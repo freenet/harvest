@@ -529,7 +529,9 @@ mod tests {
             vec![(unpaid.clone(), paid_now.backup_digest())],
         );
         let (_, kept, _) = whole(&node);
-        assert!(kept.iter().any(|k| k.order.order.id == unpaid && k.backed_up));
+        assert!(kept
+            .iter()
+            .any(|k| k.order.order.id == unpaid && k.backed_up));
         let complaint = crate::kept_purchases::fixtures::complaint_about(
             &paid_now.order,
             &crate::kept_purchases::fixtures::seed(c),

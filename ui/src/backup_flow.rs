@@ -494,9 +494,11 @@ impl AppState {
     /// Restore from a file's or a pasted text. Answers what to send.
     pub(crate) fn start_restore(&mut self, text: &str) -> Outgoing {
         let now = crate::state::now_ms();
-        if self.backup_restore.as_ref().is_some_and(|r| {
-            now.saturating_sub(r.asked_at_ms) < BACKUP_ANSWER_WAIT_MS
-        }) {
+        if self
+            .backup_restore
+            .as_ref()
+            .is_some_and(|r| now.saturating_sub(r.asked_at_ms) < BACKUP_ANSWER_WAIT_MS)
+        {
             return Vec::new();
         }
         // An old one-conversation string goes through the delegate's own
@@ -821,7 +823,10 @@ mod tests {
                 next: None,
             }),
         );
-        assert!(last.is_empty(), "nothing is marked before the file is saved");
+        assert!(
+            last.is_empty(),
+            "nothing is marked before the file is saved"
+        );
         let ready = state.backup_file_ready.clone().expect("a file");
         let (name, text) = (ready.name.clone(), ready.text.clone());
         assert!(name.starts_with("harvest-purchases-"));
@@ -836,7 +841,9 @@ mod tests {
                 conversations,
                 orders,
                 ..
-            }, harvest_common::HarvestDelegateRequest::ExportPurchasesBackup { after: None, .. }] => {
+            }, harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
+                after: None, ..
+            }] => {
                 assert_eq!(
                     conversations,
                     &vec![

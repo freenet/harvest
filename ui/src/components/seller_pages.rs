@@ -277,7 +277,8 @@ pub(crate) fn header_status(
 }
 
 /// What a paused store's header says under its pill, on Home.
-pub(crate) const PAUSED_LINE: &str = "Buyers see \u{201c}Closed for now\u{201d} and can\u{2019}t use \
+pub(crate) const PAUSED_LINE: &str =
+    "Buyers see \u{201c}Closed for now\u{201d} and can\u{2019}t use \
      Buy now. Invoices you send by hand still go out.";
 
 /// The store's header on every seller page (rule 2: status and identity in
