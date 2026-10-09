@@ -1246,7 +1246,7 @@ mod tests {
             Family::Refused,      // the pending key's scan cursor
             Family::SellerOrders, // a seller's open orders for one store
             Family::SellerOrders, // a seller's sent orders for one store
-            Family::SellerOrders, // what instant checkout signed, not yet filed
+            Family::SellerOrders, // a seller's unpaid orders for one store
             Family::Refused,      // the order-book sweep's place
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");

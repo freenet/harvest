@@ -70,7 +70,7 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::published_set::CURSOR_PENDING_KEY.to_vec(),
         crate::seller_orders::open_key(&[9u8; 32]),
         crate::seller_orders::done_key(&[9u8; 32]),
-        crate::seller_orders::signed_key(&[9u8; 32]),
+        crate::seller_orders::unpaid_key(&[9u8; 32]),
         crate::seller_orders::SWEEP_CURSOR_KEY.to_vec(),
     ]
 }

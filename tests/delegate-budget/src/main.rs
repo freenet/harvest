@@ -2087,6 +2087,24 @@ struct OpenBook {
     orders: Vec<harvest_common::delegate::SellerKeptOrder>,
 }
 
+/// The store key the delegate holds for `at` (`CreateStoreKey` made it).
+fn store_signer(r: &Runner, at: &InstantStore) -> Result<SigningKey> {
+    let seed = r
+        .host
+        .state
+        .secrets
+        .get(
+            format!(
+                "harvest:store_sk:{}",
+                bs58::encode(at.verifying_key).into_string()
+            )
+            .as_bytes(),
+        )
+        .ok_or_else(|| anyhow!("the delegate holds no key for the instant store"))?;
+    let seed: [u8; 32] = seed.as_slice().try_into()?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 /// The seller's book for `at`, filled to every cap: the paid orders of
 /// `paid` not yet sent (up to `MAX_SELLER_UNSENT_KEPT`), as many unpaid
 /// ones as it keeps, and as many sent ones, every request's texts at their
@@ -2112,7 +2130,7 @@ fn fill_book(
     };
     // Signed as the store key signs an order, so the delegate's checks of
     // a record the tab sends pass.
-    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    let signer = store_signer(r, at)?;
     let resign = |mut order: harvest_common::payment::AuthorizedOrder| -> Result<_> {
         let (scoped_payload, signature) =
             harvest_common::backing::sign_with_store_key(&signer, cbor(&order.order))
@@ -2141,21 +2159,19 @@ fn fill_book(
         let n = paid_unsent.len() as u64;
         paid_unsent.push(record(resign(order)?, n));
     }
-    let mut open = paid_unsent.clone();
+    let open = paid_unsent.clone();
+    let mut unpaid_stage = Vec::new();
     let unpaid = |k: u32| -> Result<harvest_common::payment::AuthorizedOrder> {
         let mut order = fx.paid(fx.order(k, [0x5B; 32]));
         order.status = harvest_common::payment::OrderStatus::AwaitingPayment;
         order.payment_proof = None;
         resign(order)
     };
+    // The unpaid stage full: what decide and a store notification read and
+    // write.
     for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
-        open.push(record(unpaid(100_000 + k)?, 10_000 + u64::from(k)));
+        unpaid_stage.push(record(unpaid(100_000 + k)?, 10_000 + u64::from(k)));
     }
-    // And instant checkout's signed inbox full: what decide and a store
-    // notification read and write.
-    let signed: Vec<SellerKeptOrder> = (0..MAX_SELLER_UNPAID_KEPT as u32)
-        .map(|k| Ok(record(unpaid(400_000 + k)?, 30_000 + u64::from(k))))
-        .collect::<Result<_>>()?;
     let mut done = Vec::new();
     for k in 0..MAX_SELLER_SENT_KEPT as u32 {
         // A sent order is kept without its proof (`seller_orders::file`).
@@ -2184,7 +2200,7 @@ fn fill_book(
     let done_bytes = cbor(&done);
     println!(
         "  (seller's book: {} open records, {} KiB; {} sent, {} KiB)",
-        MAX_SELLER_UNSENT_KEPT + MAX_SELLER_UNPAID_KEPT,
+        MAX_SELLER_UNSENT_KEPT,
         open_bytes.len() / 1024,
         done.len(),
         done_bytes.len() / 1024
@@ -2198,8 +2214,8 @@ fn fill_book(
         done_bytes,
     );
     r.host.state.secrets.insert(
-        format!("harvest:seller_orders:signed:{key}").into_bytes(),
-        cbor(&signed),
+        format!("harvest:seller_orders:unpaid:{key}").into_bytes(),
+        cbor(&unpaid_stage),
     );
     Ok(paid_unsent)
 }
@@ -2216,7 +2232,7 @@ fn book_calls(
         .secrets
         .get(
             format!(
-                "harvest:seller_orders:signed:{}",
+                "harvest:seller_orders:unpaid:{}",
                 bs58::encode(at.verifying_key).into_string()
             )
             .as_bytes(),
@@ -2224,7 +2240,7 @@ fn book_calls(
         .cloned()
         .ok_or_else(|| anyhow!("no inbox seeded"))?;
     use harvest_common::delegate::SELLER_ORDERS_PER_CALL;
-    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    let signer = store_signer(r, at)?;
     // A tab marking orders sent: each moves from the open half to the sent
     // half, both rewritten, the oldest sent ones cut.
     let sent: Vec<_> = paid_unsent
@@ -2289,30 +2305,38 @@ fn book_calls(
         }
     }
     println!("  (seller's book: {pages} pages)");
-    // A wake-up's sweep of the full book, with instant checkout's inbox full
-    // again to file into it.
+    // A wake-up's sweep of the full book, with every unpaid order marked
+    // paid by store notifications, to move on (the most it ever moves).
     let key = bs58::encode(at.verifying_key).into_string();
+    let mut marked: Vec<harvest_common::delegate::SellerKeptOrder> =
+        ciborium::from_reader(inbox.as_slice()).context("the unpaid stage is not CBOR")?;
+    for record in marked.iter_mut() {
+        record.order.status = harvest_common::payment::OrderStatus::Paid;
+    }
+    let marked_len = marked.len();
     r.host.state.secrets.insert(
-        format!("harvest:seller_orders:signed:{key}").into_bytes(),
-        inbox,
+        format!("harvest:seller_orders:unpaid:{key}").into_bytes(),
+        cbor(&marked),
     );
     let mut wakeup = vec![0x09, 0, 0, 0];
     wakeup.extend_from_slice(&9u64.to_le_bytes());
     wakeup.extend_from_slice(b"heartbeat");
     r.host.state.now += chrono::Duration::minutes(5);
     r.background(
-        "Background: heartbeat wake-up (a full seller's book swept, its inbox filed)",
+        "Background: heartbeat wake-up (a full seller's book swept, 128 paid moved on)",
         &wakeup,
     )?;
-    let left = r
+    let left: Vec<harvest_common::delegate::SellerKeptOrder> = r
         .host
         .state
         .secrets
-        .get(format!("harvest:seller_orders:signed:{key}").as_bytes())
-        .cloned()
+        .get(format!("harvest:seller_orders:unpaid:{key}").as_bytes())
+        .map(|b| ciborium::from_reader(b.as_slice()))
+        .transpose()
+        .context("the unpaid stage is not CBOR")?
         .unwrap_or_default();
-    if left.len() > 8 {
-        bail!("the wake-up did not file instant checkout's inbox into the book");
+    if left.len() >= marked_len {
+        bail!("the wake-up moved nothing on from the unpaid stage");
     }
     Ok(())
 }
