@@ -28043,6 +28043,18 @@ mod buy_flow_tests {
             state.seller_book_notes(STORE).is_empty(),
             "a sent order's proof is not offered"
         );
+        // Nor when the store's copy comes without the despatch the book
+        // holds.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .clear();
+        assert!(
+            state.seller_book_notes(STORE).is_empty(),
+            "a sent order's proof is not offered, whatever the store shows of it"
+        );
 
         // A paid order the book lacks: offered once.
         state.seller_books.get_mut(&owner).unwrap().orders.clear();
@@ -28130,12 +28142,27 @@ mod buy_flow_tests {
             })
             .collect();
         book.paid_refused = vec![paid.order.id.clone()];
+        // Not offered for having been offered already this session.
+        book.noted.clear();
         assert!(
             state
                 .seller_book_notes(STORE)
                 .iter()
                 .all(|n| n.order.order.id != paid.order.id),
             "refused by a full book"
+        );
+        state
+            .seller_books
+            .get_mut(&owner)
+            .unwrap()
+            .paid_refused
+            .clear();
+        assert!(
+            state
+                .seller_book_notes(STORE)
+                .iter()
+                .any(|n| n.order.order.id == paid.order.id),
+            "offered once the book did not refuse it"
         );
     }
 

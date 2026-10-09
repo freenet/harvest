@@ -282,15 +282,17 @@ pub(crate) const ONLY_HERE_LINE: &str = "Your store no longer lists this order, 
      this device only. If you mark it as sent here, the buyer won\u{2019}t see that it was sent.";
 
 /// What Home says when the seller's own book holds as many paid orders not
-/// yet sent as it keeps (step 2), with how many more it could not keep.
+/// yet sent as it keeps (step 2), with how many more wait for room.
 pub(crate) fn book_full_note(refused: usize) -> Option<String> {
     (refused > 0).then(|| {
         format!(
             "This device keeps up to {} paid orders you haven\u{2019}t sent, and {} more \
-             could not be kept here. They show while your store still lists them: mark \
-             orders as sent to make room.",
+             are waiting for room. Mark orders as sent to make room: until then, past the \
+             first {} waiting, an order\u{2019}s delivery details stay only while your \
+             store still lists it.",
             harvest_common::delegate::MAX_SELLER_UNSENT_KEPT,
-            refused
+            refused,
+            harvest_common::delegate::MAX_SELLER_UNPAID_KEPT,
         )
     })
 }

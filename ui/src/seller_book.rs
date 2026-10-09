@@ -58,15 +58,12 @@ pub(crate) type Outgoing = Vec<harvest_common::HarvestDelegateRequest>;
 
 /// Whether `note` adds to `held` (the same order): what the delegate's
 /// merge would take from it and keep. A proof adds only to a paid order not
-/// yet sent that has none: a sent one (and one past the store's byte bound,
-/// held with the height it was paid at) is kept without it.
+/// yet sent that has none: a sent one is kept without it.
 fn adds_to(held: &SellerKeptOrder, note: &SellerKeptOrder) -> bool {
     note.order.status.rank() > held.order.status.rank()
         || (note.order.status == held.order.status
             && held.order.payment_proof.is_none()
             && held.despatch.is_none()
-            && held.paid_height.is_none()
-            && note.despatch.is_none()
             && note.order.payment_proof.is_some())
         || (held.request.is_none() && note.request.is_some())
         || (held.despatch.is_none() && note.despatch.is_some())
