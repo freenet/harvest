@@ -342,6 +342,54 @@ pub fn order_stage(
     }
 }
 
+/// What the seller's app shows in place of a buyer's ship-to address once
+/// [`address_retained`] says it is no longer shown.
+///
+/// "Hidden", never "deleted" or "removed": the address is still in the
+/// store's mailbox contract, encrypted to the seller, where no owner can
+/// delete it (entries leave only by the contract's caps); the seller's store
+/// key can decrypt it for as long as the store exists; and a mailbox
+/// migration copies it to the new contract. All the app can do is stop
+/// decrypting it for display, which is what this says.
+pub const ADDRESS_HIDDEN: &str =
+    "Address hidden: the time to report a problem with this order has passed.";
+
+/// Whether the seller's app still shows the buyer's ship-to address (and
+/// the note that came with it) for `order` (Ian, 2026-09-30).
+///
+/// No once the order has been sent (a despatch is on record) and its
+/// complaint window has closed by this reader's own view of the chain
+/// ([`OrderStage::Closed`]): past that point the buyer can no longer report
+/// a problem, so the seller has no use for where they live. Yes in every
+/// other case, including [`OrderStage::Unknown`] (no tip, so the window
+/// cannot be judged), a reversed payment (no paid height to measure from),
+/// and a paid order never marked as sent: the seller still owes it and may
+/// send it late, which the Orders tab offers (a late despatch extends the
+/// buyer's window), so hiding where it goes would stop exactly that (review
+/// round 2 of #205).
+///
+/// The note goes with the address: it is free text in the same request, is
+/// where a buyer adds "flat 3, side door", and has no use to the seller once
+/// the order is finished either.
+///
+/// Reader-side, like every window in this module: nothing is written, and
+/// nothing is deleted. See [`ADDRESS_HIDDEN`] for what that means for the
+/// copy.
+pub fn address_retained(
+    order: &AuthorizedOrder,
+    despatch: Option<&AuthorizedDespatch>,
+    tip_height: Option<u32>,
+) -> bool {
+    // The payment sight bears only on unpaid orders, and a closed window is
+    // reached only by a paid one.
+    let sent = despatch.is_some_and(|d| d.despatch.order_id == order.order.id);
+    !(sent
+        && matches!(
+            order_stage(order, despatch, tip_height, PaymentSight::default()),
+            OrderStage::Closed { .. }
+        ))
+}
+
 /// Whether a complaint against a payment the store later records as
 /// reversed still counts against the seller.
 ///
@@ -1372,6 +1420,61 @@ mod tests {
         let mut not_paid = paid_with(|o| vec![confirmed(o, 10_000, ANCHOR + 3, 1)]);
         not_paid.status = OrderStatus::AwaitingPayment;
         assert_eq!(paid_height(&not_paid), None);
+    }
+
+    /// **The seller's app hides a buyer's address once a sent order's
+    /// complaint window closes, and not before** (Ian, 2026-09-30): shown
+    /// through the last block of the window, hidden from the block after; a
+    /// despatch that extends the window keeps it longer; with no tip the
+    /// window cannot be judged and it stays; an unpaid or reversed order
+    /// keeps it, and so does a paid order never sent (review round 2 of
+    /// #205: the seller may still send it late). Red with the stage check
+    /// dropped (always shown), with `Unknown` treated as closed, and with
+    /// the despatch condition dropped.
+    #[test]
+    fn the_address_is_hidden_once_the_complaint_window_closes() {
+        let paid_at = ANCHOR + 3;
+        let paid = paid_with(|o| vec![confirmed(o, 10_000, paid_at, 1)]);
+        let complaint_until = paid_at + DESPATCH_WINDOW_BLOCKS + COMPLAINT_WINDOW_BLOCKS;
+        let on_time = despatch_at(&paid, paid_at + 6);
+        assert!(address_retained(&paid, Some(&on_time), Some(paid_at + 6)));
+        assert!(address_retained(
+            &paid,
+            Some(&on_time),
+            Some(complaint_until)
+        ));
+        assert!(!address_retained(
+            &paid,
+            Some(&on_time),
+            Some(complaint_until + 1)
+        ));
+        assert!(
+            address_retained(&paid, None, Some(complaint_until + 1)),
+            "never sent: still owed, and may be sent late"
+        );
+        assert!(
+            address_retained(&paid, Some(&on_time), None),
+            "no tip: the window can't be judged, so the address stays"
+        );
+        let late = despatch_at(&paid, paid_at + DESPATCH_WINDOW_BLOCKS + 100);
+        assert!(address_retained(
+            &paid,
+            Some(&late),
+            Some(complaint_until + 1)
+        ));
+        assert!(!address_retained(
+            &paid,
+            Some(&late),
+            Some(complaint_until + 101)
+        ));
+        let mut reversed = paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        assert!(address_retained(&reversed, None, Some(complaint_until + 1)));
+        let mut unpaid = paid.clone();
+        unpaid.status = OrderStatus::AwaitingPayment;
+        assert!(address_retained(&unpaid, None, Some(complaint_until + 1)));
+        assert!(ADDRESS_HIDDEN.contains("hidden"));
+        assert!(!ADDRESS_HIDDEN.contains("deleted") && !ADDRESS_HIDDEN.contains("removed"));
     }
 
     #[test]

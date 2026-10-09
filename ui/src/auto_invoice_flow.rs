@@ -1723,6 +1723,26 @@ impl AppState {
             _ => Vec::new(),
         }
     }
+
+    /// The alerts about orders already paid (oversold), without the ones
+    /// about selling: what a store closed for good still shows (harvest#181).
+    pub fn instant_checkout_order_alerts(&self, store_contract_id: &[u8]) -> Vec<String> {
+        match self.auto_invoice.status.get(store_contract_id) {
+            Some(Ok(status)) => instant_checkout_order_alerts(status),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The instant checkout alerts a store's page lists: only the ones about
+    /// its orders once it is closed for good. One place, so the "Needs you"
+    /// card and the Stores list's flag (`overview_needs`) read the same.
+    pub fn store_alerts(&self, store_contract_id: &[u8], closed: bool) -> Vec<String> {
+        if closed {
+            self.instant_checkout_order_alerts(store_contract_id)
+        } else {
+            self.instant_checkout_alerts(store_contract_id)
+        }
+    }
 }
 
 /// Read an upcoming address's contract ([`AddressVet`]), and count it clear
@@ -1813,6 +1833,20 @@ fn without_left(arm: &AutoInvoiceArm) -> AutoInvoiceArm {
 /// paid orders the listing's count no longer covered (to refund or send by
 /// hand), and a buyer turned away by a cap in the last hour. Empty for none.
 pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
+    let mut alerts = instant_checkout_order_alerts(status);
+    if let Some(why) = &status.capped {
+        alerts.push(format!(
+            "In the last hour a buyer couldn't order because {why}; they were told to try again \
+             later."
+        ));
+    }
+    alerts
+}
+
+/// The alerts of [`instant_checkout_alerts`] about orders already paid, built
+/// from the order fields only, so an alert about selling added later does
+/// not reach a store closed for good (harvest#181).
+pub fn instant_checkout_order_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
     let mut alerts = Vec::new();
     if !status.oversold.is_empty() {
         let orders: Vec<String> = status.oversold.iter().map(|id| id.short()).collect();
@@ -1821,12 +1855,6 @@ pub fn instant_checkout_alerts(status: &AutoInvoiceStatus) -> Vec<String> {
              buyer, or you marked it sold out or took it down): {}. Refund or send these by \
              hand.",
             orders.join(", ")
-        ));
-    }
-    if let Some(why) = &status.capped {
-        alerts.push(format!(
-            "In the last hour a buyer couldn't order because {why}; they were told to try again \
-             later."
         ));
     }
     alerts

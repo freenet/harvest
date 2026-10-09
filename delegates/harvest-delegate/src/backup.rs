@@ -168,12 +168,14 @@ pub(crate) fn import<S: SecretStore>(
 }
 
 /// Mark exactly these items as held in a backup. An item this node does
-/// not hold is skipped; one already marked is counted without a write.
+/// not hold is skipped, and so is a purchase whose held copy is not the one
+/// the backup holds (its digest differs: it moved on after the export); one
+/// already marked is counted without a write.
 pub(crate) fn mark<S: SecretStore>(
     store: &mut S,
     request_id: RequestId,
     conversations: Vec<([u8; 32], [u8; 32])>,
-    orders: Vec<OrderId>,
+    orders: Vec<(OrderId, [u8; 32])>,
 ) -> HarvestDelegateResponse {
     let answer = |result| HarvestDelegateResponse::BackedUpMarked { request_id, result };
     if conversations.len() + orders.len() > BACKUP_MARK_ITEMS {
@@ -199,11 +201,12 @@ pub(crate) fn mark<S: SecretStore>(
         }
         marked += 1;
     }
-    for order in orders {
+    for (order, digest) in orders {
         let key = kept_purchase_key(&order.0);
         let Some(mut record) = store
             .get_secret(&key)
             .and_then(|b| from_cbor::<KeptPurchase>(&b).ok())
+            .filter(|record| record.backup_digest() == digest)
         else {
             continue;
         };
@@ -457,27 +460,37 @@ mod tests {
         );
     }
 
-    /// Marking sets the flag on exactly the items named, skips one not held,
+    /// Marking sets the flag on exactly the items named, skips one not held
+    /// and one held but not as the backup holds it (another digest),
     /// refuses a list over `BACKUP_MARK_ITEMS`, and a purchase paid after
-    /// the backup loses its mark. Mutated red by marking everything, and by
-    /// keeping the mark over an upgrade.
+    /// the backup, or complained about after it, loses its mark. Mutated
+    /// red by marking everything, by ignoring the digest, by keeping the
+    /// mark over an upgrade, and by keeping it over a complaint.
     #[test]
     fn marks_cover_exactly_what_the_backup_held() {
         let mut node = buyer(2);
         let (_, purchases, _) = whole(&node);
-        let unpaid = purchases
+        let unpaid_copy = purchases
             .iter()
             .find(|p| p.order.status != OrderStatus::Paid)
             .unwrap()
-            .order
-            .order
-            .id
+            .clone();
+        let unpaid = unpaid_copy.order.order.id.clone();
+        let paid_copy = purchases
+            .iter()
+            .find(|p| p.order.status == OrderStatus::Paid)
+            .unwrap()
             .clone();
         let answer = mark(
             &mut node,
             1,
             vec![([3u8; 32], conversation(1)), ([3u8; 32], [0xEE; 32])],
-            vec![unpaid.clone(), OrderId([0xEE; 32])],
+            vec![
+                (unpaid.clone(), unpaid_copy.backup_digest()),
+                (OrderId([0xEE; 32]), [0; 32]),
+                // Held, but not as the backup holds it: not marked.
+                (paid_copy.order.order.id.clone(), [0x11; 32]),
+            ],
         );
         assert!(matches!(
             answer,
@@ -485,7 +498,7 @@ mod tests {
         ));
         let (_, kept, _) = whole(&node);
         assert_eq!(kept.iter().filter(|k| k.backed_up).count(), 1);
-        let too_many = vec![OrderId([1; 32]); BACKUP_MARK_ITEMS + 1];
+        let too_many = vec![(OrderId([1; 32]), [0; 32]); BACKUP_MARK_ITEMS + 1];
         assert!(matches!(
             mark(&mut node, 2, Vec::new(), too_many),
             HarvestDelegateResponse::BackedUpMarked { result: Err(_), .. }
@@ -503,5 +516,35 @@ mod tests {
             kept.iter().all(|k| !k.backed_up),
             "the upgrade is not in the backup"
         );
+        // Backed up as paid, then complained about: no longer in it.
+        let paid_now = kept
+            .iter()
+            .find(|k| k.order.order.id == unpaid)
+            .unwrap()
+            .clone();
+        mark(
+            &mut node,
+            3,
+            Vec::new(),
+            vec![(unpaid.clone(), paid_now.backup_digest())],
+        );
+        let (_, kept, _) = whole(&node);
+        assert!(kept.iter().any(|k| k.order.order.id == unpaid && k.backed_up));
+        let complaint = crate::kept_purchases::fixtures::complaint_about(
+            &paid_now.order,
+            &crate::kept_purchases::fixtures::seed(c),
+            harvest_common::feedback::FeedbackCategory::NonDelivery,
+        );
+        crate::kept_purchases::keep(
+            &mut node,
+            harvest_common::delegate::PurchaseToKeep {
+                complaint: Some(complaint),
+                ..to_keep(u16::from(c), c, OrderStatus::Paid, c)
+            },
+        );
+        let (_, kept, _) = whole(&node);
+        let complained = kept.iter().find(|k| k.order.order.id == unpaid).unwrap();
+        assert!(complained.complaint.is_some());
+        assert!(!complained.backed_up, "the complaint is not in the backup");
     }
 }

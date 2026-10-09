@@ -19,10 +19,13 @@
 //! # Making it
 //!
 //! The delegate answers a page at a time (`ExportPurchasesBackup`, each
-//! within one call's budget); this module asks for each page in turn,
-//! assembles the file, offers it as a download, and then marks exactly the
-//! items the file holds as backed up (`MarkBackedUp`), so a purchase made
-//! or paid later is shown as not in a backup yet.
+//! within one call's budget); this module asks for each page in turn and
+//! assembles the file as soon as the Backup page opens. The buyer's click
+//! saves it (a download needs the click), and only then are exactly the
+//! items the file holds marked as backed up (`MarkBackedUp`), each purchase
+//! by its digest, so a purchase made, paid or complained about later is
+//! shown as not in a backup yet, and a file that was never saved marks
+//! nothing.
 //!
 //! # Restoring it
 //!
@@ -30,8 +33,16 @@
 //! `BACKUP_IMPORT_ITEMS` (`ImportPurchasesBackup`), each item kept by the
 //! delegate's own rules: what this device already holds stays, a cap
 //! refuses rather than evicts. The counts are reported at the end. An old
-//! one-conversation string (`harvest-conv-backup-v2:`) is not a bundle: it
-//! names no store code, so it is restored from its store's page, as before.
+//! one-conversation string (`harvest-conv-backup-v2:`) is not a bundle; it
+//! restores through the delegate's one-conversation import, as before.
+//!
+//! # An answer that never comes
+//!
+//! A request the delegate refused answers a bare `Error`, with no request
+//! id, and a request can be lost on the way. An `Error` while a backup or a
+//! restore is waiting ends it ([`AppState::backup_refused`]), and one that
+//! has waited [`BACKUP_ANSWER_WAIT_MS`] for an answer no longer holds the
+//! buttons ([`AppState::backup_busy_at`]).
 
 use std::collections::VecDeque;
 
@@ -49,6 +60,10 @@ pub(crate) const BUNDLE_PREFIX: &str = "harvest-backup-v3:";
 
 /// The prefix of an old one-conversation backup string.
 pub(crate) const CONVERSATION_STRING_PREFIX: &str = "harvest-conv-backup-v2:";
+
+/// How long a backup or restore waits for the delegate's answer before
+/// its buttons work again.
+pub(crate) const BACKUP_ANSWER_WAIT_MS: u64 = 60_000;
 
 /// Said beside the button that makes the file.
 pub(crate) const KEEP_IT_PRIVATE: &str = "Keep this file private, like a password: anyone with \
@@ -223,6 +238,8 @@ pub struct BackupExport {
     pub request_id: u64,
     pub conversations: Vec<BackupConversation>,
     pub purchases: Vec<KeptPurchase>,
+    /// When the last page was asked for.
+    pub asked_at_ms: u64,
 }
 
 /// A restore being sent a chunk at a time.
@@ -233,6 +250,19 @@ pub struct BackupRestore {
     pub restored: usize,
     pub already: usize,
     pub refused: Vec<String>,
+    /// When the last chunk was sent.
+    pub asked_at_ms: u64,
+}
+
+/// A finished backup file, waiting for the buyer to save it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadyBackup {
+    pub name: String,
+    pub text: String,
+    pub purchases: usize,
+    pub conversations: usize,
+    /// The marks for exactly what the file holds, sent once it is saved.
+    pub marks: Outgoing,
 }
 
 /// What a request to the delegate this module wants sent.
@@ -249,6 +279,92 @@ impl AppState {
     /// How many kept purchases are not in a backup the buyer holds.
     pub fn purchases_not_backed_up(&self) -> usize {
         self.kept_purchases.iter().filter(|k| !k.backed_up).count()
+    }
+
+    /// How many kept purchases, and how many of the conversations this
+    /// device keeps with stores it does not own, are in no backup the
+    /// buyer saved.
+    pub fn not_backed_up(&self) -> (usize, usize) {
+        let conversations = self
+            .browsing_stores
+            .iter()
+            .filter(|(id, _)| self.store_owner_fingerprint(id).is_none())
+            .map(|(_, store)| store.conversations.iter().filter(|c| !c.backed_up).count())
+            .sum();
+        (self.purchases_not_backed_up(), conversations)
+    }
+
+    /// Whether this order is in no backup the buyer saved: its kept copy
+    /// as it is now is unmarked, or, with no kept copy, the conversation
+    /// it was placed in is.
+    pub(crate) fn order_not_backed_up(
+        &self,
+        store_contract_id: &[u8],
+        order: &harvest_common::payment::OrderId,
+        conversation: &[u8; 32],
+    ) -> bool {
+        match self
+            .kept_purchases
+            .iter()
+            .find(|k| k.order.order.id == *order)
+        {
+            Some(kept) => !kept.backed_up,
+            None => self
+                .browsing_stores
+                .get(store_contract_id)
+                .and_then(|s| {
+                    s.conversations
+                        .iter()
+                        .find(|c| c.buyer_public_key == *conversation)
+                })
+                .is_some_and(|c| !c.backed_up),
+        }
+    }
+
+    /// Whether a backup or restore is waiting on the delegate, and has not
+    /// waited past [`BACKUP_ANSWER_WAIT_MS`].
+    pub(crate) fn backup_busy_at(&self, now_ms: u64) -> bool {
+        let waiting = |asked: u64| now_ms.saturating_sub(asked) < BACKUP_ANSWER_WAIT_MS;
+        self.backup_export
+            .as_ref()
+            .is_some_and(|e| waiting(e.asked_at_ms))
+            || self
+                .backup_restore
+                .as_ref()
+                .is_some_and(|r| waiting(r.asked_at_ms))
+    }
+
+    /// The delegate answered a bare `Error`: an export or restore waiting on
+    /// it ends, saying why. Answers whether one was waiting.
+    pub(crate) fn backup_refused(&mut self, why: &str) -> bool {
+        if self.backup_export.take().is_some() {
+            self.backup_message = Some(format!("The backup could not be made: {why}"));
+            return true;
+        }
+        if let Some(done) = self.backup_restore.take() {
+            self.backup_message = Some(format!(
+                "The restore stopped: {why}. {} restored, {} already here before it stopped.",
+                done.restored, done.already
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// The buyer saved the file (or copied its text): mark exactly what it
+    /// holds, and start the next one, so the button is ready again.
+    pub(crate) fn backup_saved(&mut self) -> Outgoing {
+        let Some(ready) = self.backup_file_ready.take() else {
+            return Vec::new();
+        };
+        self.backup_message = Some(format!(
+            "Saved {}. It holds {}. Keep it somewhere other than this computer.",
+            ready.name,
+            held_words(ready.purchases, ready.conversations),
+        ));
+        let mut out = ready.marks;
+        out.extend(self.start_backup_export());
+        out
     }
 
     /// The code of the store at `contract_id`, if this device knows it.
@@ -268,17 +384,21 @@ impl AppState {
         Some(StoreParameters::new(key).code().to_string())
     }
 
-    /// Start making a backup: ask for its first page.
+    /// Start making a backup: ask for its first page. Nothing while one is
+    /// being made or a restore runs (one that has waited past
+    /// [`BACKUP_ANSWER_WAIT_MS`] is started again).
     pub(crate) fn start_backup_export(&mut self) -> Outgoing {
-        if self.backup_export.is_some() {
+        let now = crate::state::now_ms();
+        if self.backup_busy_at(now) {
             return Vec::new();
         }
+        self.backup_restore = None;
         let request_id = self.next_messaging_request_id();
         self.backup_export = Some(BackupExport {
             request_id,
+            asked_at_ms: now,
             ..Default::default()
         });
-        self.backup_message = Some("Making your backup\u{2026}".into());
         vec![
             harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
                 request_id,
@@ -311,6 +431,7 @@ impl AppState {
         export.conversations.extend(page.conversations);
         export.purchases.extend(page.purchases);
         if let Some(after) = page.next {
+            export.asked_at_ms = crate::state::now_ms();
             return vec![
                 harvest_common::HarvestDelegateRequest::ExportPurchasesBackup {
                     request_id,
@@ -323,25 +444,19 @@ impl AppState {
         let bundle = self.bundle_of(export, made_at_ms);
         match encode_file(&bundle) {
             Ok(text) => {
-                self.backup_file_ready = Some((file_name(made_at_ms), text));
-                self.backup_message = Some(format!(
-                    "Your backup holds {} purchase{} and {} conversation{}.",
-                    bundle.purchases.len(),
-                    if bundle.purchases.len() == 1 { "" } else { "s" },
-                    bundle.conversations.len(),
-                    if bundle.conversations.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                ));
-                marks_for(&bundle, request_id)
+                self.backup_file_ready = Some(ReadyBackup {
+                    name: file_name(made_at_ms),
+                    text,
+                    purchases: bundle.purchases.len(),
+                    conversations: bundle.conversations.len(),
+                    marks: marks_for(&bundle, request_id),
+                });
             }
             Err(why) => {
                 self.backup_message = Some(format!("The backup could not be made: {why}"));
-                Vec::new()
             }
         }
+        Vec::new()
     }
 
     /// The bundle for what the delegate exported, each conversation's store
@@ -378,16 +493,18 @@ impl AppState {
 
     /// Restore from a file's or a pasted text. Answers what to send.
     pub(crate) fn start_restore(&mut self, text: &str) -> Outgoing {
-        if self.backup_restore.is_some() {
+        let now = crate::state::now_ms();
+        if self.backup_restore.as_ref().is_some_and(|r| {
+            now.saturating_sub(r.asked_at_ms) < BACKUP_ANSWER_WAIT_MS
+        }) {
             return Vec::new();
         }
-        if text.trim_start().starts_with(CONVERSATION_STRING_PREFIX) {
-            self.backup_message = Some(
-                "That is a backup of one conversation. Open its store and paste it there, under \
-                 \u{201c}Restore a conversation\u{201d}."
-                    .into(),
-            );
-            return Vec::new();
+        // An old one-conversation string goes through the delegate's own
+        // import for it, which says what it did.
+        let trimmed = text.trim();
+        if trimmed.starts_with(CONVERSATION_STRING_PREFIX) {
+            self.backup_message = Some("Restoring that conversation\u{2026}".into());
+            return vec![self.conversation_to_import(trimmed.to_string())];
         }
         let bundle = match decode_file(text) {
             Ok(bundle) => bundle,
@@ -432,9 +549,13 @@ impl AppState {
             chunks.push_back((Vec::new(), chunk.to_vec()));
         }
         let request_id = self.next_messaging_request_id();
+        // The file made before this restore no longer holds everything.
+        self.backup_file_ready = None;
+        self.backup_export = None;
         self.backup_restore = Some(BackupRestore {
             request_id,
             chunks,
+            asked_at_ms: now,
             ..Default::default()
         });
         self.backup_message = Some("Restoring your backup\u{2026}".into());
@@ -447,6 +568,7 @@ impl AppState {
         };
         match restore.chunks.pop_front() {
             Some((conversations, purchases)) => {
+                restore.asked_at_ms = crate::state::now_ms();
                 vec![
                     harvest_common::HarvestDelegateRequest::ImportPurchasesBackup {
                         request_id: restore.request_id,
@@ -511,11 +633,22 @@ impl AppState {
     }
 }
 
-/// The `MarkBackedUp` requests for exactly what `bundle` holds.
+/// "2 purchases and 1 conversation".
+fn held_words(purchases: usize, conversations: usize) -> String {
+    format!(
+        "{purchases} purchase{} and {conversations} conversation{}",
+        if purchases == 1 { "" } else { "s" },
+        if conversations == 1 { "" } else { "s" },
+    )
+}
+
+/// The `MarkBackedUp` requests for exactly what `bundle` holds: each
+/// conversation by its store and tag, each purchase by its order and the
+/// digest of the copy the file holds.
 fn marks_for(bundle: &Bundle, request_id: u64) -> Outgoing {
     enum Mark {
         Conversation([u8; 32], [u8; 32]),
-        Order(harvest_common::payment::OrderId),
+        Order(harvest_common::payment::OrderId, [u8; 32]),
     }
     let items: Vec<Mark> = bundle
         .conversations
@@ -530,7 +663,7 @@ fn marks_for(bundle: &Bundle, request_id: u64) -> Outgoing {
             bundle
                 .purchases
                 .iter()
-                .map(|p| Mark::Order(p.order.order.id.clone())),
+                .map(|p| Mark::Order(p.order.order.id.clone(), p.backup_digest())),
         )
         .collect();
     items
@@ -542,13 +675,13 @@ fn marks_for(bundle: &Bundle, request_id: u64) -> Outgoing {
                     .iter()
                     .filter_map(|m| match m {
                         Mark::Conversation(store, tag) => Some((*store, *tag)),
-                        Mark::Order(_) => None,
+                        Mark::Order(..) => None,
                     })
                     .collect(),
                 orders: chunk
                     .iter()
                     .filter_map(|m| match m {
-                        Mark::Order(id) => Some(id.clone()),
+                        Mark::Order(id, digest) => Some((id.clone(), *digest)),
                         Mark::Conversation(..) => None,
                     })
                     .collect(),
@@ -644,10 +777,12 @@ mod tests {
     }
 
     /// Making a backup: each page asks for the next, the last makes the
-    /// file and marks exactly what it holds (each conversation by its store
-    /// and tag, each purchase by its order), and nothing else. Mutated red
-    /// by marking before the last page, and by marking a conversation by
-    /// its secret.
+    /// file and marks nothing; saving it marks exactly what it holds (each
+    /// conversation by its store and tag, each purchase by its order and
+    /// the digest of the copy held) and starts the next file, and the file
+    /// is offered once. Mutated red by marking at the last page, by marking
+    /// a conversation by its secret, and by keeping the file after it is
+    /// saved.
     #[test]
     fn a_backup_is_assembled_from_pages_and_marks_what_it_holds() {
         let mut state = AppState::default();
@@ -678,7 +813,7 @@ mod tests {
             ]
         ));
         assert!(state.backup_file_ready.is_none());
-        let marks = state.on_purchases_backup(
+        let last = state.on_purchases_backup(
             request_id,
             Ok(PurchasesBackupPage {
                 conversations: vec![conversation(4)],
@@ -686,17 +821,22 @@ mod tests {
                 next: None,
             }),
         );
-        let (name, text) = state.backup_file_ready.clone().expect("a file");
+        assert!(last.is_empty(), "nothing is marked before the file is saved");
+        let ready = state.backup_file_ready.clone().expect("a file");
+        let (name, text) = (ready.name.clone(), ready.text.clone());
         assert!(name.starts_with("harvest-purchases-"));
         let held = decode_file(&text).unwrap();
         assert_eq!(held.conversations.len(), 2);
         assert_eq!(held.stores.len(), 2);
+        let marks = state.backup_saved();
+        assert!(state.backup_file_ready.is_none(), "offered once");
+        assert!(state.backup_saved().is_empty(), "nothing to save twice");
         match &marks[..] {
             [harvest_common::HarvestDelegateRequest::MarkBackedUp {
                 conversations,
                 orders,
                 ..
-            }] => {
+            }, harvest_common::HarvestDelegateRequest::ExportPurchasesBackup { after: None, .. }] => {
                 assert_eq!(
                     conversations,
                     &vec![
@@ -713,7 +853,8 @@ mod tests {
     /// Restoring: chunks of at most `BACKUP_IMPORT_ITEMS`, one at a time,
     /// each conversation filed under its store's address today (derived
     /// from its code), the counts reported at the end, and an old
-    /// one-conversation string sent to its store's page. Mutated red by
+    /// one-conversation string sent to the delegate's one-conversation
+    /// import. Mutated red by
     /// keeping the address the file was made at when the code is known,
     /// and by sending every chunk at once.
     #[test]
@@ -777,13 +918,45 @@ mod tests {
         );
 
         let mut state = AppState::default();
-        assert!(state
-            .start_restore("harvest-conv-backup-v2:abcdef")
-            .is_empty());
+        assert!(matches!(
+            &state.start_restore("  harvest-conv-backup-v2:abcdef\n")[..],
+            [harvest_common::HarvestDelegateRequest::ImportBuyerConversation { backup, .. }]
+                if backup.0 == "harvest-conv-backup-v2:abcdef"
+        ));
+    }
+
+    /// A delegate `Error` while a backup or a restore waits ends it, saying
+    /// why; one whose answer never came stops holding the buttons after
+    /// `BACKUP_ANSWER_WAIT_MS`. Mutated red by not ending on `Error`, and by
+    /// holding the buttons for good.
+    #[test]
+    fn a_backup_whose_answer_never_comes_does_not_hold_the_page() {
+        let mut state = AppState::default();
+        assert!(!state.start_backup_export().is_empty());
+        let now = crate::state::now_ms();
+        assert!(state.backup_busy_at(now));
+        assert!(state.start_backup_export().is_empty(), "one at a time");
+        assert!(!state.backup_busy_at(now + BACKUP_ANSWER_WAIT_MS + 1));
+        state.on_delegate_response(harvest_common::HarvestDelegateResponse::Error {
+            message: "not allowed".into(),
+        });
+        assert!(state.backup_export.is_none());
+        assert!(!state.backup_busy_at(now));
         assert!(state
             .backup_message
             .as_deref()
-            .unwrap()
-            .contains("Open its store and paste it there"));
+            .is_some_and(|m| m.contains("not allowed")));
+        // A restore, likewise.
+        let text = encode_file(&bundle()).unwrap();
+        assert!(!state.start_restore(&text).is_empty());
+        assert!(state.backup_busy_at(now));
+        state.on_delegate_response(harvest_common::HarvestDelegateResponse::Error {
+            message: "full".into(),
+        });
+        assert!(state.backup_restore.is_none());
+        assert!(state
+            .backup_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("The restore stopped: full")));
     }
 }

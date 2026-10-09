@@ -192,6 +192,10 @@ fn handle_contract_response(response: ContractResponse) {
             APP_STATE
                 .write()
                 .on_address_reuse_absent(instance_id.as_bytes());
+            // And to a Ghost Key index My Store waits on before offering
+            // "Create a store" (harvest#181).
+            #[cfg(target_arch = "wasm32")]
+            APP_STATE.write().on_index_absent(instance_id.as_bytes());
             // And to an upcoming address instant checkout reads before it may
             // be watched (harvest#183): absence counts as clear there too.
             #[cfg(target_arch = "wasm32")]

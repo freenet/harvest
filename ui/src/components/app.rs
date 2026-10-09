@@ -1,96 +1,34 @@
 use dioxus::prelude::*;
 
 use super::bitcoin_view::BitcoinView;
-use super::my_store::MyStore;
-use super::purchases_view::MyPurchases;
-use super::store_view::{StorePage, StoresPage};
+use super::router::{go, NavTab, Page, StoreTab, PAGE};
 use crate::gateway::{ConnectionStatus, CONNECTION_STATUS};
 
-/// The pages. Two tabs, Stores and Purchases (the 2026-09-30 Stores page,
-/// after the mockup's `header()`): a store's own page and the seller's
-/// pages are reached from Stores and keep its tab lit ([`nav_tab`]). The
-/// Bitcoin diagnostics are reached from the footer.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum Route {
-    /// The list: your stores, find a store, the stores you have visited.
-    Stores,
-    /// One store's own page, as a buyer sees it: `active_store_id`.
-    Store,
-    Purchases,
-    /// The seller's pages for one of their stores, or opening one
-    /// ([`SELLER_PAGE`] says which).
-    MyStore,
-    Diagnostics,
-}
-
-/// The page on screen, global so that a control on one page can send the
-/// seller to another ("See your store as buyers do", "Back to managing it").
-pub(crate) static ROUTE: GlobalSignal<Route> = GlobalSignal::new(|| Route::Stores);
-
-/// The tab that reads as current on `route`: a store's page and the seller's
-/// pages are both reached from Stores, so Stores stays lit on them. `None`
-/// for the footer's diagnostics.
-pub(crate) fn nav_tab(route: Route) -> Option<Route> {
-    match route {
-        Route::Stores | Route::Store | Route::MyStore => Some(Route::Stores),
-        Route::Purchases => Some(Route::Purchases),
-        Route::Diagnostics => None,
-    }
-}
-
-/// The pill at the top right that says what needs the seller
-/// (`my_store::requests_needing_seller`), when there is any, so a buyer's
-/// order is seen from every page (mockup `header()`). On the Stores tab as
-/// "Stores (2)" it read as two stores (critique C-1), so the tabs carry no
-/// count.
-pub(crate) fn needs_you_pill(needs_seller: usize) -> Option<String> {
-    match needs_seller {
-        0 => None,
-        1 => Some("1 needs you".to_string()),
-        n => Some(format!("{n} need you")),
-    }
-}
-
-/// Which of the seller's pages [`Route::MyStore`] opens on. Set by whatever
-/// sends the seller there, read when the pages mount.
-#[derive(Clone, PartialEq, Debug, Default)]
-pub(crate) enum SellerPage {
-    /// The first store's Overview, or opening a first store.
-    #[default]
-    First,
-    /// This store's Overview, whose first card is "Needs you".
-    Store(Vec<u8>),
-    /// Opening another store (the Stores page's "Open another store").
-    AnotherStore,
-}
-
-pub(crate) static SELLER_PAGE: GlobalSignal<SellerPage> = GlobalSignal::new(SellerPage::default);
-
 /// Show a store's own page: the store opened by a link, a typed code, a row
-/// of the Stores page, Purchases' "Open store", or the seller's "See your
-/// store as buyers do". Its state is asked for by whoever calls this, if it
-/// is not already here (`store_link::open_store`).
+/// of the Stores page, a purchase's store, or the seller's "View store".
+/// Opening the page asks for the store's state if it is not here
+/// ([`load_store_for_page`]).
 pub(crate) fn show_store(store_contract_id: Vec<u8>) {
-    crate::gateway::APP_STATE
-        .write()
-        .begin_browsing(store_contract_id);
-    *ROUTE.write() = Route::Store;
+    go(Page::Store {
+        store: store_contract_id,
+        tab: StoreTab::Items,
+    });
 }
 
-/// How [`open_store_page`] opens a store.
+/// How [`load_store_for_page`] asks for a store.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Opening {
-    /// Its state is here and followed: just show it.
+    /// Its state is here and followed: nothing to ask for.
     Loaded,
-    /// Not here, or here only to be listed (`AppState::light_stores`): open
-    /// it by its code, which fetches it with a subscription and remembers it.
+    /// Not here, or here only to be listed (`AppState::light_stores`): asked
+    /// for by its code, which fetches it with a subscription and remembers it.
     ByCode(harvest_common::store::StoreParameters),
-    /// No code known for it anywhere: fetch it by its address, which still
+    /// No code known for it anywhere: fetched by its address, which still
     /// gives up after a while.
     ById,
 }
 
-/// How to open the store `store_contract_id`: see [`Opening`]. Its code is
+/// How to ask for the store `store_contract_id`: see [`Opening`]. Its code is
 /// looked for where this node may hold it: the codes stores were opened
 /// under, the remembered stores (removed ones too), and this node's own
 /// stores' keys.
@@ -134,52 +72,71 @@ pub(crate) fn opening_for(state: &crate::state::AppState, store_contract_id: &[u
     }
 }
 
-/// Show a store's own page from a button that names it by id (Purchases'
-/// "Open store", a visited row, "See your store as buyers do"). A store
-/// whose state is not here is fetched (`store_link::open_store`, or by its
-/// address when no code is known), and that fetch gives up after a while, so
-/// the page never says "Loading" for good.
-pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
-    let opening = opening_for(&crate::gateway::APP_STATE.peek(), &store_contract_id);
+/// Ask for the state of a store a page is about to show, when it is not
+/// here (a store page, an item, an order or a conversation opened by a
+/// button, Back, or a reload). Its fetch gives up after a while
+/// (`store_link::fetch_store_id`), so a page never says "Loading" for good.
+/// Does nothing for a store already here and followed.
+pub(crate) fn load_store_for_page(store_contract_id: &[u8]) {
+    let opening = opening_for(&crate::gateway::APP_STATE.peek(), store_contract_id);
+    let Ok(bytes) = <[u8; 32]>::try_from(store_contract_id) else {
+        crate::gateway::APP_STATE
+            .write()
+            .note_store_link_failed(store_contract_id, "That store can\u{2019}t be opened.");
+        return;
+    };
+    let id = freenet_stdlib::prelude::ContractInstanceId::new(bytes);
     match opening {
-        Opening::Loaded => show_store(store_contract_id),
-        Opening::ByCode(params) => crate::store_link::open_store(params),
-        Opening::ById => match <[u8; 32]>::try_from(store_contract_id.as_slice()) {
-            Ok(bytes) => crate::store_link::open_store_id(
-                freenet_stdlib::prelude::ContractInstanceId::new(bytes),
-            ),
-            Err(_) => {
-                show_store(store_contract_id.clone());
-                crate::gateway::APP_STATE.write().note_store_link_failed(
-                    &store_contract_id,
-                    "That store can\u{2019}t be opened.",
-                );
-            }
-        },
+        Opening::Loaded => {}
+        Opening::ByCode(params) => {
+            crate::gateway::APP_STATE
+                .write()
+                .note_store_code(store_contract_id.to_vec(), params.code().to_string());
+            crate::store_link::fetch_store_id(id);
+        }
+        Opening::ById => crate::store_link::fetch_store_id(id),
     }
+}
+
+/// Show a store's own page from a button that names it by id: the same as
+/// [`show_store`], kept for the callers that name it so.
+pub(crate) fn open_store_page(store_contract_id: Vec<u8>) {
+    show_store(store_contract_id);
 }
 
 /// A followed link named a store the old way: the store page says so.
 pub(crate) fn show_old_format_link() {
     crate::gateway::APP_STATE.write().note_old_format_link();
-    *ROUTE.write() = Route::Store;
+    super::router::replace(Page::Store {
+        store: Vec::new(),
+        tab: StoreTab::Items,
+    });
 }
 
-/// Show the seller's pages, on `page`.
-pub(crate) fn open_seller_page(page: SellerPage) {
-    *SELLER_PAGE.write() = page;
-    *ROUTE.write() = Route::MyStore;
+/// The pill at the top right, when anything needs the person using this
+/// device: as a seller (`my_store::SellerStore::needs_you`) or as a buyer
+/// (an order to pay, a store that replied). The browser tab's title carries
+/// the same count.
+pub(crate) fn needs_you_pill(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 needs you".to_string()),
+        n => Some(format!("{n} need you")),
+    }
 }
 
 #[component]
 pub fn App() -> Element {
-    let current_route = ROUTE();
+    let page = PAGE();
     let connection_status = CONNECTION_STATUS.read().clone();
-    // A buyer's request arriving is the one thing a seller must not miss, so
-    // its count rides on the navigation, visible from every page.
-    let waiting = super::my_store::requests_needing_seller(&crate::gateway::APP_STATE.read());
-    let needs_pill = needs_you_pill(waiting);
-    let current_tab = nav_tab(current_route);
+    // What needs the person, as a seller and as a buyer, rides on the header,
+    // visible from every page: a buyer's order arriving is the one thing a
+    // seller must not miss, and a store's reply the one a buyer would.
+    let places = super::needs::header_places();
+    let needs_count: usize = places.iter().map(|p| p.count).sum();
+    let current_tab = page.nav_tab();
+    // Back and Forward, for the life of the page.
+    use_hook(super::router::listen_for_back);
 
     #[cfg(all(target_arch = "wasm32", not(feature = "no-sync")))]
     {
@@ -201,8 +158,12 @@ pub fn App() -> Element {
                 // If this page was opened from a shared store link, fetch and
                 // subscribe to that store now. It needs only the websocket:
                 // a buyer following a seller's link has no ghostkey and needs
-                // neither delegate to read a store.
-                crate::store_link::open_store_from_url();
+                // neither delegate to read a store. Otherwise the page its
+                // fragment names (a reload, or a link to a page), with the
+                // store it shows asked for now the websocket is up.
+                if !super::router::start() {
+                    crate::store_link::open_store_from_url();
+                }
 
                 let harvest_wasm = include_bytes!("../../public/contracts/harvest_delegate.wasm");
                 let harvest_key = match crate::gateway::register_delegate(harvest_wasm).await {
@@ -340,23 +301,28 @@ pub fn App() -> Element {
             // An unnamed store keeps the plain title, not "Harvest - ".
             .filter(|name| !name.is_empty());
 
-        match (&current_route, store_name) {
-            (Route::Store, Some(name)) => crate::document_title::set_store_title(name),
-            _ => crate::document_title::set_default_title(),
-        }
+        let on_store = matches!(page, Page::Store { .. } | Page::Item { .. });
+        crate::document_title::set_counted_title(needs_count, store_name.filter(|_| on_store));
     }
 
-    let status_class = match &connection_status {
-        ConnectionStatus::Connected => "harvest-status connected",
-        ConnectionStatus::Connecting => "harvest-status connecting",
-        ConnectionStatus::Error(_) => "harvest-status error",
-        ConnectionStatus::Disconnected => "harvest-status",
+    // A dot while all is well; words only when the connection is not.
+    let (status_class, status_words) = match &connection_status {
+        ConnectionStatus::Connected => ("harvest-status connected", None),
+        ConnectionStatus::Connecting => (
+            "harvest-status connecting",
+            Some("Connecting\u{2026}".to_string()),
+        ),
+        ConnectionStatus::Error(_) => ("harvest-status error", Some(connection_status.to_string())),
+        ConnectionStatus::Disconnected => ("harvest-status", Some("Disconnected".to_string())),
     };
 
     rsx! {
         div { class: "harvest-app",
             header { class: "harvest-header",
-                div { class: "harvest-title-group",
+                button {
+                    class: "harvest-title-group",
+                    aria_label: "Harvest, to Stores",
+                    onclick: move |_| go(Page::Stores),
                     img {
                         class: "harvest-logo",
                         src: "harvest-logo.svg",
@@ -365,32 +331,29 @@ pub fn App() -> Element {
                     h1 { class: "harvest-title", "Harvest" }
                 }
                 div { class: "harvest-header-right",
-                    // To the store that needs the seller (the first, when
-                    // several do), on its Overview, whose first card is
-                    // "Needs you".
-                    if let Some(ref pill) = needs_pill {
-                        // The button is the 44px tap area on a phone; the
-                        // pill inside stays small (round-6 critique).
-                        button {
-                            class: "needs-hit",
-                            onclick: move |_| {
-                                let first = super::my_store::first_store_needing_seller(
-                                    &crate::gateway::APP_STATE.peek(),
-                                );
-                                open_seller_page(first.map_or(SellerPage::First, SellerPage::Store));
-                            },
-                            span { class: "needs-pill", "{pill}" }
+                    super::needs::NeedsPill { places }
+                    span {
+                        class: "{status_class}",
+                        title: "{connection_status}",
+                        role: "status",
+                        span { class: "status-dot", aria_hidden: "true" }
+                        if let Some(words) = status_words {
+                            span { class: "status-words", "{words}" }
+                        } else {
+                            span { class: "visually-hidden", "Connected to Freenet" }
                         }
                     }
-                    span { class: "{status_class}", "{connection_status}" }
                 }
             }
             nav { class: "harvest-nav", aria_label: "Main",
-                for (route , label) in [(Route::Stores, "Stores"), (Route::Purchases, "Purchases")] {
+                for (tab , label , target) in [
+                    (NavTab::Stores, "Stores", Page::Stores),
+                    (NavTab::Purchases, "Purchases", Page::Purchases),
+                ] {
                     button {
-                        class: if current_tab == Some(route) { "nav-btn active" } else { "nav-btn" },
-                        aria_current: if current_tab == Some(route) { "page" } else { "false" },
-                        onclick: move |_| *ROUTE.write() = route,
+                        class: if current_tab == Some(tab) { "nav-btn active" } else { "nav-btn" },
+                        aria_current: if current_tab == Some(tab) { "page" } else { "false" },
+                        onclick: move |_| go(target.clone()),
                         "{label}"
                     }
                 }
@@ -398,28 +361,24 @@ pub fn App() -> Element {
 
             {notification_bar()}
 
-            match current_route {
-                Route::Stores => rsx! { StoresPage {} },
-                Route::Store => rsx! { StorePage {} },
-                Route::Purchases => rsx! { MyPurchases {} },
-                Route::MyStore => rsx! { MyStore {} },
-                Route::Diagnostics => rsx! { BitcoinView {} },
+            main { class: "harvest-main",
+                {super::pages::page_body(page)}
             }
 
             // Details for whoever needs them (a developer, or a seller asked
-            // which build they run), folded away: a build time and "Bitcoin
-            // bridge status" in every visitor's footer confused first-time
-            // visitors (freenet.org/open critique). Sellers reach the Bitcoin
-            // page from Settings.
+            // which build they run), quiet at the foot of every page: a build
+            // time and "Bitcoin bridge status" in every visitor's footer
+            // confused first-time visitors (freenet.org/open critique).
             footer { class: "harvest-footer",
                 details {
                     summary { "About this version" }
                     p { "Built {format_build_time()}." }
-                    button {
-                        class: "link-btn",
-                        onclick: move |_| *ROUTE.write() = Route::Diagnostics,
-                        "Harvest\u{2019}s connection to Bitcoin"
-                    }
+                }
+                span { class: "sep", aria_hidden: "true", "\u{00b7}" }
+                button {
+                    class: "link-btn",
+                    onclick: move |_| go(Page::Diagnostics),
+                    "Diagnostics"
                 }
             }
         }
@@ -485,7 +444,7 @@ async fn harvest_delegate_ready() {
             .payment_xpub_loaded = true;
     }
     // And never wait on its answer forever (harvest#163): an answer can
-    // still be lost, and the page would sit on "Checking your payment key".
+    // still be lost, and the page would sit on "Checking your payout wallet".
     // Asked once more, then the form is shown.
     wasm_bindgen_futures::spawn_local(async {
         gloo_timers::future::TimeoutFuture::new(crate::state::PAYMENT_KEY_ANSWER_WAIT_MS).await;
@@ -681,10 +640,10 @@ mod route_tests {
     #[test]
     fn every_way_of_opening_a_store_lands_on_its_own_page() {
         in_app(|| {
-            assert_eq!(*ROUTE.peek(), Route::Stores, "the app opens on Stores");
+            assert_eq!(*PAGE.peek(), Page::Stores, "the app opens on Stores");
             let linked = params(7);
             crate::store_link::open_store(linked.clone());
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id_of(&linked)));
             {
                 let state = crate::gateway::APP_STATE.peek();
                 assert_eq!(state.active_store_id, Some(id_of(&linked)));
@@ -697,9 +656,9 @@ mod route_tests {
 
             // Back to Stores, then a store opened from Purchases or from
             // the seller's own pages, by its id.
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             open_store_page(vec![9u8; 32]);
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(vec![9u8; 32]));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().active_store_id,
                 Some(vec![9u8; 32])
@@ -711,18 +670,18 @@ mod route_tests {
             crate::gateway::APP_STATE
                 .write()
                 .note_store_code(id_of(&known), known.code().to_string());
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             open_store_page(id_of(&known));
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id_of(&known)));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().active_store_id,
                 Some(id_of(&known))
             );
 
             // A link from before store codes: the store page says why.
-            *ROUTE.write() = Route::Stores;
+            go(Page::Stores);
             show_old_format_link();
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert!(matches!(*PAGE.peek(), Page::Store { .. }));
             assert_eq!(
                 crate::gateway::APP_STATE.peek().store_link_error.as_deref(),
                 Some(crate::store_link::OLD_FORMAT_LINK_MESSAGE)
@@ -733,29 +692,44 @@ mod route_tests {
         });
     }
 
-    /// The seller's pages open on the store whose card was pressed, or on
-    /// opening another store, and keep the Stores tab lit.
-    #[test]
-    fn a_store_card_opens_that_stores_seller_pages() {
-        in_app(|| {
-            open_seller_page(SellerPage::Store(vec![3u8; 32]));
-            assert_eq!(*ROUTE.peek(), Route::MyStore);
-            assert_eq!(*SELLER_PAGE.peek(), SellerPage::Store(vec![3u8; 32]));
-            open_seller_page(SellerPage::AnotherStore);
-            assert_eq!(*SELLER_PAGE.peek(), SellerPage::AnotherStore);
-            assert_eq!(nav_tab(*ROUTE.peek()), Some(Route::Stores));
-        });
+    /// The page for a store's own items.
+    fn store_page(id: Vec<u8>) -> Page {
+        Page::Store {
+            store: id,
+            tab: StoreTab::Items,
+        }
     }
 
-    /// Two tabs. A store's page and the seller's pages light Stores; the
-    /// footer's diagnostics light neither.
+    /// The seller's pages and opening a store are reached from Stores, and
+    /// keep its tab lit; an order, a conversation and the backup light
+    /// Purchases; the footer's diagnostics light neither.
     #[test]
-    fn stores_stays_lit_on_the_pages_reached_from_it() {
-        assert_eq!(nav_tab(Route::Stores), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::Store), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::MyStore), Some(Route::Stores));
-        assert_eq!(nav_tab(Route::Purchases), Some(Route::Purchases));
-        assert_eq!(nav_tab(Route::Diagnostics), None);
+    fn each_page_lights_the_tab_it_is_reached_from() {
+        use super::super::router::{OrderAt, SellerView};
+        in_app(|| {
+            go(Page::Seller {
+                store: Some(vec![3u8; 32]),
+                view: SellerView::Home,
+            });
+            assert_eq!(PAGE.peek().nav_tab(), Some(NavTab::Stores));
+        });
+        assert_eq!(Page::Stores.nav_tab(), Some(NavTab::Stores));
+        assert_eq!(store_page(vec![1u8; 32]).nav_tab(), Some(NavTab::Stores));
+        assert_eq!(
+            Page::OpenStore { another: true }.nav_tab(),
+            Some(NavTab::Stores)
+        );
+        assert_eq!(Page::Purchases.nav_tab(), Some(NavTab::Purchases));
+        assert_eq!(Page::Backup.nav_tab(), Some(NavTab::Purchases));
+        assert_eq!(
+            Page::Order {
+                at: OrderAt::Kept([1u8; 32]),
+                order: harvest_common::payment::OrderId([2u8; 32]),
+            }
+            .nav_tab(),
+            Some(NavTab::Purchases)
+        );
+        assert_eq!(Page::Diagnostics.nav_tab(), None);
     }
 
     /// What needs the seller rides on the Stores tab, from every page, and
@@ -848,7 +822,7 @@ mod route_tests {
         in_app(|| {
             let id = vec![12u8; 32];
             open_store_page(id.clone());
-            assert_eq!(*ROUTE.peek(), Route::Store);
+            assert_eq!(*PAGE.peek(), store_page(id.clone()));
             assert!(crate::gateway::APP_STATE
                 .peek()
                 .foreground_loads

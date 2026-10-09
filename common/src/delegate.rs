@@ -330,16 +330,20 @@ pub enum HarvestDelegateRequest {
     },
 
     /// Record that the buyer holds a backup of exactly these items: the
-    /// conversations by store id and routing tag, the purchases by order id.
-    /// At most [`BACKUP_MARK_ITEMS`] a call (each is a secret write). An
-    /// item this node does not hold is skipped. A purchase's mark is
-    /// cleared when its order moves on (paid after the backup), so the
-    /// buyer is asked to back it up again. Answered with
+    /// conversations by store id and routing tag, the purchases by order id
+    /// and [`KeptPurchase::backup_digest`] of the copy the backup holds. At
+    /// most [`BACKUP_MARK_ITEMS`] a call (each is a secret write). An item
+    /// this node does not hold is skipped, and so is a purchase whose held
+    /// copy is no longer the one the backup holds (it moved on between the
+    /// export and the save). A purchase's mark is cleared when its copy
+    /// moves on (paid, or a complaint filed, after the backup), so the
+    /// buyer is asked to back it up again. Sent only once the buyer has
+    /// saved the file. Answered with
     /// [`HarvestDelegateResponse::BackedUpMarked`].
     MarkBackedUp {
         request_id: RequestId,
         conversations: Vec<([u8; 32], [u8; 32])>,
-        orders: Vec<crate::payment::OrderId>,
+        orders: Vec<(crate::payment::OrderId, [u8; 32])>,
     },
 
     // === Listing Management ===
@@ -971,6 +975,19 @@ pub const BACKUP_IMPORT_ITEMS: usize = 16;
 pub const BACKUP_MARK_ITEMS: usize = 48;
 
 impl KeptPurchase {
+    /// What a backup's mark names this copy by: the BLAKE3 of the record
+    /// with `backed_up` cleared, so a copy that moved on after the export
+    /// (paid, or a complaint filed) is not marked as backed up by it.
+    pub fn backup_digest(&self) -> [u8; 32] {
+        let unmarked = KeptPurchase {
+            backed_up: false,
+            ..self.clone()
+        };
+        // A record that does not encode cannot have been exported either.
+        let bytes = crate::to_cbor(&unmarked).unwrap_or_default();
+        *blake3::hash(&bytes).as_bytes()
+    }
+
     /// The filed complaint, as the reputation record holds it.
     pub fn filed_complaint(&self) -> Option<crate::reputation::Complaint> {
         self.complaint.as_ref().map(|kept| kept.about(&self.order))
@@ -2589,7 +2606,7 @@ mod tests {
             Q::MarkBackedUp {
                 request_id: 27,
                 conversations: vec![([3u8; 32], [1u8; 32])],
-                orders: vec![crate::payment::OrderId([4u8; 32])],
+                orders: vec![(crate::payment::OrderId([4u8; 32]), [5u8; 32])],
             },
         ]
     }

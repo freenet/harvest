@@ -26,14 +26,17 @@ pub enum SellerRequest {
     /// No readable request of the buyer's agrees with the order (another
     /// device, keys not here, or it left the mailbox).
     NotFound,
-    /// More than one does, and they differ (another address, say).
-    Conflict,
+    /// More than one does, and they differ (another address, say): each
+    /// distinct version, so the seller can see what to ask the buyer about.
+    Conflict(Vec<SellerOrderRequest>),
 }
 
 /// What a buyer asked for, as the seller's order card shows it
 /// ([`AppState::seller_order_request`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SellerOrderRequest {
+    /// The listing the buyer asked for.
+    pub listing_id: Option<harvest_common::listing::ListingId>,
     /// The listing's title, while the store still lists it.
     pub title: Option<String>,
     pub quantity: u32,
@@ -461,6 +464,30 @@ pub struct AppState {
     /// The Ghost Key indexes this tab follows, by index contract id
     /// (harvest#93 phase 1c). See `index_flow`.
     pub ghostkey_indexes: HashMap<Vec<u8>, crate::index_flow::IndexView>,
+    /// Ghost Keys (by fingerprint) whose index migration walk has ended in a
+    /// way that settles what the key backs this session (harvest#181). See
+    /// `index_flow::IndexWalkEnd` and `AppState::store_creation_gate`.
+    pub index_walks_done: HashSet<String>,
+    /// Ghost Keys (by fingerprint) whose index wait has been started, and
+    /// those whose wait has run out (`index_flow::INDEX_SETTLE_WAIT_MS`).
+    pub index_waits_started: HashSet<String>,
+    pub index_waits_elapsed: HashSet<String>,
+    /// Earlier-generation Ghost Key indexes recovered by the index migration
+    /// walk, by Ghost Key (harvest#181). See `index_flow::IndexWalkEnd`.
+    pub recovered_indexes: HashMap<[u8; 32], harvest_common::ghostkey_index::GhostKeyIndexV1>,
+    /// Stores being closed for good, by id, with the signed halves so far
+    /// (`crate::closure_flow`, harvest#181).
+    pub closing_stores: HashMap<Vec<u8>, crate::closure_flow::ClosingStore>,
+    /// Closes handed to the node, by store key, until the store's state
+    /// shows it closed (`crate::closure_flow`, harvest#181).
+    pub closes_sent: HashMap<[u8; 32], crate::closure_flow::CloseSent>,
+    /// Off-target only: closes ready to publish, recorded instead of sent.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub closes_ready: Vec<(
+        Vec<u8>,
+        harvest_common::backing::AuthorizedRetirement,
+        harvest_common::backing::AuthorizedClosure,
+    )>,
 
     /// Store keys whose backing this session has published into their
     /// backer's index, so it is published at most once per session.
@@ -651,11 +678,6 @@ pub struct AppState {
     /// late failure of the first would then wipe it.
     pub store_publishing: bool,
 
-    /// A creation refused because its Ghost Key already backs a store, kept
-    /// so the seller can be asked whether they meant to open a second one
-    /// (harvest#93 section 6.2). Cleared when they answer either way.
-    pub second_store_offer: Option<SecondStoreOffer>,
-
     /// Off-target only: a store whose backing completed, recorded instead of
     /// published, so the creation flow can be followed in a test without a
     /// browser. See `backing_flow`.
@@ -811,9 +833,8 @@ pub struct AppState {
     /// A purchases backup being assembled from the delegate's pages (step
     /// 2; `crate::backup_flow`).
     pub backup_export: Option<crate::backup_flow::BackupExport>,
-    /// A finished backup file, (name, text), waiting to be offered as a
-    /// download.
-    pub backup_file_ready: Option<(String, String)>,
+    /// A finished backup file, waiting for the buyer to save it.
+    pub backup_file_ready: Option<crate::backup_flow::ReadyBackup>,
     /// A restore being sent a chunk at a time.
     pub backup_restore: Option<crate::backup_flow::BackupRestore>,
     /// What the purchases backup last said, shown under its buttons.
@@ -896,6 +917,11 @@ pub struct AppState {
     /// every keystroke in a reply box, and each verdict is an RSA chain check.
     /// See [`AppState::voucher_verifies`].
     pub voucher_verdicts: std::cell::RefCell<HashMap<[u8; 32], bool>>,
+    /// When this session first saw each mailbox entry, by digest: the
+    /// arrival time `components::message_view::awaiting_reply` caps a buyer
+    /// line's own claimed time at. Per session: after a reload it starts
+    /// again, which errs toward "waiting".
+    pub mailbox_first_seen: std::cell::RefCell<HashMap<[u8; 32], chrono::DateTime<chrono::Utc>>>,
 
     /// The master key vouchers are checked against in tests; production
     /// always uses Freenet's (`ghostkey_cert`).
@@ -907,11 +933,6 @@ pub struct AppState {
 /// that supply the rest of its inputs. See `start_store_creation_if_ready`.
 #[derive(Clone, Debug)]
 pub struct PendingStoreCreation {
-    /// The seller said, on purpose, that this Ghost Key may back a second
-    /// store (harvest#93 section 6.2). Carried into `CreateStoreKey` so the
-    /// delegate's own one-store rule lets it through, and it turns off this
-    /// tab's check too.
-    pub another_store: bool,
     pub ghostkey_fingerprint: String,
     pub seller_verifying_key_bytes: [u8; 32],
     /// Filled by the ghostkey delegate's `Certificate` (or `GhostKeyDetail`)
@@ -1346,7 +1367,7 @@ pub(crate) fn spawn_bitcoin_requests(requests: Vec<harvest_common::BitcoinDelega
                     state.abandon_payment_key_request(request_id);
                     state
                         .notifications
-                        .push(format!("Could not save your payment key: {e}"));
+                        .push(format!("Could not save your payout wallet: {e}"));
                 }
                 Req::DeriveOrderAddress { request_id, .. } => {
                     state.abandon_address_request(request_id);
@@ -1487,6 +1508,10 @@ pub(crate) const PAYMENT_KEY_ANSWER_WAIT_MS: u32 = 15_000;
 // Longer than a delegate usually takes to answer (seconds, even on a loaded
 // node), short enough that "Checking" does not look like a hang.
 const _: () = assert!(PAYMENT_KEY_ANSWER_WAIT_MS >= 10_000 && PAYMENT_KEY_ANSWER_WAIT_MS <= 60_000);
+
+/// Why nothing is invoiced at a store closed for good (harvest#181).
+pub(crate) const STORE_CLOSED_INVOICE: &str =
+    "this store is closed for good, so it can't take orders any more";
 
 /// Why an invoice waits (harvest#164).
 pub(crate) const STORE_STILL_MOVING_INVOICE: &str = "your store is still moving to this version \
@@ -1853,6 +1878,11 @@ pub enum PendingSignature {
     /// Harvest delegate's watch key (`crate::auto_invoice_flow`). A
     /// background request, handled as the watch requests are.
     WatchDelegation(Box<crate::auto_invoice_flow::PendingWatchDelegation>),
+    /// The retirement of a store's backer, half of closing it for good
+    /// (`crate::closure_flow`, harvest#181).
+    Retirement(Box<crate::closure_flow::PendingRetirement>),
+    /// A store's closure, the other half.
+    Closure(Box<crate::closure_flow::PendingClosure>),
 }
 
 /// Which key a pending signature is asked of, and so which answer may settle
@@ -1890,6 +1920,8 @@ impl PendingSignature {
                     backing: pending.statement.clone(),
                 })
             }
+            PendingSignature::Retirement(pending) => harvest_common::to_cbor(&pending.retirement),
+            PendingSignature::Closure(pending) => harvest_common::to_cbor(&pending.closure),
         }
     }
 
@@ -1910,7 +1942,9 @@ impl PendingSignature {
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
             | PendingSignature::Despatch(_)
-            | PendingSignature::BackingAcceptance(_) => Signer::StoreKey,
+            | PendingSignature::BackingAcceptance(_)
+            | PendingSignature::Retirement(_)
+            | PendingSignature::Closure(_) => Signer::StoreKey,
             PendingSignature::InboxEntry(_)
             | PendingSignature::WatchDelegation(_)
             | PendingSignature::BackingStatement(_)
@@ -1943,24 +1977,6 @@ impl PendingSignature {
             _ => None,
         }
     }
-}
-
-/// A refused creation, waiting on the seller's answer to "open a second
-/// store under this Ghost Key anyway?".
-///
-/// The refusal alone is a dead end: a Ghost Key that already backs a store
-/// cannot back another, and nothing in this build can take a backing off a
-/// store (harvest#104), so the only other way forward is a different Ghost
-/// Key. Some sellers do want two stores under one key, so the refusal is
-/// escapable rather than final.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SecondStoreOffer {
-    pub fingerprint: String,
-    pub seller_verifying_key_bytes: [u8; 32],
-    /// The store this Ghost Key already backs, as the refusal named it.
-    pub other_store: String,
-    pub details: StoreDetails,
-    pub carried_listings: Vec<harvest_common::listing::Listing>,
 }
 
 /// What a seller has typed to issue one invoice, before it has an address.
@@ -2637,9 +2653,8 @@ impl PaymentBlocker {
             PaymentBlocker::SellerIdentityUnknown => "This store's identity does not check out, \
                  so nothing here can be tied to the seller. Do not pay."
                 .to_string(),
-            PaymentBlocker::StoreClosed => "This store has closed. Its seller closed it because \
-                 its key may be in someone else's hands, so an order from it may not be the \
-                 seller's. Do not pay."
+            PaymentBlocker::StoreClosed => "This store has closed for good, so an order from \
+                 it can no longer be relied on. Do not pay."
                 .to_string(),
             PaymentBlocker::CommitmentNotTheSellers(why) => format!(
                 "The published order is not signed by this store's seller ({why}). Do not pay."
@@ -3324,9 +3339,15 @@ pub struct BrowsingStore {
     /// longer, and it is deliberately not persisted alongside the
     /// conversation secret -- it is not part of what a buyer loses by closing
     /// a tab, since the messages themselves come back out of the mailbox
-    /// after a reload. What is lost is only the "You, from this tab" label,
-    /// so a recalled thread describes its own messages by direction. Both are
-    /// truthful; the second is less specific.
+    /// after a reload. The label survives a reload through the harvest
+    /// delegate, which keeps the same digests (#221,
+    /// [`AppState::kept_as_sent`]). A message neither holds (sent from another
+    /// device, or past the delegate's caps) stays in time order but is drawn
+    /// dashed as "Not confirmed as yours" (`message_view::who`), on both
+    /// screens. The record also decides which
+    /// messages the seller's inbox exempts from its gate as the seller's own
+    /// (`message_view::shown_to_seller`), and which sent messages have not
+    /// landed yet.
     pub sent_messages: Vec<SentMessage>,
 }
 
@@ -4444,7 +4465,14 @@ impl AppState {
                 store.backing = view;
             }
         }
-        let currents = self.browsing_stores.values().filter_map(|store| {
+        // An earlier generation of a store whose current one is loaded is
+        // left out: it never receives the store's later records, so a
+        // retirement there (closing one of two stores, harvest#181) would
+        // never take effect on this device.
+        let currents = self.browsing_stores.iter().filter_map(|(id, store)| {
+            if self.superseded_generation(id) {
+                return None;
+            }
             let view = store.backing.as_ref()?;
             if !view.certificate_status.is_verified() {
                 return None;
@@ -5720,6 +5748,13 @@ impl AppState {
             if peer.len() != harvest_common::mailbox::SENDER_KEY_BYTES {
                 continue;
             }
+            // A non-canonical twin of a real tag would get the real
+            // conversation's keys from the delegate, which does not check;
+            // it is never read, so its keys are never asked for
+            // (`messaging::is_canonical_tag`).
+            if !crate::messaging::is_canonical_tag(peer) {
+                continue;
+            }
             if self.conversation_keys.contains_key(peer)
                 || self.declined_conversation_tags.contains(peer)
                 || wanted.contains(peer)
@@ -6006,17 +6041,35 @@ impl AppState {
         // mistake -- skipping a conversation that was never actually kept,
         // which is the silent failure this whole mechanism exists to
         // prevent.
+        let tag = self
+            .browsing_stores
+            .get(store_contract_id)?
+            .conversations
+            .last()?
+            .buyer_public_key;
+        self.conversation_to_keep_tagged(store_contract_id, seller_encryption_key, &tag)
+    }
+
+    /// [`Self::conversation_to_keep`] for the conversation tagged `tag`,
+    /// which need not be the last: a message written from an order's own
+    /// thread goes into that order's conversation.
+    pub fn conversation_to_keep_tagged(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        tag: &[u8; 32],
+    ) -> Option<harvest_common::HarvestDelegateRequest> {
         let request_id = self.next_messaging_request_id();
         let conversation = self
             .browsing_stores
             .get(store_contract_id)?
             .conversations
-            .last()?;
-        let tag = conversation.buyer_public_key;
+            .iter()
+            .find(|conversation| conversation.buyer_public_key == *tag)?;
         let request =
             conversation.to_persist(store_contract_id, seller_encryption_key, request_id)?;
         self.pending_conversation_persists
-            .insert(request_id, (store_contract_id.to_vec(), tag));
+            .insert(request_id, (store_contract_id.to_vec(), *tag));
         Some(request)
     }
 
@@ -6027,6 +6080,21 @@ impl AppState {
         seller_encryption_key: &[u8; 32],
     ) {
         let Some(request) = self.conversation_to_keep(store_contract_id, seller_encryption_key)
+        else {
+            return;
+        };
+        self.send_to_harvest_delegate("keep this conversation", &request);
+    }
+
+    /// [`Self::conversation_to_keep_tagged`], dispatched.
+    pub fn keep_conversation_tagged(
+        &mut self,
+        store_contract_id: &[u8],
+        seller_encryption_key: &[u8; 32],
+        tag: &[u8; 32],
+    ) {
+        let Some(request) =
+            self.conversation_to_keep_tagged(store_contract_id, seller_encryption_key, tag)
         else {
             return;
         };
@@ -7667,21 +7735,42 @@ impl AppState {
         self.notifications.retain(|n| n != notice);
     }
 
-    /// What the buyer of this seller's `order` asked for, read from the Buy
-    /// now request it answers in the store's mailbox: the listing's title
-    /// (while it is listed), how many, where to send it, the note, and the
-    /// delivery region and choices. What the seller's order card shows, so
-    /// the address is on the card rather than in the message thread (the
-    /// 2026-09-27 friction report).
+    /// Whether the seller's app still shows the ship-to address of `order`
+    /// (`fulfilment::address_retained`), judged against this node's own tip
+    /// for the order's network and the store's despatch of it.
+    pub fn address_retained_for(&self, order: &harvest_common::payment::AuthorizedOrder) -> bool {
+        let tip = self
+            .bitcoin
+            .tips
+            .get(&order.order.network)
+            .and_then(|t| t.tip_height);
+        crate::fulfilment::address_retained(order, self.despatch_of(order).as_ref(), tip)
+    }
+
+    /// What the buyer of this seller's `order` asked for, read from the
+    /// request it answers in the store's mailbox: the listing's title (while
+    /// it is listed), how many, where to send it, the note, and the delivery
+    /// region and choices. What the seller's order card shows, so the address
+    /// is on the card rather than in the message thread (the 2026-09-27
+    /// friction report).
     ///
     /// A request counts only if it is the buyer's (addressed to the seller)
     /// and agrees with the order the seller's store published for it: the
-    /// same listing (the order's tag) and the total the order asks. The
-    /// order's id binds the request's nonce and date, not its terms, so a
-    /// second request under the same id naming another quantity or listing
-    /// is possible (review of #190). Requests that agree with the order but
-    /// not with each other are a [`SellerRequest::Conflict`]: the seller asks
-    /// the buyer before sending.
+    /// same listing (the order's tag), and for a Buy now the total the order
+    /// asks. The order's id binds the request's nonce and date, not its
+    /// terms, so a second request under the same id naming another quantity
+    /// or listing is possible (review of #190). A quote request (from before
+    /// fixed prices, answered by hand) has no id to match: it counts when the
+    /// order carries its listing's tag under this conversation, its binding
+    /// and its receipt key, and it was made after the previous such order and
+    /// no later than this one (`message_view::quote_order_answers`; a buyer's
+    /// clock far off can misplace theirs, which reads as "not found"). Requests that agree with
+    /// the order but not with each other are a [`SellerRequest::Conflict`]:
+    /// the seller asks the buyer before sending.
+    ///
+    /// Once the order's complaint window has closed the address and note are
+    /// replaced by [`crate::fulfilment::ADDRESS_HIDDEN`]
+    /// ([`Self::address_retained_for`]): hidden, not deleted.
     pub fn seller_order_request(
         &self,
         store_contract_id: &[u8],
@@ -7707,66 +7796,127 @@ impl AppState {
             return orders.iter().map(|_| SellerRequest::NotFound).collect();
         };
         let entries = self.mailbox_entries(store_contract_id);
+        let index = crate::components::message_view::OrderIndex::new(&store.orders);
+        // Each request read once, with the id of the order answering it
+        // worked out once (codex on #205 round 3: per order, per request,
+        // this rescanned every order and rehashed every request). A Buy now
+        // names its order by request id, and counts only if its total
+        // agrees; a quote request is answered by the one order its binding,
+        // listing tag, receipt key and time place it with
+        // (`message_view::quote_order_answers`, review of #205 L1).
+        let requests: Vec<(
+            harvest_common::payment::OrderId,
+            SellerOrderRequest,
+            Option<u64>,
+        )> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content:
+                        MessageContent::OrderRequest {
+                            listing_id,
+                            quantity,
+                            shipping,
+                            note,
+                            instant,
+                            order_binding,
+                            buyer_receipt_key,
+                        },
+                    conversation,
+                    addressing: Addressing::ToSeller,
+                    timestamp,
+                    ..
+                } => {
+                    let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
+                    let listing_tag = self
+                        .conversation_keys
+                        .get(conversation.as_slice())
+                        .map(|keys| keys.listing_tag(listing_id))?;
+                    let (answering, total) = match instant {
+                        Some(selection) => {
+                            let id = selection.answered_request(&tag)?.order_id();
+                            let order = index.order(&id)?;
+                            (order, Some(selection.expected_total_sats))
+                        }
+                        None => (
+                            index.quote_answering(
+                                *timestamp,
+                                order_binding,
+                                buyer_receipt_key,
+                                &listing_tag,
+                            )?,
+                            None,
+                        ),
+                    };
+                    // Its listing: the order carries this listing's tag.
+                    if answering.order.listing_tag != Some(listing_tag) {
+                        return None;
+                    }
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == *listing_id)
+                        .map(|l| &l.listing);
+                    let (region, picks) = instant
+                        .as_ref()
+                        .map(|s| (s.region.clone(), s.choices.as_slice()))
+                        .unwrap_or_default();
+                    Some((
+                        answering.order.id.clone(),
+                        SellerOrderRequest {
+                            listing_id: Some(listing_id.clone()),
+                            title: listing.map(|l| l.title.clone()),
+                            quantity: *quantity,
+                            shipping: shipping.clone(),
+                            note: note.clone(),
+                            region,
+                            choices: labelled_choices(
+                                listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                                picks,
+                            ),
+                        },
+                        total,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        // Grouped by the order each answers, once, so each order below reads
+        // only its own requests (review round 4 of #205).
+        let mut by_order: HashMap<
+            harvest_common::payment::OrderId,
+            Vec<(SellerOrderRequest, Option<u64>)>,
+        > = HashMap::new();
+        for (id, request, total) in requests {
+            by_order.entry(id).or_default().push((request, total));
+        }
         orders
             .iter()
             .map(|order| {
-                let asked: Vec<SellerOrderRequest> = entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        MailboxEntry::Readable {
-                            content:
-                                MessageContent::OrderRequest {
-                                    listing_id,
-                                    quantity,
-                                    shipping,
-                                    note,
-                                    instant: Some(selection),
-                                    ..
-                                },
-                            conversation,
-                            addressing: Addressing::ToSeller,
-                            ..
-                        } => {
-                            let tag: [u8; 32] = conversation.as_slice().try_into().ok()?;
-                            let answers = selection
-                                .answered_request(&tag)
-                                .is_some_and(|request| request.order_id() == order.order.id);
-                            let same_listing = self
-                                .conversation_keys
-                                .get(conversation.as_slice())
-                                .is_some_and(|keys| {
-                                    order.order.listing_tag == Some(keys.listing_tag(listing_id))
-                                });
-                            let same_total =
-                                selection.expected_total_sats == order.order.amount_sats;
-                            (answers && same_listing && same_total).then(|| {
-                                let listing = store
-                                    .listings
-                                    .iter()
-                                    .find(|l| l.listing.id == *listing_id)
-                                    .map(|l| &l.listing);
-                                SellerOrderRequest {
-                                    title: listing.map(|l| l.title.clone()),
-                                    quantity: *quantity,
-                                    shipping: shipping.clone(),
-                                    note: note.clone(),
-                                    region: selection.region.clone(),
-                                    choices: labelled_choices(
-                                        listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
-                                        &selection.choices,
-                                    ),
-                                }
-                            })
-                        }
-                        _ => None,
-                    })
+                let retained = self.address_retained_for(order);
+                let mut asked: Vec<SellerOrderRequest> = by_order
+                    .get(&order.order.id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, total)| total.is_none_or(|total| total == order.order.amount_sats))
+                    .map(|(request, _)| request.clone())
                     .collect();
-                match asked.first() {
-                    None => SellerRequest::NotFound,
-                    Some(first) if asked.iter().all(|other| other == first) => {
-                        SellerRequest::Found(first.clone())
+                if !retained {
+                    for request in asked.iter_mut() {
+                        request.shipping = crate::fulfilment::ADDRESS_HIDDEN.to_string();
+                        request.note.clear();
                     }
-                    Some(_) => SellerRequest::Conflict,
+                }
+                let mut versions: Vec<SellerOrderRequest> = Vec::new();
+                for request in asked.drain(..) {
+                    if !versions.contains(&request) {
+                        versions.push(request);
+                    }
+                }
+                match versions.len() {
+                    0 => SellerRequest::NotFound,
+                    1 => SellerRequest::Found(versions.remove(0)),
+                    _ => SellerRequest::Conflict(versions),
                 }
             })
             .collect()
@@ -7782,6 +7932,17 @@ impl AppState {
         store_contract_id: &[u8],
         purchase: &BuyerPurchase,
     ) -> Option<(Option<String>, u32)> {
+        self.purchase_listing(store_contract_id, purchase)
+            .map(|(_, title, quantity)| (title, quantity))
+    }
+
+    /// [`Self::purchase_item`] with the listing the buyer asked for, which a
+    /// purchase's row and page show the item's picture by, when it has one.
+    pub fn purchase_listing(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<(harvest_common::listing::ListingId, Option<String>, u32)> {
         use crate::messaging::{Addressing, MessageContent};
         let store = self.browsing_stores.get(store_contract_id)?;
         let conversation = store
@@ -7822,7 +7983,64 @@ impl AppState {
             .iter()
             .find(|l| l.listing.id == listing_id)
             .map(|l| l.listing.title.clone());
-        Some((title, quantity))
+        Some((listing_id, title, quantity))
+    }
+
+    /// Where the buyer asked for `purchase` to be sent, as they typed it in
+    /// their own request: the address, the note, and the region and picks
+    /// (named by their group). The order page shows it under "Sending to".
+    /// `None` when the request is not in this device's thread, or two
+    /// requests under the order's id disagree.
+    pub fn purchase_ship_to(
+        &self,
+        store_contract_id: &[u8],
+        purchase: &BuyerPurchase,
+    ) -> Option<SellerOrderRequest> {
+        use crate::messaging::{Addressing, MessageContent};
+        let store = self.browsing_stores.get(store_contract_id)?;
+        let conversation = store
+            .conversations
+            .iter()
+            .find(|c| c.buyer_public_key == purchase.conversation)?;
+        let asked: Vec<SellerOrderRequest> = conversation
+            .read(&store.mailbox_messages)
+            .into_iter()
+            .filter_map(|message| match message.content {
+                MessageContent::OrderRequest {
+                    listing_id,
+                    quantity,
+                    shipping,
+                    note,
+                    instant: Some(selection),
+                    ..
+                } if message.addressing == Addressing::ToSeller
+                    && selection
+                        .answered_request(&purchase.conversation)
+                        .is_some_and(|request| request.order_id() == purchase.order_id) =>
+                {
+                    let listing = store
+                        .listings
+                        .iter()
+                        .find(|l| l.listing.id == listing_id)
+                        .map(|l| &l.listing);
+                    Some(SellerOrderRequest {
+                        title: listing.map(|l| l.title.clone()),
+                        listing_id: Some(listing_id),
+                        quantity,
+                        shipping,
+                        note,
+                        region: selection.region.clone(),
+                        choices: labelled_choices(
+                            listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
+                            &selection.choices,
+                        ),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let first = asked.first()?.clone();
+        asked.iter().all(|other| *other == first).then_some(first)
     }
 
     /// Send one `KeepPurchase`, once: nothing is sent while the same step for
@@ -9342,7 +9560,8 @@ impl AppState {
         use harvest_common::payment::{OrderStatus, MAX_ANCHOR_AGE_BLOCKS};
 
         // Before anything about the order: a closed store's key may be in
-        // someone else's hands, so no order from it is safe, published or not.
+        // someone else's hands (or it was a second store on one Ghost Key,
+        // harvest#181), so no order from it is safe, published or not.
         if store.closed {
             return vec![PaymentBlocker::StoreClosed];
         }
@@ -9811,6 +10030,35 @@ impl AppState {
         }
     }
 
+    /// When this session first saw the mailbox entry with `digest`: `now`,
+    /// the first time it is asked, and the same answer after
+    /// ([`Self::mailbox_first_seen`]). Bounded by
+    /// [`Self::prune_first_seen`], which the seller's inbox runs before it
+    /// reads, never in the middle of a read.
+    pub fn first_seen(
+        &self,
+        digest: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        *self
+            .mailbox_first_seen
+            .borrow_mut()
+            .entry(*digest)
+            .or_insert(now)
+    }
+
+    /// Past 16,384 distinct entries in one session (a mailbox holds 512 at
+    /// a time) the first-seen record is cleared whole, and every entry is
+    /// first seen again, as after a reload: the timestamps decide, which
+    /// errs toward "waiting". Run at the start of a read of the seller's
+    /// inbox, so one read never sees half a record (review after 6c61839).
+    pub fn prune_first_seen(&self) {
+        let mut seen = self.mailbox_first_seen.borrow_mut();
+        if seen.len() >= 16_384 {
+            seen.clear();
+        }
+    }
+
     /// Whether THIS browser wrote the message with this digest.
     ///
     /// # Why authorship is answered from local records and not from the
@@ -9823,9 +10071,12 @@ impl AppState {
     /// [`harvest_common::mailbox::MessageDirection`].
     ///
     /// The one thing a client can know first-hand is what it sent itself.
-    /// That is this. Everything else is unattributed, and
-    /// `components::message_view` says so rather than labelling a
-    /// counterparty-written message with the counterparty's name.
+    /// That is this. It decides what the seller's inbox exempts from its gate
+    /// as the seller's own (`components::message_view::shown_to_seller`);
+    /// and it is the only thing that earns a message the "You" label
+    /// (`message_view::who`), with the delegate's kept digests below, so a
+    /// message neither records, this side's own from another device
+    /// included, is shown as "Not confirmed as yours".
     ///
     /// # The identity compared here is the DIGEST, not the nonce
     ///
@@ -9852,9 +10103,10 @@ impl AppState {
     /// `entry_digest`, so a substitute sits beside the original. See
     /// `docs/messaging-privacy.md`.
     ///
-    /// It is per-tab, like everything else about a conversation: a reload
-    /// loses it, and messages this browser really did send then read as
-    /// unattributed, which is the honest direction to be wrong in.
+    /// The tab's own record is per-tab; after a reload the delegate's kept
+    /// digests answer instead. A message neither holds (sent from another
+    /// device, or past the delegate's caps) reads as unattributed, which is
+    /// the honest direction to be wrong in.
     pub fn authored_here(&self, store_contract_id: &[u8], digest: &[u8; 32]) -> bool {
         self.browsing_stores
             .get(store_contract_id)
@@ -11824,8 +12076,26 @@ impl AppState {
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
             Some(PendingSignature::Despatch(_)) => "the despatch",
             Some(PendingSignature::BackingAcceptance(_)) => "your new store",
+            Some(PendingSignature::Retirement(_) | PendingSignature::Closure(_)) => {
+                "the store's closing"
+            }
             _ => "your store",
         };
+        // Closing a store needs both halves: one refused, the close stops.
+        let closing = match &withdrawn {
+            Some(PendingSignature::Retirement(p)) => Some(p.store_contract_id.clone()),
+            Some(PendingSignature::Closure(p)) => Some(p.store_contract_id.clone()),
+            _ => None,
+        };
+        if let Some(store_contract_id) = closing {
+            self.abandon_close(&store_contract_id);
+            warn!("store key did not sign {what}: {reason}");
+            self.notifications.push(format!(
+                "{} ({reason})",
+                crate::closure_flow::CLOSE_NOT_SAVED
+            ));
+            return;
+        }
         warn!("store key did not sign {what}: {reason}");
         if let Some(PendingSignature::Listing(listing)) = &withdrawn {
             self.on_listing_published(&listing.listing.id, false);
@@ -11924,6 +12194,16 @@ impl AppState {
                 "this store belongs to {owner}, so only that identity can issue invoices \
                  on it"
             ));
+        }
+        // Closing for good is permanent and buyers refuse to pay a closed
+        // store (`PaymentBlocker::StoreClosed`), so nothing is issued there
+        // (harvest#181).
+        if self
+            .browsing_stores
+            .get(&invoice.store_contract_id)
+            .is_some_and(|store| store.closed)
+        {
+            return Err(STORE_CLOSED_INVOICE.to_string());
         }
         // A listing its seller took down is not one to start a fresh sale of
         // (harvest#70). An invoice answering a buyer's request is allowed
@@ -13520,8 +13800,12 @@ impl AppState {
                 // answer once the delegate has refused (#98 review, L1): an
                 // Error carries no request id, and the only request a
                 // creation has outstanding with this delegate at that stage
-                // is that one.
-                if self
+                // is that one. A purchases backup or restore waiting on its
+                // answer ends the same way (round 1 of step 2's review).
+                if self.backup_refused(&message) {
+                    self.notifications
+                        .push(format!("Delegate error: {message}"));
+                } else if self
                     .pending_store_creation
                     .as_ref()
                     .is_some_and(|p| p.store_verifying_key.is_none())
@@ -13737,6 +14021,12 @@ impl AppState {
             }
             Some(PendingSignature::StorePause(pending)) => {
                 self.on_store_pause_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Retirement(pending)) => {
+                self.on_retirement_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::Closure(pending)) => {
+                self.on_closure_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::StoreInfo(pending)) => {
                 self.details_sent(&pending.store_contract_id, pending.info.version);
@@ -17627,7 +17917,6 @@ mod tests {
 
     fn pending_creation() -> PendingStoreCreation {
         PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [7u8; 32],
             certificate_pem: String::new(),
@@ -18325,6 +18614,8 @@ mod tests {
                 | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_)
+                | PendingSignature::Closure(_)
                 | PendingSignature::MessageVoucher(_) => None,
             })
     }
@@ -19063,6 +19354,8 @@ mod tests {
                 | PendingSignature::WatchDelegation(_)
                 | PendingSignature::BackingStatement(_)
                 | PendingSignature::BackingAcceptance(_)
+                | PendingSignature::Retirement(_)
+                | PendingSignature::Closure(_)
                 | PendingSignature::MessageVoucher(_) => None,
             })
             .collect();
@@ -19512,7 +19805,6 @@ mod tests {
     fn a_ghostkey_error_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -19548,7 +19840,6 @@ mod tests {
     fn key_not_found_clears_a_waiting_store_creation() {
         let mut state = state_with_delegates();
         state.pending_store_creation = Some(PendingStoreCreation {
-            another_store: false,
             ghostkey_fingerprint: FINGERPRINT.to_string(),
             seller_verifying_key_bytes: [3u8; 32],
             certificate_pem: String::new(),
@@ -21654,6 +21945,24 @@ mod invoice_tests {
         );
     }
 
+    /// A store closed for good issues nothing (harvest#181): buyers refuse
+    /// to pay it, and closing is permanent. Mutated red by dropping the
+    /// closed check in `issue_invoice`.
+    #[test]
+    fn a_store_closed_for_good_cannot_issue_an_invoice() {
+        let mut state = seller_with_a_store();
+        state
+            .browsing_stores
+            .entry(STORE_ID.to_vec())
+            .or_default()
+            .closed = true;
+        assert_eq!(
+            state.issue_invoice(invoice()),
+            Err(STORE_CLOSED_INVOICE.to_string())
+        );
+        assert!(state.pending_invoices.is_empty());
+    }
+
     /// **A seller who cannot see the chain issues nothing at all.**
     ///
     /// The alternative is worse than it looks: an unanchored invoice is one
@@ -22919,7 +23228,6 @@ mod mailbox_read_tests {
         // reaching for the wrong fingerprint would most naturally pick up.
         let mut state = AppState {
             pending_store_creation: Some(PendingStoreCreation {
-                another_store: false,
                 ghostkey_fingerprint: "someone-else".to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 certificate_pem: String::new(),
@@ -23268,7 +23576,6 @@ mod delegate_correlation_tests {
     fn with_another_creation_in_flight() -> AppState {
         AppState {
             pending_store_creation: Some(PendingStoreCreation {
-                another_store: false,
                 ghostkey_fingerprint: THEIRS.to_string(),
                 seller_verifying_key_bytes: [0u8; 32],
                 // Empty on purpose: `start_store_creation_if_ready` gates on
@@ -25892,14 +26199,37 @@ mod buy_flow_tests {
             .order_id();
         // The order the store published for it: this listing's tag, the
         // total the buyer agreed. Unsigned: the card reads terms only.
-        let mut order = commitment(
-            &seller_signing_key(),
-            Some(anchor(TIP_HEIGHT - 1)),
-            OrderStatus::Paid,
+        // Genuinely paid, so its complaint window has an end to hide the
+        // address after, and signed as the answer to this request (its id
+        // is derived from the request), so its despatch verifies.
+        let answered = instant(12_000).answered_request(&tag).expect("dated");
+        let (unpaid, claims, tip) = a_paid_order_where(|o| {
+            o.amount_sats = 12_000;
+            o.request_id = Some(answered.request_id);
+            o.created_at = answered.requested_at;
+            o.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        });
+        let mut order = unpaid;
+        order.status = OrderStatus::Paid;
+        order.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+            claims, tip,
+        ));
+        assert_eq!(
+            order.order.id, order_id,
+            "precondition: the request's order"
         );
-        order.order.id = order_id.clone();
-        order.order.amount_sats = 12_000;
-        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .owner = Some(seller_signing_key().verifying_key().to_bytes());
+        // (The listing tag is signed in with the terms above.) The store's
+        // own order: the card reads the store (`OrderIndex`).
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .expect("the store")
+            .orders = vec![order.clone()];
         let ask = |listing: u8, quantity: u32, shipping: &str, total: u64| {
             buyer
                 .request_order(
@@ -25955,10 +26285,572 @@ mod buy_flow_tests {
                 ask(3, 2, "Elsewhere", 12_000),
             ],
         );
+        let SellerRequest::Conflict(versions) = state.seller_order_request(STORE, &order) else {
+            panic!("two versions: ask the buyer");
+        };
+        let mut shipped: Vec<&str> = versions.iter().map(|v| v.shipping.as_str()).collect();
+        shipped.sort();
         assert_eq!(
-            state.seller_order_request(STORE, &order),
-            SellerRequest::Conflict,
-            "two versions: ask the buyer"
+            shipped,
+            vec!["Elsewhere", "Jo Buyer\n1 Lane"],
+            "each version, once"
+        );
+
+        // Once the complaint window has closed, the card hides the address
+        // and the note (Ian, 2026-09-30); with no tip it cannot tell, and
+        // shows them. Red with the retention check dropped.
+        set(&mut state, vec![ask(3, 2, "Jo Buyer\n1 Lane", 12_000)]);
+        // Sent: an order never sent keeps its address (review round 2 of
+        // #205).
+        let closed_unsent = crate::fulfilment::complaint_window_end(&order, None)
+            .expect("a paid order's window has an end");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(closed_unsent + 1));
+        let SellerRequest::Found(unsent) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(
+            unsent.shipping, "Jo Buyer\n1 Lane",
+            "never sent: the seller may still send it late"
+        );
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        despatched(&mut state, &order);
+        assert!(state.despatch_of(&order).is_some(), "precondition: sent");
+        let closed =
+            crate::fulfilment::complaint_window_end(&order, state.despatch_of(&order).as_ref())
+                .expect("a paid order's window has an end");
+        let SellerRequest::Found(open) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(open.shipping, "Jo Buyer\n1 Lane", "inside the window");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(closed + 1));
+        let SellerRequest::Found(hidden) = state.seller_order_request(STORE, &order) else {
+            panic!("still found");
+        };
+        assert_eq!(hidden.shipping, crate::fulfilment::ADDRESS_HIDDEN);
+        assert_eq!(hidden.note, "");
+        assert_eq!(hidden.quantity, 2, "what to send stays");
+        state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
+        let SellerRequest::Found(shown) = state.seller_order_request(STORE, &order) else {
+            panic!("found");
+        };
+        assert_eq!(shown.shipping, "Jo Buyer\n1 Lane");
+    }
+
+    /// **A paid invoice answering a QUOTE request names what to send and
+    /// where**: now that requests are not shown as messages, the card is the
+    /// only place the seller reads the address. Matched by the order's
+    /// binding and listing tag, and only for an ask made before the order
+    /// was issued. Red with the quote arm dropped (not found), and with the
+    /// binding check dropped.
+    #[test]
+    fn the_sellers_card_reads_a_quote_request_its_invoice_answers() {
+        let (mut state, tag, _) = seller_holding_a_request();
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let entries =
+            crate::messaging::read_mailbox(&state.browsing_stores[STORE].mailbox_messages, &keys);
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            timestamp,
+            ..
+        } = entries[0].clone()
+        else {
+            panic!("the fixture's request reads");
+        };
+        // The card reads the store's own orders (`OrderIndex`): each case
+        // holds the order it asks about, as a real card does.
+        fn holding<'a>(state: &'a mut AppState, order: &AuthorizedOrder) -> &'a AppState {
+            state.browsing_stores.get_mut(STORE).unwrap().orders = vec![order.clone()];
+            state
+        }
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+        let SellerRequest::Found(asked) =
+            holding(&mut state, &order).seller_order_request(STORE, &order)
+        else {
+            panic!("the quote request answers the invoice");
+        };
+        assert_eq!(
+            (asked.quantity, asked.shipping.as_str()),
+            (2, "12 Example St")
+        );
+
+        let mut other = order.clone();
+        other.order.order_binding = Some([0x11; 32]);
+        assert_eq!(
+            holding(&mut state, &other).seller_order_request(STORE, &other),
+            SellerRequest::NotFound
+        );
+        assert!(
+            buyer_receipt_key.is_some(),
+            "precondition: the ask names a receipt key"
+        );
+        let mut unkeyed = order.clone();
+        unkeyed.order.buyer_receipt_key = Some([0x22; 32]);
+        assert_eq!(
+            holding(&mut state, &unkeyed).seller_order_request(STORE, &unkeyed),
+            SellerRequest::NotFound,
+            "an order carrying another receipt key answers nothing"
+        );
+        let mut earlier = order;
+        earlier.order.created_at = timestamp - chrono::Duration::minutes(5);
+        assert_eq!(
+            holding(&mut state, &earlier).seller_order_request(STORE, &earlier),
+            SellerRequest::NotFound,
+            "an ask after the invoice is for another order"
+        );
+    }
+
+    /// **The Orders tab files each conversation where its order is**
+    /// (round-6 critique 10-3): an unanswered quote request is a question
+    /// waiting for the seller, with no chat; once a paid invoice answers it,
+    /// its conversation opens and sits under that order, with the buyer's
+    /// plain text in it; an entry nobody can read is only counted. Red with
+    /// the order mapping dropped from the inbox.
+    #[test]
+    fn the_sellers_inbox_files_each_conversation_under_its_order() {
+        use crate::components::message_view::{is_question, seller_inbox};
+        let (mut state, tag, _) = seller_holding_a_request();
+        let junk = EncryptedMessage {
+            conversation_id: harvest_common::mailbox::ConversationId([0x5a; 32]),
+            sender_public_key: vec![0x5d; 32],
+            ciphertext: vec![0x5c; 48],
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a time"),
+            nonce: [0x5b; 24],
+        };
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .push(junk);
+
+        let inbox = seller_inbox(&state, STORE);
+        assert_eq!(inbox.unreadable, 1);
+        assert_eq!(inbox.threads.len(), 1, "junk is not a conversation");
+        let thread = &inbox.threads[0];
+        assert!(!thread.open);
+        assert_eq!(thread.chat_count(), 0, "a request is not a message");
+        assert!(is_question(thread));
+        // Junk and an unopened request never ask for the seller's reply
+        // (msg1 critique MSG-3): the count cannot be inflated for free.
+        assert!(!thread.awaiting_reply);
+        assert_eq!(
+            crate::components::message_view::replies_awaited(&state, STORE),
+            0
+        );
+
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            conversation_id,
+            timestamp,
+            ..
+        } = crate::messaging::read_mailbox(
+            &state.browsing_stores[STORE].mailbox_messages[..1],
+            &keys,
+        )
+        .remove(0)
+        else {
+            panic!("the fixture's request reads");
+        };
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+        let text = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Is it on its way?".into()),
+        )
+        .unwrap();
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = vec![order.clone()];
+        store.mailbox_messages.push(text);
+
+        // Through the inbox itself (review after 6c61839: the paid set was
+        // computed by a copy only tests called): an order awaiting payment,
+        // or cancelled, opens nothing, so the buyer's plain text is held
+        // back. Red with the inbox's paid check made always true.
+        for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+            state.browsing_stores.get_mut(STORE).unwrap().orders[0].status = status;
+            let unpaid = seller_inbox(&state, STORE);
+            let thread = unpaid
+                .for_order(&order.order.id)
+                .expect("still its conversation");
+            assert!(!thread.open, "{status:?} opens nothing");
+            assert_eq!(thread.chat_count(), 0, "{status:?}: text held back");
+            assert_eq!(unpaid.held_back, 1, "{status:?}");
+        }
+        state.browsing_stores.get_mut(STORE).unwrap().orders[0].status = OrderStatus::Paid;
+
+        let inbox = seller_inbox(&state, STORE);
+        let thread = inbox
+            .for_order(&order.order.id)
+            .expect("filed under its order");
+        assert!(thread.open, "a paid order opens it");
+        assert_eq!(thread.chat_count(), 1, "the buyer's plain text is shown");
+        assert_eq!(inbox.held_back, 0);
+        // The buyer wrote last in an open conversation: it waits for the
+        // seller, and "need you" counts it (msg1 critique MSG-3).
+        assert!(thread.awaiting_reply);
+        assert_eq!(
+            crate::components::message_view::replies_awaited(&state, STORE),
+            1
+        );
+        assert_eq!(thread.order_refs, vec![order.order.id.short()]);
+
+        // Review of #205, S2: the paid buyer, needing no Ghost Key, seals a
+        // "reply" in the seller's direction. It is not the seller's "You";
+        // the reply this device did send is.
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).from_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Agreed, full refund".into()),
+        )
+        .unwrap();
+        let genuine = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).from_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("Posting today".into()),
+        )
+        .unwrap();
+        state.record_sent_message(STORE, "Posting today".into(), &genuine);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend([forged, genuine]);
+        let inbox = seller_inbox(&state, STORE);
+        let lines = &inbox.for_order(&order.order.id).unwrap().lines;
+        let label = |text: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.item == crate::components::message_view::ChatItem::Said(text.into())
+                })
+                .map(|line| (line.who, line.trusted))
+        };
+        assert_eq!(label("Posting today"), Some(("You", true)));
+        // The seller has replied since: no longer waiting.
+        assert!(!inbox.for_order(&order.order.id).unwrap().awaiting_reply);
+        // The forged line is not counted as a message (review after
+        // b9c727f): the buyer's and the seller's confirmed reply are.
+        assert_eq!(inbox.for_order(&order.order.id).unwrap().chat_count(), 2);
+
+        // An input a hand-picked cache key once missed (review after
+        // 9417fbf): the order's listing tag changes under the same id and
+        // status between two reads, and the inbox follows it. Red with any
+        // cache keyed only on id and status.
+        state.browsing_stores.get_mut(STORE).unwrap().orders[0]
+            .order
+            .listing_tag = Some([0x77; 32]);
+        let moved = seller_inbox(&state, STORE);
+        assert!(
+            moved.for_order(&order.order.id).is_none(),
+            "the order no longer belongs to the conversation"
+        );
+        assert!(
+            moved.threads.iter().all(|thread| !thread.open),
+            "nothing paid opens it now"
+        );
+        assert_eq!(
+            label("Agreed, full refund"),
+            Some((crate::components::message_view::UNCONFIRMED, false))
+        );
+        assert_eq!(label("Is it on its way?"), Some(("Buyer", true)));
+    }
+
+    /// **A twin tag cannot take a paid order's conversation** (review of
+    /// #205, S1 and round 2 B1). X25519 ignores bit 255, and the seller's
+    /// clamped scalar kills any torsion component, so the buyer of a paid
+    /// order can write under the same tag with bit 255 set, or under any of
+    /// its torsion twins, and the delegate would derive the same keys; with a
+    /// twin read, it claims the same order and can stand under its card with
+    /// whatever the buyer wrote. None is read, filed or asked keys for, only
+    /// counted as unreadable. Red with the canonical check dropped from
+    /// `read_mailbox`, and with its subgroup check dropped.
+    #[test]
+    fn a_twin_tag_cannot_take_a_paid_orders_conversation() {
+        use crate::components::message_view::seller_inbox;
+        let (mut state, tag, _) = seller_holding_a_request();
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(&tag))].into();
+        let crate::messaging::MailboxEntry::Readable {
+            content:
+                crate::messaging::MessageContent::OrderRequest {
+                    order_binding,
+                    buyer_receipt_key,
+                    ..
+                },
+            conversation_id,
+            timestamp,
+            ..
+        } = crate::messaging::read_mailbox(
+            &state.browsing_stores[STORE].mailbox_messages[..1],
+            &keys,
+        )
+        .remove(0)
+        else {
+            panic!("the fixture's request reads");
+        };
+        let mut order = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        order.order.request_id = None;
+        order.order.order_binding = Some(order_binding);
+        order.order.buyer_receipt_key = buyer_receipt_key;
+        order.order.listing_tag = Some(seller_keys_for(&tag).listing_tag(&ListingId([3u8; 32])));
+        order.order.created_at = timestamp + chrono::Duration::minutes(5);
+
+        // Every twin: bit 255 set, and the torsion twins P + Q for the
+        // points Q of order dividing 8 (review round 2 of #205), which are
+        // canonical bytes and pass the delegate's contributory check. The
+        // exploit picks whichever sorts lowest; all of them are tried.
+        let mut twins: Vec<[u8; 32]> = Vec::new();
+        let mut high_bit = tag;
+        high_bit[31] |= 0x80;
+        twins.push(high_bit);
+        let point = curve25519_dalek::montgomery::MontgomeryPoint(tag)
+            .to_edwards(0)
+            .expect("a real tag is on the curve");
+        for torsion in curve25519_dalek::constants::EIGHT_TORSION.iter().skip(1) {
+            let twin = (point + torsion).to_montgomery().to_bytes();
+            if twin != tag && !twins.contains(&twin) {
+                twins.push(twin);
+            }
+        }
+        assert!(twins.len() > 1, "precondition: torsion twins exist");
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = vec![order.clone()];
+        for twin in &twins {
+            assert_eq!(
+                seller_keys_for(twin),
+                seller_keys_for(&tag),
+                "precondition: the twin derives the same keys"
+            );
+            // Written under the twin, with the conversation's own keys,
+            // naming the same listing so it would claim the same order.
+            let request = crate::messaging::seal_for_test(
+                &seller_keys_for(twin).to_seller,
+                twin,
+                &conversation_id,
+                crate::messaging::MessageContent::OrderRequest {
+                    listing_id: ListingId([3u8; 32]),
+                    quantity: 1,
+                    shipping: "Elsewhere".into(),
+                    note: String::new(),
+                    order_binding,
+                    buyer_receipt_key,
+                    instant: None,
+                },
+            )
+            .unwrap();
+            let fake = crate::messaging::seal_for_test(
+                &seller_keys_for(twin).from_seller,
+                twin,
+                &conversation_id,
+                crate::messaging::MessageContent::Text("Agreed, full refund".into()),
+            )
+            .unwrap();
+            store.mailbox_messages.extend([request, fake]);
+        }
+
+        // Asked for: no twin is, even with nothing cached.
+        let asked = state.conversation_keys_to_request(STORE);
+        if let Some(harvest_common::HarvestDelegateRequest::DeriveConversationKeys {
+            peer_public_keys,
+            ..
+        }) = asked
+        {
+            assert!(twins
+                .iter()
+                .all(|twin| !peer_public_keys.contains(&twin.to_vec())));
+        }
+        // And if a delegate answered for them anyway, none is read.
+        for twin in &twins {
+            state
+                .conversation_keys
+                .insert(twin.to_vec(), seller_keys_for(twin));
+        }
+        let inbox = seller_inbox(&state, STORE);
+        assert!(
+            inbox
+                .threads
+                .iter()
+                .all(|thread| !twins.contains(&thread.tag)),
+            "no twin is a conversation"
+        );
+        assert_eq!(
+            inbox.for_order(&order.order.id).map(|thread| thread.tag),
+            Some(tag),
+            "the real conversation stays under the order"
+        );
+        assert_eq!(
+            inbox.unreadable,
+            2 * twins.len(),
+            "the twins' entries are only counted"
+        );
+    }
+
+    /// **The seller's inbox does not scale with conversations × orders**
+    /// (review after 1bd9bcd). Anyone can open conversations with a store,
+    /// and get keys for them, at no cost; with 512 of them (the mailbox's
+    /// cap) and 4096 orders (the store's), matching each conversation against
+    /// every order took tenths of a second natively and more in wasm, on
+    /// every state change, from the header. Counted, not timed: no order is
+    /// matched one by one, and one order index serves every conversation's
+    /// requests (review after 6c61839: a scan of every order per request was
+    /// still conversations × orders). The junk carries quote requests and
+    /// Buy nows, which reach per-thread work even unopened; each request asks
+    /// the index a fixed number of times (review after 01f2bcf), and plain
+    /// text nothing vouches for makes no thread. Red with the order lookup
+    /// replaced by a scan, with an index built per thread, and with
+    /// `unanswered_requests_in` walking `by_id` instead of asking the index.
+    #[test]
+    fn the_sellers_inbox_does_not_scan_every_order_per_conversation() {
+        use crate::components::message_view::seller_inbox;
+        use crate::messaging::BuyerConversation;
+        let (mut state, _, _) = seller_holding_a_request();
+        let template = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::Paid,
+        );
+        let orders: Vec<AuthorizedOrder> = (0..harvest_common::store::MAX_ORDERS)
+            .map(|i| {
+                let mut o = template.clone();
+                let n = (i as u32).to_le_bytes();
+                o.order.id = harvest_common::payment::OrderId([
+                    n[0], n[1], n[2], n[3], 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]);
+                o.order.listing_tag = Some([
+                    n[0], n[1], n[2], n[3], 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]);
+                o
+            })
+            .collect();
+        let mut junk = Vec::new();
+        for i in 0..511u32 {
+            let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+            let tag = buyer.buyer_public_key;
+            state
+                .conversation_keys
+                .insert(tag.to_vec(), seller_keys_for(&tag));
+            junk.push(buyer.seal("junk".into()).expect("sealed"));
+            // A request in each: a quote request, or a Buy now.
+            let instant = (i % 2 == 1).then(|| crate::messaging::InstantSelection {
+                requested_at_ms: 1_700_000_000_000,
+                nonce: [i as u8; 16],
+                region: None,
+                choices: vec![],
+                expected_total_sats: 12_000,
+            });
+            junk.push(
+                buyer
+                    .request_order(&ListingId([3u8; 32]), 1, "x".into(), String::new(), instant)
+                    .expect("sealed"),
+            );
+        }
+        // And conversations holding only plain text nothing vouches for:
+        // nothing in them is shown, so they make no thread at all.
+        let mut silent: Vec<[u8; 32]> = Vec::new();
+        for _ in 0..50 {
+            let buyer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+            let tag = buyer.buyer_public_key;
+            state
+                .conversation_keys
+                .insert(tag.to_vec(), seller_keys_for(&tag));
+            junk.push(buyer.seal("junk".into()).expect("sealed"));
+            silent.push(tag);
+        }
+        let store = state.browsing_stores.get_mut(STORE).unwrap();
+        store.orders = orders;
+        store.mailbox_messages.extend(junk);
+        crate::order_threads::FULL_MATCHES.with(|n| n.set(0));
+        crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.set(0));
+        crate::components::message_view::ORDER_LOOKUPS.with(|n| n.set(0));
+        crate::components::message_view::BINDING_TAG_LOOKUPS.with(|n| n.set(0));
+        // No wall-clock bound: it would be flaky on a slow CI runner, and
+        // the counts below pin the property deterministically.
+        let inbox = seller_inbox(&state, STORE);
+        assert_eq!(
+            crate::order_threads::FULL_MATCHES.with(|n| n.get()),
+            0,
+            "orders are matched through the lookup, never one by one"
+        );
+        assert_eq!(
+            crate::components::message_view::ORDER_INDEX_BUILDS.with(|n| n.get()),
+            1,
+            "one order index for every conversation's requests"
+        );
+        // Each request asks the index once, never walks the orders: a Buy
+        // now (255 of them, odd i) by its request id, once for whether its
+        // address is hidden and once for whether it is answered; a quote
+        // request (256 here plus the fixture's one) once, by binding and tag.
+        assert_eq!(
+            crate::components::message_view::ORDER_LOOKUPS.with(|n| n.get()),
+            2 * 255,
+            "one id lookup per Buy now per question asked of it"
+        );
+        assert_eq!(
+            crate::components::message_view::BINDING_TAG_LOOKUPS.with(|n| n.get()),
+            257,
+            "one binding-and-tag lookup per quote request"
+        );
+        assert!(
+            !inbox
+                .threads
+                .iter()
+                .any(|thread| silent.contains(&thread.tag)),
+            "junk with nothing shown makes no thread"
+        );
+        assert!(
+            inbox.threads.len() >= 511,
+            "the request-bearing conversations reach per-thread work: {}",
+            inbox.threads.len()
         );
     }
 
@@ -26665,7 +27557,7 @@ mod buy_flow_tests {
         );
     }
 
-    /// **My store's overview counts the orders a seller must reissue, and
+    /// **The seller's Home tab counts the orders a seller must reissue, and
     /// only those** (harvest#93 phase 2): an aged-out unpaid order counts; a
     /// fresh one and a cancelled one do not. Pins the composition in
     /// `my_store::seller_stores` (seller filter, `needs_reissue`, and
@@ -32678,6 +33570,417 @@ mod buy_flow_tests {
         give_the_node_the_chain(&mut state, &settled, claims, tip);
         state.test_guards.push(recognised);
         (state, settled)
+    }
+
+    /// The fixtures' listing as the store lists it; unsigned, as only its id
+    /// is read here.
+    fn widget_listing() -> harvest_common::listing::AuthorizedListing {
+        harvest_common::listing::AuthorizedListing {
+            listing: harvest_common::listing::Listing {
+                checkout: None,
+                choices: Vec::new(),
+                id: widget(),
+                title: "Widget".into(),
+                description: String::new(),
+                kind: harvest_common::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::Utc::now(),
+                images: Vec::new(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            certificate_pem: String::new(),
+        }
+    }
+
+    /// The buyer's own request to buy the fixtures' listing, sealed into
+    /// their conversation and put in `STORE`'s mailbox.
+    fn buyer_asks_for_the_widget(state: &mut AppState) {
+        let store = state.browsing_stores.get_mut(STORE).expect("the store");
+        let request = store.conversations[0]
+            .request_order(&widget(), 1, "Jo Buyer\n1 Lane".into(), String::new(), None)
+            .expect("sealed");
+        store.mailbox_messages.push(request);
+    }
+
+    /// Whether the SELLER's inbox counts `tag` as opened by a paid order,
+    /// reading `state`'s copy of the store with the seller's own keys.
+    fn seller_counts_paid(state: &AppState, tag: &[u8; 32]) -> bool {
+        let store = &state.browsing_stores[STORE];
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(tag))].into();
+        let entries = crate::messaging::read_mailbox(&store.mailbox_messages, &keys);
+        crate::components::message_view::paid_conversations(
+            &entries,
+            &store.orders,
+            &store.listings,
+            |t| keys.get(t),
+        )
+        .contains(tag)
+    }
+
+    /// What the seller's inbox shows of `messages` added to `state`'s
+    /// mailbox: no voucher verifies, and the paid rule is the seller's own.
+    fn seller_is_shown(
+        state: &AppState,
+        tag: &[u8; 32],
+        messages: &[EncryptedMessage],
+    ) -> (Vec<crate::messaging::MailboxEntry>, usize) {
+        let mut state = state.clone();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend_from_slice(messages);
+        let paid = seller_counts_paid(&state, tag);
+        let keys: HashMap<Vec<u8>, ConversationKeys> =
+            [(tag.to_vec(), seller_keys_for(tag))].into();
+        let entries =
+            crate::messaging::read_mailbox(&state.browsing_stores[STORE].mailbox_messages, &keys);
+        crate::components::message_view::shown_to_seller(
+            entries,
+            |_, _| false,
+            |t| paid && t == tag,
+            |_| false,
+            |_| false,
+        )
+    }
+
+    fn texts(entries: &[crate::messaging::MailboxEntry]) -> Vec<String> {
+        use crate::messaging::{MailboxEntry, MessageContent};
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MailboxEntry::Readable {
+                    content: MessageContent::Text(text),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **A buyer whose order is paid writes in its conversation without a
+    /// Ghost Key, and the seller sees it** (Ian, 2026-09-30). Read back
+    /// through the SELLER's own inbox rule over the same state, because that
+    /// is the half that decides. The acceptance alone opens nothing on
+    /// either side: it is a message the buyer could have written. Red with
+    /// the buyer's `order_in_conversation` check dropped (the acceptance-only
+    /// case then offers a box the seller hides).
+    #[test]
+    fn a_paid_buyer_writes_without_a_ghost_key_and_the_seller_sees_it() {
+        use crate::voucher_flow::{ComposeGate, VouchedCompose};
+        let (mut state, _) = a_paid_purchase();
+        let tag = the_buyers_conversation().buyer_public_key;
+        assert!(state.ghostkeys.is_empty(), "no Ghost Key anywhere here");
+        assert_eq!(
+            purchases(&state)
+                .iter()
+                .filter(|p| p.paid.is_some())
+                .count(),
+            1,
+            "precondition: the buyer's node takes the order as paid"
+        );
+
+        // Only the seller's acceptance is in the mailbox: neither side
+        // counts the conversation as paid.
+        assert!(!state.paid_conversation(STORE, &tag));
+        assert!(!seller_counts_paid(&state, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::NeedsGhostKey
+        );
+
+        // The buyer's request for the listing the order carries the tag of.
+        buyer_asks_for_the_widget(&mut state);
+        assert!(state.paid_conversation(STORE, &tag));
+        assert!(seller_counts_paid(&state, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::PaidOrder { tag }
+        );
+        let VouchedCompose::Sealed(sealed) = state
+            .compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &seller_signing_key().verifying_key().to_bytes(),
+                "Has it gone out yet?".into(),
+                Some(tag),
+                0,
+            )
+            .expect("composed")
+        else {
+            panic!("a paid conversation seals at once, with no vault request");
+        };
+        assert!(state.pending_signatures.is_empty());
+        let (shown, hidden) = seller_is_shown(&state, &tag, std::slice::from_ref(&sealed));
+        assert_eq!(texts(&shown), vec!["Has it gone out yet?".to_string()]);
+        assert_eq!(hidden, 0);
+
+        // Review of #205, S2, the buyer's screen: what this device sent is
+        // "You"; a message in the buyer's direction the seller sealed is not.
+        state.record_sent_message(STORE, "Has it gone out yet?".into(), &sealed);
+        let conversation_id = state.browsing_stores[STORE].conversations[0]
+            .conversation_id
+            .clone();
+        let forged = crate::messaging::seal_for_test(
+            &seller_keys_for(&tag).to_seller,
+            &tag,
+            &conversation_id,
+            crate::messaging::MessageContent::Text("I'll pay double".into()),
+        )
+        .unwrap();
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .mailbox_messages
+            .extend([sealed, forged]);
+        let lines = crate::components::message_view::buyer_chat_lines(&state, STORE, Some(tag));
+        let label = |text: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.item == crate::components::message_view::ChatItem::Said(text.into())
+                })
+                .map(|line| (line.who, line.trusted))
+        };
+        assert_eq!(label("Has it gone out yet?"), Some(("You", true)));
+        assert_eq!(
+            label("I'll pay double"),
+            Some((crate::components::message_view::UNCONFIRMED, false))
+        );
+        // The thread shows (its button carries no count since the msg4
+        // screenshots, so a forged line can't inflate one).
+        assert!(crate::components::message_view::buyer_thread_has_messages(
+            &state,
+            STORE,
+            Some(tag)
+        ));
+    }
+
+    /// **"Once this order is paid, you can message the seller here" is
+    /// promised only where it is true** (codex on #205): an order in the
+    /// conversation that can be paid now and that the paid gate would tie
+    /// to it. Not with only the seller's acceptance (the gate can't tie
+    /// it), not on an invoice too old to pay, not once paid. Red with the
+    /// payability check or the membership check dropped.
+    #[test]
+    fn the_after_payment_promise_is_made_only_where_payment_would_open() {
+        let unpaid = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, tag) = buyer_after_acceptance(&unpaid);
+        assert!(
+            !state.payment_would_open(STORE, &tag),
+            "only an acceptance: the paid gate could never tie the order here"
+        );
+        buyer_asks_for_the_widget(&mut state);
+        assert!(
+            state.payment_would_open(STORE, &tag),
+            "payable now and tied here: {:?}",
+            purchases(&state)[0].blockers
+        );
+        // Too old to pay.
+        let stale = commitment(
+            &seller_signing_key(),
+            Some(anchor(
+                TIP_HEIGHT - harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS - 10,
+            )),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut old, old_tag) = buyer_after_acceptance(&stale);
+        buyer_asks_for_the_widget(&mut old);
+        assert!(
+            !purchases(&old)[0].blockers.is_empty(),
+            "precondition: blocked"
+        );
+        assert!(!old.payment_would_open(STORE, &old_tag));
+        // Already paid.
+        let (mut paid, _) = a_paid_purchase();
+        buyer_asks_for_the_widget(&mut paid);
+        assert!(!paid.payment_would_open(STORE, &the_buyers_conversation().buyer_public_key));
+    }
+
+    /// **The buyer's rule is a strict subset of the seller's.** Over the
+    /// same state, whenever the buyer is offered a box without a Ghost Key,
+    /// the seller shows what comes out of it; and there are states the
+    /// seller counts as paid where the buyer is still gated (a reversed
+    /// payment; an order this node does not take as its own paid purchase).
+    /// Red with the buyer's `order_in_conversation` check dropped.
+    #[test]
+    fn the_buyers_rule_is_a_strict_subset_of_the_sellers() {
+        let tag = the_buyers_conversation().buyer_public_key;
+        let mut seller_only = 0;
+        for status in [
+            OrderStatus::Paid,
+            OrderStatus::PaymentReversed,
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Cancelled,
+        ] {
+            for asked in [false, true] {
+                for listed in [false, true] {
+                    let (mut state, _) = a_paid_purchase();
+                    if asked {
+                        buyer_asks_for_the_widget(&mut state);
+                    }
+                    let store = state.browsing_stores.get_mut(STORE).unwrap();
+                    store.orders[0].status = status;
+                    if listed {
+                        store.listings = vec![widget_listing()];
+                    }
+                    let buyer = state.paid_conversation(STORE, &tag);
+                    let seller = seller_counts_paid(&state, &tag);
+                    assert!(
+                        !buyer || seller,
+                        "{status:?} asked={asked} listed={listed}: the buyer may write \
+                         where the seller would hide it"
+                    );
+                    if seller && !buyer {
+                        seller_only += 1;
+                    }
+                    if buyer {
+                        assert_eq!(status, OrderStatus::Paid);
+                    }
+                }
+            }
+        }
+        assert!(
+            seller_only > 0,
+            "strict: the reversed payment is seller-only"
+        );
+    }
+
+    /// A payment the store now records as REVERSED keeps the seller's inbox
+    /// open (money was spent) but no longer offers the buyer the box without
+    /// a Ghost Key, even while their node keeps its `Paid` copy (a kept paid
+    /// copy is never replaced). Red with the buyer's `Paid`-only check
+    /// widened to the seller's statuses.
+    #[test]
+    fn a_reversed_payment_gates_the_buyer_but_not_the_seller() {
+        let (mut state, unpaid, claims, tip) = a_kept_unpaid_purchase();
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        state.on_kept_purchases(vec![kept(&paid)]);
+        let mut reversed = paid.clone();
+        reversed.status = OrderStatus::PaymentReversed;
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![reversed];
+        buyer_asks_for_the_widget(&mut state);
+        let tag = the_buyers_conversation().buyer_public_key;
+        assert_eq!(
+            purchases(&state).remove(0).paid.as_ref(),
+            Some(&paid),
+            "precondition: the node still takes it as paid"
+        );
+        assert!(seller_counts_paid(&state, &tag));
+        assert!(!state.paid_conversation(STORE, &tag));
+    }
+
+    /// Before payment a Ghost Key is still required: no plain compose, and a
+    /// plain text a script writes into the conversation anyway is hidden
+    /// from the seller.
+    #[test]
+    fn before_payment_a_ghost_key_is_still_required() {
+        use crate::voucher_flow::{ComposeGate, NEEDS_GHOST_KEY};
+        let unpaid = commitment(
+            &seller_signing_key(),
+            Some(anchor(TIP_HEIGHT - 1)),
+            OrderStatus::AwaitingPayment,
+        );
+        let (mut state, tag) = buyer_after_acceptance(&unpaid);
+        buyer_asks_for_the_widget(&mut state);
+        assert!(!state.paid_conversation(STORE, &tag));
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(tag)),
+            ComposeGate::NeedsGhostKey
+        );
+        assert_eq!(
+            state.compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "hi".into(),
+                Some(tag),
+                0
+            ),
+            Err(NEEDS_GHOST_KEY.to_string())
+        );
+        assert_eq!(
+            state.compose_plain_to_seller(STORE, &seller_encryption_key(), &tag, "hi".into()),
+            Err(NEEDS_GHOST_KEY.to_string()),
+            "the plain path checks again rather than trusting its caller"
+        );
+        let scripted = state.browsing_stores[STORE].conversations[0]
+            .seal("pay me".into())
+            .unwrap();
+        let (shown, hidden) = seller_is_shown(&state, &tag, &[scripted]);
+        assert!(texts(&shown).is_empty());
+        assert_eq!(hidden, 1);
+    }
+
+    /// The message goes into the PAID order's conversation, not the one a
+    /// new message would continue; and a message aimed at that newer
+    /// conversation still needs a Ghost Key. A Ghost Key held does not turn
+    /// the paid path into a vault request. Red sealing into
+    /// `conversations.last()`.
+    #[test]
+    fn a_paid_message_goes_into_that_conversation_not_the_last() {
+        use crate::voucher_flow::{ComposeGate, VouchedCompose};
+        let (mut state, _) = a_paid_purchase();
+        buyer_asks_for_the_widget(&mut state);
+        let tag = the_buyers_conversation().buyer_public_key;
+        let newer = BuyerConversation::open(&seller_encryption_key()).expect("open");
+        let newer_tag = newer.buyer_public_key;
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .conversations
+            .push(newer);
+        assert_eq!(
+            state.compose_gate_in(STORE, None),
+            ComposeGate::NeedsGhostKey
+        );
+        assert_eq!(
+            state.compose_gate_in(STORE, Some(newer_tag)),
+            ComposeGate::NeedsGhostKey
+        );
+        state.ghostkeys = vec![ghostkey_common::GhostKeyInfo {
+            fingerprint: "buyer-fp".into(),
+            label: None,
+            notary_info: String::new(),
+            verifying_key_bytes: None,
+            backed_up: false,
+        }];
+        let VouchedCompose::Sealed(sealed) = state
+            .compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "about my order".into(),
+                Some(tag),
+                0,
+            )
+            .expect("composed")
+        else {
+            panic!("paid: sealed at once");
+        };
+        assert_eq!(sealed.sender_public_key, tag.to_vec());
+        assert!(state.pending_signatures.is_empty(), "no vault prompt");
+        // The newer conversation, with the Ghost Key, asks the vault.
+        assert!(matches!(
+            state.compose_message_to_seller(
+                STORE,
+                &seller_encryption_key(),
+                &[0; 32],
+                "a question".into(),
+                None,
+                0,
+            ),
+            Ok(VouchedCompose::AwaitingSignature(Some(_)))
+        ));
     }
 
     /// The seller's despatch of `order`, recorded in `STORE`.

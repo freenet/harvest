@@ -215,9 +215,12 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
             (OrderStatus::AwaitingPayment, OrderStatus::Paid) => offered,
             // A paid copy stays as it is, but may gain the filed complaint,
             // once, about that very copy.
+            // Not in any backup made before it (round 1 of step 2's review:
+            // `..held` kept the old mark).
             (OrderStatus::Paid, _) if held.complaint.is_none() && offered.complaint.is_some() => {
                 KeptPurchase {
                     complaint: offered.complaint,
+                    backed_up: false,
                     ..held
                 }
             }
@@ -273,6 +276,11 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
     // and the complaint. Both records passed `check`, so the more complete
     // one wins: a complaint first (and a held complaint is never swapped
     // for another), then paid over unpaid. On a tie what is held stays.
+    // A held paid copy is never replaced by another paid copy (section 7.2
+    // of `docs/complaint-threat-model.md`): the complaint is taken only
+    // when it rides on the very copy held (round 1 of step 2's review: a
+    // restored backup's complaint carried a different paid copy over the
+    // held one).
     if let Some(held) = held(store, key) {
         let completeness = |record: &KeptPurchase| {
             (
@@ -281,6 +289,9 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
             )
         };
         if held.complaint.is_some() || completeness(&incoming) <= completeness(&held) {
+            return SecretImport::AlreadyAuthoritative;
+        }
+        if held.order.status == OrderStatus::Paid && held.order != incoming.order {
             return SecretImport::AlreadyAuthoritative;
         }
         return if store.set_secret(key, &bytes) {
@@ -842,6 +853,32 @@ mod tests {
             ));
             assert_eq!(paid_holder.get_secret(&key), held_before);
         }
+
+        // Nor by a paid copy that differs and carries a complaint (round 1
+        // of step 2's review: a restored backup's complaint carried its
+        // own paid copy over the held one). Mutated red by dropping the
+        // same-copy condition.
+        let mut complained_source = holding(1);
+        let fresher = purchases(keep(&mut complained_source, paid_as_of(1, 1, 110)))
+            .remove(0)
+            .order;
+        keep(
+            &mut complained_source,
+            PurchaseToKeep {
+                complaint: Some(complaint_about(
+                    &fresher,
+                    &seed(1),
+                    FeedbackCategory::NonDelivery,
+                )),
+                ..paid_as_of(1, 1, 110)
+            },
+        );
+        let complained_value = complained_source.get_secret(&key).expect("kept");
+        assert!(matches!(
+            import(&mut paid_holder, &key, &complained_value),
+            SecretImport::AlreadyAuthoritative
+        ));
+        assert_eq!(paid_holder.get_secret(&key), held_before);
     }
 
     /// No complaint is kept about an unpaid order.
