@@ -498,6 +498,20 @@ mod tests {
         ));
         let (_, kept, _) = whole(&node);
         assert_eq!(kept.iter().filter(|k| k.backed_up).count(), 1);
+        // The conversation the backup held is marked in its own record.
+        let held = |tag: [u8; 32]| -> BuyerConversationRecord {
+            from_cbor(
+                &node
+                    .get_secret(&buyer_conversation_key(&[3u8; 32], &tag))
+                    .expect("held"),
+            )
+            .unwrap()
+        };
+        assert!(
+            held(conversation(1)).backed_up,
+            "the conversation is marked"
+        );
+        assert!(!held(conversation(2)).backed_up, "one not named is not");
         let too_many = vec![(OrderId([1; 32]), [0; 32]); BACKUP_MARK_ITEMS + 1];
         assert!(matches!(
             mark(&mut node, 2, Vec::new(), too_many),

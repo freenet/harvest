@@ -549,7 +549,7 @@ pub fn BackupPage() -> Element {
         }
     });
     let _ = clock();
-    let (purchases, conversations, message, busy, restoring, ready, addresses) = {
+    let (purchases, conversations, message, busy, restoring, ready, addresses, books_unread) = {
         let state = APP_STATE.read();
         let (purchases, conversations) = state.not_backed_up();
         (
@@ -560,6 +560,7 @@ pub fn BackupPage() -> Element {
             state.backup_restore.is_some(),
             state.backup_file_ready.clone(),
             state.unsent_addresses_in_backup(),
+            state.seller_books_unread(),
         )
     };
     let restore = |text: String| {
@@ -570,19 +571,36 @@ pub fn BackupPage() -> Element {
         let Some((name, text)) = APP_STATE.read().ready_backup_file() else {
             return;
         };
+        let saved = || {
+            let out = APP_STATE.write().backup_saved();
+            crate::backup_flow::send_all(out);
+        };
+        // Marked only once the text is on the clipboard: a copy the browser
+        // refused saved nothing. A download cannot be followed that far; the
+        // click that asked for it is the buyer's say-so.
         #[cfg(target_arch = "wasm32")]
         if copy {
-            let _ = document::eval(&format!(
-                "navigator.clipboard.writeText({});",
-                js_string(&text)
-            ));
+            spawn(async move {
+                let mut copied = document::eval(&format!(
+                    "navigator.clipboard.writeText({}).then(\
+                     () => dioxus.send(true), () => dioxus.send(false));",
+                    js_string(&text)
+                ));
+                if copied.recv::<bool>().await.unwrap_or(false) {
+                    saved();
+                } else {
+                    APP_STATE.write().backup_message = Some(COPY_REFUSED.to_string());
+                }
+            });
         } else {
             download(&name, &text);
+            saved();
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (copy, &name, &text);
-        let out = APP_STATE.write().backup_saved();
-        crate::backup_flow::send_all(out);
+        {
+            let _ = (copy, &name, &text);
+            saved();
+        }
     };
     rsx! {
         super::seller_pages::BackTo { label: "Purchases".to_string(), page: Page::Purchases }
@@ -601,12 +619,15 @@ pub fn BackupPage() -> Element {
             match unsaved_line(purchases, conversations) {
                 Some(line) => rsx! { p { class: "text-warning", "{line}" } },
                 None => rsx! {
-                    p { class: "text-muted small", "Everything on this device is in a backup you saved." }
+                    p { class: "text-muted small", "Every purchase and conversation on this device is in a backup you saved." }
                 },
             }
             p { class: "text-muted small", "{crate::backup_flow::KEEP_IT_PRIVATE}" }
             if let Some(line) = crate::backup_flow::addresses_line(addresses) {
                 p { class: "text-warning", "{line}" }
+            }
+            if books_unread > 0 {
+                p { class: "text-muted small", "{BOOKS_UNREAD}" }
             }
             div { class: "row",
                 button {
@@ -712,6 +733,14 @@ pub fn BackupPage() -> Element {
         }
     }
 }
+
+/// Said while a store's own orders have not been read yet.
+const BOOKS_UNREAD: &str = "Your store\u{2019}s orders on this device are still loading, \
+     so a backup saved now leaves them out. Open your store, then come back.";
+
+/// Said when the browser would not put the backup on the clipboard.
+const COPY_REFUSED: &str =
+    "The browser did not copy the backup, so nothing is marked as saved. Use Save instead.";
 
 /// What Backup says is not in a backup yet, or `None` when everything is.
 pub(crate) fn unsaved_line(purchases: usize, conversations: usize) -> Option<String> {

@@ -58,9 +58,9 @@ pub(crate) fn on_background<S: SecretStore>(
             // (#206), before the heartbeats say whether the store is taking
             // orders.
             crate::bitcoin::advance_on_wakeup(secrets);
-            // One seller's order book swept (step 2): unpaid orders past
-            // their payment window go, and a sent order's ship-to once its
-            // complaint window has closed.
+            // One seller's order book swept (step 2): paid orders move on
+            // from the unpaid stage, and unpaid ones past their payment
+            // window go.
             crate::seller_orders::sweep(secrets);
             // The delegated watch's one read (the bridge inbox, or an
             // address contract) first in the list. Order in the list is not

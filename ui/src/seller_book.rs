@@ -36,6 +36,18 @@ pub struct SellerBook {
     pub reading: Option<(u64, SellerOrdersPage)>,
     /// A keep under way: its request id and when it went.
     pub keeping: Option<(u64, u64)>,
+    /// Every note this tab has sent this session, by order id and the
+    /// note's digest: one is never sent twice. What the book keeps can
+    /// differ from what it was sent (it keeps no proof once an order is
+    /// sent, drops a request once its window closes, or refuses a note), so
+    /// comparing the two again would offer the same note for ever.
+    pub noted: std::collections::HashSet<([u8; 32], [u8; 32])>,
+}
+
+/// A note's identity for [`SellerBook::noted`].
+fn note_digest(note: &SellerKeptOrder) -> ([u8; 32], [u8; 32]) {
+    let bytes = harvest_common::to_cbor(note).unwrap_or_default();
+    (note.order.order.id.0, *blake3::hash(&bytes).as_bytes())
 }
 
 /// How long a keep waits for its answer before another may go.
@@ -45,11 +57,16 @@ const KEEP_ANSWER_WAIT_MS: u64 = 60_000;
 pub(crate) type Outgoing = Vec<harvest_common::HarvestDelegateRequest>;
 
 /// Whether `note` adds to `held` (the same order): what the delegate's
-/// merge would take from it.
+/// merge would take from it and keep. A proof adds only to a paid order not
+/// yet sent that has none: a sent one (and one past the store's byte bound,
+/// held with the height it was paid at) is kept without it.
 fn adds_to(held: &SellerKeptOrder, note: &SellerKeptOrder) -> bool {
     note.order.status.rank() > held.order.status.rank()
         || (note.order.status == held.order.status
             && held.order.payment_proof.is_none()
+            && held.despatch.is_none()
+            && held.paid_height.is_none()
+            && note.despatch.is_none()
             && note.order.payment_proof.is_some())
         || (held.request.is_none() && note.request.is_some())
         || (held.despatch.is_none() && note.despatch.is_some())
@@ -68,8 +85,10 @@ impl AppState {
         self.seller_books.get(&key).filter(|b| b.loaded)
     }
 
-    /// The orders this store's book keeps that the store no longer holds,
-    /// newest first: what the seller would otherwise lose sight of.
+    /// The paid orders this store's book keeps that the store no longer
+    /// holds, newest first: what the seller would otherwise lose sight of.
+    /// Not an unpaid one: the store has dropped it (or never held it, if
+    /// its publish failed), and there is nothing to send for it.
     pub(crate) fn book_only_orders(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
         let Some(book) = self.seller_book(store_contract_id) else {
             return Vec::new();
@@ -78,6 +97,7 @@ impl AppState {
         let mut orders: Vec<AuthorizedOrder> = book
             .orders
             .iter()
+            .filter(|r| r.order.status != OrderStatus::AwaitingPayment)
             .filter(|r| {
                 held.is_none_or(|s| !s.orders.iter().any(|o| o.order.id == r.order.order.id))
             })
@@ -156,6 +176,14 @@ impl AppState {
             despatch.verify(&owner).ok()?;
             Some(despatch)
         })
+    }
+
+    /// Whether this tab is reading one of our stores' books for the first
+    /// time: what it holds is not known yet.
+    pub(crate) fn seller_book_unread(&self, store_contract_id: &[u8]) -> bool {
+        self.own_store_key(store_contract_id)
+            .and_then(|key| self.seller_books.get(&key))
+            .is_some_and(|b| !b.loaded && b.reading.is_some())
     }
 
     /// Paid orders not yet sent that this store's book could not keep.
@@ -241,21 +269,23 @@ impl AppState {
             .collect()
     }
 
-    /// A keep was answered: read the book again, so this tab shows it.
+    /// A keep was answered: read the book again, so this tab shows it. A
+    /// refusal is not read again for: nothing changed.
     pub(crate) fn on_seller_orders_kept(
         &mut self,
         request_id: u64,
         store_key: [u8; 32],
         result: Result<u32, String>,
     ) -> Outgoing {
-        if let Err(why) = &result {
-            dioxus::logger::tracing::warn!("The seller's orders were not kept: {why}");
-        }
         let Some(book) = self.seller_books.get_mut(&store_key) else {
             return Vec::new();
         };
         if book.keeping.is_some_and(|(id, _)| id == request_id) {
             book.keeping = None;
+        }
+        if let Err(why) = &result {
+            dioxus::logger::tracing::warn!("The seller's orders were not kept: {why}");
+            return Vec::new();
         }
         let ids: Vec<Vec<u8>> = self
             .browsing_stores
@@ -297,7 +327,12 @@ impl AppState {
                 )
             })
             .filter_map(|o| {
-                let request = requests.get(&o.order.id).cloned();
+                // Not a ship-to the app would no longer show: the book drops
+                // a sent order's once its complaint window has closed.
+                let request = requests
+                    .get(&o.order.id)
+                    .filter(|_| self.address_retained_for(o))
+                    .cloned();
                 if o.status == OrderStatus::AwaitingPayment && request.is_none() {
                     return None;
                 }
@@ -314,6 +349,7 @@ impl AppState {
                 };
                 match held.get(&o.order.id) {
                     Some(held) if !adds_to(held, &note) => None,
+                    _ if book.noted.contains(&note_digest(&note)) => None,
                     _ => Some(note),
                 }
             })
@@ -321,7 +357,7 @@ impl AppState {
     }
 
     /// Send what [`Self::seller_book_notes`] finds, one call at a time.
-    fn sync_seller_book_requests(&mut self, store_contract_id: &[u8]) -> Outgoing {
+    pub(crate) fn sync_seller_book_requests(&mut self, store_contract_id: &[u8]) -> Outgoing {
         let Some(key) = self.own_store_key(store_contract_id) else {
             return Vec::new();
         };
@@ -342,6 +378,7 @@ impl AppState {
         let request_id = self.next_messaging_request_id();
         if let Some(book) = self.seller_books.get_mut(&key) {
             book.keeping = Some((request_id, now));
+            book.noted.extend(notes.iter().map(note_digest));
         }
         vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
             request_id,
@@ -407,18 +444,31 @@ impl AppState {
 
     /// The orders the seller's to-send list and order pages read: the
     /// store's, then the book's that the store no longer holds. An order the
-    /// store keeps unpaid that this tab proved paid past the store's byte
-    /// bound reads as that paid copy (step 2).
+    /// store keeps unpaid (or cancelled) that is paid as this tab proved it
+    /// past the store's byte bound, or as the book holds it, reads as that
+    /// paid copy (step 2): the book's survives a reload, the tab's proof
+    /// does not.
     pub(crate) fn seller_orders_with_book(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
+        let book = self.seller_book(store_contract_id);
         let mut orders: Vec<AuthorizedOrder> = self
             .browsing_stores
             .get(store_contract_id)
             .map(|s| s.orders.clone())
             .unwrap_or_default()
             .into_iter()
-            .map(|o| match self.paid_past_store_bound.get(&o.order.id) {
-                Some(paid) if o.status == OrderStatus::AwaitingPayment => paid.clone(),
-                _ => o,
+            .map(|o| {
+                if !matches!(
+                    o.status,
+                    OrderStatus::AwaitingPayment | OrderStatus::Cancelled
+                ) {
+                    return o;
+                }
+                if let Some(paid) = self.paid_past_store_bound.get(&o.order.id) {
+                    return paid.clone();
+                }
+                book.and_then(|b| b.orders.iter().find(|r| r.order.order.id == o.order.id))
+                    .filter(|r| r.order.status.rank() > o.status.rank())
+                    .map_or(o, |r| r.order.clone())
             })
             .collect();
         orders.extend(self.book_only_orders(store_contract_id));

@@ -378,7 +378,9 @@ bound, every field at its largest, and the pause. Store case only
 (report-only), budget 2.2 billion fuel a call.
 
 **At the current caps** (256 paid orders, 128 listings; store wasm blake3
-`a4cf4e03`), as percentages of the budget:
+`8d6d76e1`; the wall-time runs were on `a4cf4e03`, which behaves the same
+on every state here: since then the listing caps are checked before the
+signatures, and `OrdersV1::normalize` caps), as percentages of the budget:
 
 | case | call | of budget |
 |---|---|---:|

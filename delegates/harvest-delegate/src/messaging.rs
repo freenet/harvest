@@ -51,8 +51,8 @@
 use crate::secrets::RemovableSecrets;
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{
-    BackupString, ConversationKey, ConversationSecret, EvictedConversation,
-    HarvestDelegateResponse, ImportedConversation, RecalledConversation, RequestId,
+    ConversationKey, ConversationSecret, EvictedConversation, HarvestDelegateResponse,
+    ImportedConversation, RecalledConversation, RequestId,
 };
 use harvest_common::mailbox::{conversation_key_from_dh, MessageDirection};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -835,18 +835,12 @@ pub(crate) const BUYER_CONVERSATION_BACKUP_PREFIX: &str = "harvest-conv-backup-v
 /// size falls in a band so the number here cannot drift again.
 pub(crate) const MAX_BACKUP_STRING_BYTES: usize = 4 * 1024;
 
-/// One conversation, as it travels between two nodes.
+/// One conversation, as the per-conversation backup string carried it.
 ///
-/// # Why one and not a store's worth
-///
-/// A store-wide backup is too easy to leave out of date: taken on Monday,
-/// silently incomplete on Tuesday, and nothing about the artefact says which
-/// conversations existed when it was taken. The marker settles it -- a
-/// `backed_up` flag set from a store-wide export would falsely cover a
-/// conversation created after that export, which is the "cannot silence a
-/// warning about a key it has no backup of" property defeated through
-/// granularity rather than through permission. See
-/// `HarvestDelegateRequest::ExportBuyerConversation` and
+/// The app no longer makes these strings: the one backup file
+/// (`crate::backup`) replaced them. The format stays so a string saved
+/// before that still restores through
+/// `HarvestDelegateRequest::ImportBuyerConversation`. See
 /// `docs/buyer-conversation-persistence.md`.
 ///
 /// A buyer restoring a machine pastes several strings in a row; nothing here
@@ -860,13 +854,16 @@ pub(crate) struct BuyerConversationBackupV2 {
     pub(crate) conversation: BuyerConversationRecord,
 }
 
-/// A backup as a string the buyer can paste.
+/// A backup as a string the buyer can paste: the format the app made before
+/// the one backup file. Only tests make one now, to stand for a string a
+/// buyer saved then.
 ///
 /// Base58Check inside the prefix, which is this repository's convention for
 /// anything a person handles, and which carries a checksum: a string that
 /// lost its tail in a copy is refused here rather than restoring a
 /// conversation with a corrupt secret at the moment the buyer believes they
 /// have their recourse back.
+#[cfg(test)]
 pub(crate) fn encode_backup(backup: &BuyerConversationBackupV2) -> Result<String, String> {
     let bytes = harvest_common::to_cbor(backup)
         .map_err(|e| format!("could not encode this backup: {e}"))?;
@@ -914,54 +911,30 @@ pub(crate) fn decode_backup(backup: &str) -> Result<BuyerConversationBackupV2, S
         .map_err(|e| format!("that Harvest conversation backup could not be read: {e}"))
 }
 
-/// Hand back ONE conversation as a string the buyer can save.
-pub(crate) fn export_buyer_conversation<S: SecretStore>(
+/// The string the per-conversation export made for one held conversation,
+/// as a buyer who saved one before the one backup file would hold it. For
+/// tests of the restore path, which is still live.
+///
+/// Not what was noted on it (its sent digests, its seen time): a backup
+/// string is bounded (`MAX_BACKUP_STRING_BYTES`), and the export left them
+/// out so a full set of digests could not put it past that.
+#[cfg(test)]
+pub(crate) fn old_conversation_string<S: SecretStore>(
     store: &S,
-    request_id: RequestId,
     store_contract_id: &[u8],
     buyer_public_key: &[u8; 32],
-) -> HarvestDelegateResponse {
-    let exported = |result| HarvestDelegateResponse::BuyerConversationExported {
-        request_id,
-        store_contract_id: store_contract_id.to_vec(),
-        buyer_public_key: *buyer_public_key,
-        result,
-    };
-
-    let Ok(id) = <[u8; 32]>::try_from(store_contract_id) else {
-        return exported(Err(format!(
-            "a store is named by a {STORE_CONTRACT_ID_BYTES}-byte contract id, and this one is \
-             {} bytes",
-            store_contract_id.len()
-        )));
-    };
-
-    let Some(mut conversation) = store
+) -> String {
+    let mut conversation = store
         .get_secret(&buyer_conversation_key(store_contract_id, buyer_public_key))
         .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
-    else {
-        // Refused rather than answered as an empty string. An empty backup
-        // looks exactly like a real one once it is saved, and the buyer finds
-        // out it was empty at the moment they need it.
-        return exported(Err(
-            "this node does not hold that conversation, so there is nothing to back up".to_string(),
-        ));
-    };
-
-    // Not what was noted on it (its sent digests, its seen time): a backup
-    // string is bounded (`MAX_BACKUP_STRING_BYTES`), and a full set of
-    // digests would put it past that, so it would not restore. A migration
-    // carries them (`import::Family::BuyerConversation`); a restored
-    // conversation shows the buyer's own messages as not confirmed.
+        .expect("the conversation is held");
     conversation.sent.clear();
     conversation.seen_ms = None;
-    exported(
-        encode_backup(&BuyerConversationBackupV2 {
-            store_contract_id: id,
-            conversation,
-        })
-        .map(BackupString),
-    )
+    encode_backup(&BuyerConversationBackupV2 {
+        store_contract_id: store_contract_id.try_into().expect("a 32-byte store id"),
+        conversation,
+    })
+    .expect("encodes")
 }
 
 /// Take one saved backup and make its conversation readable here.
@@ -1082,54 +1055,6 @@ pub(crate) fn import_conversation_record<S: SecretStore>(
             "the node refused the write, so this conversation is still not readable here"
                 .to_string(),
         )
-    }
-}
-
-/// Record that the buyer holds a copy of THIS conversation elsewhere.
-///
-/// `Ok(true)` when it is marked, `Ok(false)` when this node does not hold it
-/// -- which is not an error and creates nothing. A write the node REFUSED is
-/// an `Err`, because "not marked" and "could not mark" are different
-/// situations and a boolean cannot tell them apart; it answered `Ok`
-/// unconditionally until review, which made the caller's failure path dead
-/// code.
-///
-/// One conversation, matching the export. Marking a SET would let one saved
-/// string clear the warning on a conversation it does not contain.
-pub(crate) fn mark_conversation_backed_up<S: SecretStore>(
-    store: &mut S,
-    request_id: RequestId,
-    store_contract_id: &[u8],
-    buyer_public_key: &[u8; 32],
-) -> HarvestDelegateResponse {
-    let key = buyer_conversation_key(store_contract_id, buyer_public_key);
-    let result = match store
-        .get_secret(&key)
-        .and_then(|bytes| harvest_common::from_cbor::<BuyerConversationRecord>(&bytes).ok())
-    {
-        None => Ok(false),
-        Some(record) if record.backed_up => Ok(true),
-        Some(record) => {
-            let marked = BuyerConversationRecord {
-                backed_up: true,
-                ..record
-            };
-            match harvest_common::to_cbor(&marked) {
-                Ok(bytes) if store.set_secret(&key, &bytes) => Ok(true),
-                _ => Err(
-                    "the node refused to record that you have saved this, so it will keep \
-                     warning you about it"
-                        .to_string(),
-                ),
-            }
-        }
-    };
-
-    HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
-        request_id,
-        store_contract_id: store_contract_id.to_vec(),
-        buyer_public_key: *buyer_public_key,
-        result,
     }
 }
 
@@ -2434,13 +2359,6 @@ mod buyer_conversation_backup_tests {
         }
     }
 
-    fn exported(response: &HarvestDelegateResponse) -> &Result<BackupString, String> {
-        match response {
-            HarvestDelegateResponse::BuyerConversationExported { result, .. } => result,
-            other => panic!("expected BuyerConversationExported, got {other:?}"),
-        }
-    }
-
     fn imported(response: &HarvestDelegateResponse) -> &Result<ImportedConversation, String> {
         match response {
             HarvestDelegateResponse::BuyerConversationImported { result, .. } => result,
@@ -2448,10 +2366,13 @@ mod buyer_conversation_backup_tests {
         }
     }
 
-    fn marked(response: &HarvestDelegateResponse) -> &Result<bool, String> {
-        match response {
-            HarvestDelegateResponse::BuyerConversationMarkedBackedUp { result, .. } => result,
-            other => panic!("expected BuyerConversationMarkedBackedUp, got {other:?}"),
+    /// What saving the one backup file marks for this conversation
+    /// (`crate::backup::mark`).
+    fn mark_saved(store: &mut MemSecrets, tag: &[u8; 32]) -> Result<u32, String> {
+        let store_contract_id = <[u8; 32]>::try_from(STORE).expect("32 bytes");
+        match crate::backup::mark(store, 1, vec![(store_contract_id, *tag)], Vec::new()) {
+            HarvestDelegateResponse::BackedUpMarked { result, .. } => result,
+            other => panic!("expected BackedUpMarked, got {other:?}"),
         }
     }
 
@@ -2464,12 +2385,9 @@ mod buyer_conversation_backup_tests {
         }
     }
 
+    /// The per-conversation string a buyer saved before the one backup file.
     fn export(store: &MemSecrets, store_contract_id: &[u8], tag: &[u8; 32]) -> String {
-        exported(&export_buyer_conversation(store, 1, store_contract_id, tag))
-            .as_ref()
-            .expect("must export")
-            .0
-            .clone()
+        old_conversation_string(store, store_contract_id, tag)
     }
 
     /// **The whole point: a conversation carried to another node reads its
@@ -2740,30 +2658,19 @@ mod buyer_conversation_backup_tests {
         );
     }
 
-    /// A freshly opened conversation is NOT backed up, and stays that way
-    /// until the buyer says otherwise.
-    ///
-    /// Exporting is not saving: a buyer who opens the panel, reads the
-    /// string, and closes the tab has saved nothing.
+    /// A freshly opened conversation is NOT backed up.
     #[test]
-    fn a_new_conversation_is_not_backed_up_and_exporting_does_not_change_that() {
+    fn a_new_conversation_is_not_backed_up() {
         let mut store = MemSecrets::default();
-        let (tag, record) = conversation(9);
+        let (_, record) = conversation(9);
         store_buyer_conversation(&mut store, 1, STORE, &record);
         assert!(!listed(&list_buyer_conversations(&store, 1, STORE))[0].backed_up);
-
-        let _ = export(&store, STORE, &tag);
-        assert!(
-            !listed(&list_buyer_conversations(&store, 1, STORE))[0].backed_up,
-            "exporting a conversation reported it as saved"
-        );
     }
 
     /// **Marking clears the warning on THAT conversation and no other.**
     ///
-    /// The granularity is the point: one saved string covers one
-    /// conversation, so marking a set would let it clear a warning about a
-    /// conversation it does not contain.
+    /// The granularity is the point: marking names what the saved file
+    /// holds, so a conversation it does not contain keeps its warning.
     #[test]
     fn marking_a_conversation_clears_its_warning_and_no_others() {
         let mut store = MemSecrets::default();
@@ -2772,11 +2679,7 @@ mod buyer_conversation_backup_tests {
         store_buyer_conversation(&mut store, 1, STORE, &record);
         store_buyer_conversation(&mut store, 2, STORE, &other);
 
-        assert!(
-            marked(&mark_conversation_backed_up(&mut store, 3, STORE, &tag))
-                .as_ref()
-                .expect("must mark")
-        );
+        assert_eq!(mark_saved(&mut store, &tag), Ok(1), "must mark");
 
         for recalled in listed(&list_buyer_conversations(&store, 1, STORE)) {
             if recalled.buyer_public_key == tag {
@@ -2796,11 +2699,7 @@ mod buyer_conversation_backup_tests {
     #[test]
     fn marking_a_conversation_that_is_not_here_stores_nothing() {
         let mut store = MemSecrets::default();
-        assert!(!marked(&mark_conversation_backed_up(
-            &mut store, 1, STORE, &[7u8; 32]
-        ))
-        .as_ref()
-        .expect("not an error"));
+        assert_eq!(mark_saved(&mut store, &[7u8; 32]), Ok(0), "not an error");
         assert!(store.is_empty(), "marking created a conversation");
     }
 
@@ -2817,10 +2716,7 @@ mod buyer_conversation_backup_tests {
         store_buyer_conversation(&mut store, 1, STORE, &record);
         store.writes_fail = true;
 
-        let response = mark_conversation_backed_up(&mut store, 2, STORE, &tag);
-        let message = marked(&response)
-            .as_ref()
-            .expect_err("a refused write must be reported");
+        let message = mark_saved(&mut store, &tag).expect_err("a refused write must be reported");
         assert!(message.contains("refused"), "{message}");
         assert!(
             !listed(&list_buyer_conversations(&store, 3, STORE))[0].backed_up,
@@ -2839,7 +2735,7 @@ mod buyer_conversation_backup_tests {
         let mut store = MemSecrets::default();
         let (tag, record) = conversation(12);
         store_buyer_conversation(&mut store, 1, STORE, &record);
-        mark_conversation_backed_up(&mut store, 2, STORE, &tag);
+        assert_eq!(mark_saved(&mut store, &tag), Ok(1));
 
         forget_buyer_conversation(&mut store, 3, STORE, &tag);
         assert!(
@@ -2851,34 +2747,6 @@ mod buyer_conversation_backup_tests {
                 .map(|k| String::from_utf8_lossy(k).into_owned())
                 .collect::<Vec<_>>()
         );
-    }
-
-    /// Exporting a conversation this node does not hold is refused rather
-    /// than answered as an empty string that looks like a saved backup.
-    #[test]
-    fn exporting_a_conversation_this_node_does_not_hold_is_refused() {
-        let store = MemSecrets::default();
-        let response = export_buyer_conversation(&store, 1, STORE, &[5u8; 32]);
-        let message = exported(&response)
-            .as_ref()
-            .expect_err("an empty backup must be refused");
-        assert!(message.contains("does not hold"), "{message}");
-    }
-
-    /// **A backup is a capability, and the test says so.**
-    ///
-    /// It contains the secret itself -- that is what makes it work on another
-    /// machine, and what makes it worth as much as the conversation it
-    /// restores. Pinned so that a future "safer" export that omitted it fails
-    /// here rather than in a buyer's hands.
-    #[test]
-    fn a_backup_contains_the_secret_itself() {
-        let mut store = MemSecrets::default();
-        let (tag, record) = conversation(13);
-        store_buyer_conversation(&mut store, 1, STORE, &record);
-
-        let decoded = decode_backup(&export(&store, STORE, &tag)).expect("decode");
-        assert_eq!(decoded.conversation.secret, record.secret);
     }
 
     /// **A backup string longer than the cap is refused before it is
@@ -3358,7 +3226,12 @@ mod sent_and_seen_tests {
         assert_eq!(recalled(&store, &tag).sent_digests, vec![digest(0)], "once");
 
         store_buyer_conversation(&mut store, 4, STORE, &record(1).1);
-        mark_conversation_backed_up(&mut store, 5, STORE, &tag);
+        crate::backup::mark(
+            &mut store,
+            5,
+            vec![(<[u8; 32]>::try_from(STORE).expect("32 bytes"), tag)],
+            Vec::new(),
+        );
         assert_eq!(
             recalled(&store, &tag).sent_digests,
             vec![digest(0)],
@@ -3568,36 +3441,6 @@ mod sent_and_seen_tests {
             recalled(&empty, &tag).sent_digests,
             vec![digest(1), digest(2)]
         );
-    }
-
-    /// Review round 1 of batch 2 (blocking): a conversation's backup string
-    /// carries neither its sent digests nor its seen time, so one at the
-    /// digest cap still fits `MAX_BACKUP_STRING_BYTES` and restores. Mutated
-    /// red by exporting the record as it is.
-    #[test]
-    fn a_full_digest_list_still_backs_up_and_restores() {
-        let (mut store, tag) = kept(1);
-        for i in 0..MAX_SENT_DIGESTS {
-            note_buyer_sent(&mut store, 2, STORE, &tag, &digest(i));
-        }
-        mark_conversation_seen(&mut store, 3, STORE, &tag, 9);
-        let HarvestDelegateResponse::BuyerConversationExported {
-            result: Ok(backup), ..
-        } = export_buyer_conversation(&store, 4, STORE, &tag)
-        else {
-            panic!("exported")
-        };
-        let mut fresh = MemSecrets::default();
-        let HarvestDelegateResponse::BuyerConversationImported { result, .. } =
-            import_buyer_conversation(&mut fresh, 5, &backup.0)
-        else {
-            panic!("an import answer")
-        };
-        assert!(
-            matches!(result, Ok(ImportedConversation::Imported { .. })),
-            "{result:?}"
-        );
-        assert!(recalled(&fresh, &tag).sent_digests.is_empty());
     }
 
     /// A predecessor's record for a conversation this delegate does not hold

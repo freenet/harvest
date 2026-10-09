@@ -220,8 +220,9 @@ mod tests {
 
     /// A pause asks the store key for a revision above everything held,
     /// asked for and sent, and no lower than now; the page shows it as on
-    /// its way until the state holds it. Mutated red by reusing the held
-    /// revision, and by not settling on the state's echo.
+    /// its way until the state holds it, or its saving window is over.
+    /// Mutated red by reusing the held revision, by not settling on the
+    /// state's echo, and by waiting past the window.
     #[test]
     fn a_pause_is_signed_above_what_is_held_and_settles_on_the_echo() {
         let mut state = seller_state();
@@ -248,6 +249,10 @@ mod tests {
         assert!(
             state.store_pause_pending_at(STORE, now),
             "sent, not yet shown"
+        );
+        assert!(
+            !state.store_pause_pending_at(STORE, now + SAVING_WINDOW_MS),
+            "a publish never echoed stops holding the switch once its window is over"
         );
         held(&mut state, 51, true);
         assert!(

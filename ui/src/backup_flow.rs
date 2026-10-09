@@ -415,6 +415,19 @@ impl AppState {
         books
     }
 
+    /// How many of our stores' books this tab has not read yet, so a backup
+    /// made now would leave out: said on the Backup page.
+    pub fn seller_books_unread(&self) -> usize {
+        self.my_stores
+            .values()
+            .flatten()
+            .filter_map(|r| r.store_verifying_key)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|key| self.seller_books.get(key).is_none_or(|b| !b.loaded))
+            .count()
+    }
+
     /// How many delivery addresses of orders not yet sent a backup made now
     /// would hold: said on the Backup page.
     pub fn unsent_addresses_in_backup(&self) -> usize {
@@ -431,10 +444,20 @@ impl AppState {
         let Some(ready) = self.backup_file_ready.take() else {
             return Vec::new();
         };
+        let orders: usize = self
+            .seller_books_for_backup()
+            .iter()
+            .map(|b| b.orders.len())
+            .sum();
         self.backup_message = Some(format!(
-            "Saved {}. It holds {}. Keep it somewhere other than this computer.",
+            "Saved {}. It holds {}{}. Keep it somewhere other than this computer.",
             ready.name,
             held_words(ready.purchases, ready.conversations),
+            match orders {
+                0 => String::new(),
+                1 => ", and 1 of your store\u{2019}s orders".to_string(),
+                n => format!(", and {n} of your store\u{2019}s orders"),
+            },
         ));
         let mut out = ready.marks;
         out.extend(self.start_backup_export());
@@ -680,8 +703,20 @@ impl AppState {
                     ));
                 }
                 self.backup_message = Some(message);
-                // What the delegate now holds, shown.
-                vec![harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+                // What the delegate now holds, shown: the purchases, and each
+                // of our stores' books (one a full book could not take is
+                // named there, and on the store's Home).
+                let mut out = vec![harvest_common::HarvestDelegateRequest::ListKeptPurchases];
+                let own: Vec<Vec<u8>> = self
+                    .browsing_stores
+                    .iter()
+                    .filter(|(_, s)| s.owner.is_some_and(|k| self.seller_books.contains_key(&k)))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in own {
+                    out.extend(self.read_seller_book(&id));
+                }
+                out
             }
         }
     }
@@ -753,13 +788,13 @@ pub(crate) fn addresses_line(addresses: usize) -> Option<String> {
     match addresses {
         0 => None,
         1 => Some(
-            "It also holds the delivery address of 1 order you haven\u{2019}t sent yet: \
-             keep it as private as the buyer would want."
+            "It also holds the delivery address of 1 of your store\u{2019}s orders not \
+             yet sent: keep it as private as the buyer would want."
                 .to_string(),
         ),
         n => Some(format!(
-            "It also holds the delivery addresses of {n} orders you haven\u{2019}t sent \
-             yet: keep it as private as your buyers would want."
+            "It also holds the delivery addresses of {n} of your store\u{2019}s orders not \
+             yet sent: keep it as private as your buyers would want."
         )),
     }
 }
@@ -827,8 +862,16 @@ pub(crate) fn send_all(requests: Outgoing) {
     for request in requests {
         crate::state::spawn_harvest_request(request, "a purchases backup request");
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), test))]
+    SENT.with(|sent| sent.borrow_mut().extend(requests));
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
     let _ = requests;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`send_all`] was given, for a test to read.
+    pub(crate) static SENT: std::cell::RefCell<Outgoing> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -1275,6 +1318,21 @@ mod tests {
         assert!(books[0].orders[0].request.is_some(), "not yet sent");
         assert!(books[0].orders[1].request.is_none(), "sent: terms only");
         assert_eq!(state.unsent_addresses_in_backup(), 1);
+        let mut reversed = record(5, false);
+        reversed.order.status = harvest_common::payment::OrderStatus::PaymentReversed;
+        let mut with_reversed = state.clone();
+        with_reversed
+            .seller_books
+            .get_mut(&[3; 32])
+            .unwrap()
+            .orders
+            .push(reversed);
+        assert!(
+            with_reversed.seller_books_for_backup()[0].orders[2]
+                .request
+                .is_none(),
+            "reversed: terms only"
+        );
         assert!(addresses_line(1).unwrap().contains("delivery address"));
 
         let mut file = bundle();
@@ -1307,6 +1365,49 @@ mod tests {
         assert_eq!(
             state.backup_message.as_deref(),
             Some("2 restored, 1 already here.")
+        );
+    }
+
+    /// A book larger than one call takes is restored in calls of at most
+    /// `SELLER_ORDERS_PER_CALL` (the delegate refuses a larger one whole).
+    /// Mutated red by one call for the whole book.
+    #[test]
+    fn a_large_book_is_restored_a_call_at_a_time() {
+        use harvest_common::delegate::{SellerKeptOrder, SELLER_ORDERS_PER_CALL};
+        let mut file = bundle();
+        file.purchases.clear();
+        file.conversations.clear();
+        file.seller_orders = vec![BundleSellerBook {
+            store_key: [3; 32],
+            orders: (0..100u8)
+                .map(|n| SellerKeptOrder {
+                    order: kept_order(n),
+                    request: None,
+                    despatch: None,
+                    paid_height: None,
+                    sent_off_store: false,
+                })
+                .collect(),
+        }];
+        let mut state = AppState::default();
+        let mut sizes = Vec::new();
+        let mut out = state.start_restore(&encode_file(&file).unwrap());
+        while let [harvest_common::HarvestDelegateRequest::KeepSellerOrders {
+            request_id,
+            orders,
+            ..
+        }] = &out[..]
+        {
+            sizes.push(orders.len());
+            let (id, n) = (*request_id, orders.len() as u32);
+            out = state
+                .on_restored_seller_orders(id, &Ok(n))
+                .expect("the restore's");
+        }
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+        assert!(
+            sizes.iter().all(|n| *n <= SELLER_ORDERS_PER_CALL),
+            "{sizes:?}"
         );
     }
 

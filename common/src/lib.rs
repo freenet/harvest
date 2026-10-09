@@ -279,7 +279,7 @@ pub mod listing_image;
 // After everything else for the same reason as `listing_image` above.
 pub mod store_pause;
 
-/// The encoding every generation before step 2 wrote (step 2, harvest#227):
+/// The encoding every generation before step 2 wrote (step 2, harvest#230):
 /// the same bytes with each signed record's outer byte fields -- its signed
 /// payload and signature, which `serde_bytes` now writes as CBOR byte
 /// strings -- as arrays of integers, which is how ciborium writes a plain

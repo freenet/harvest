@@ -241,6 +241,16 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             store_key,
         } => crate::messaging::list_seller_sent(store, request_id, &store_key),
 
+        // The one backup file. The export answers the secrets themselves, so
+        // its need for the gate is obvious. `MarkBackedUp` is the one whose
+        // need is NOT obvious and matters as much: it silences the warning
+        // that a conversation or an order exists in one place only, and the
+        // party that benefits from silence is not the party that loses it.
+        // An app that could set it without the user holding a backup would
+        // stop the warning for something about to be lost with the machine,
+        // which is worse than never warning, because the user stops looking.
+        // Same reasoning as the ghostkey vault gating its own `MarkBackedUp`
+        // on the `Export` scope only it is granted.
         HarvestDelegateRequest::ExportPurchasesBackup { request_id, after } => {
             crate::backup::export_page(store, request_id, after)
         }
@@ -270,41 +280,11 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             after,
         } => crate::seller_orders::list(store, request_id, store_key, after),
 
-        // Backup. The export answers the secrets themselves, so its need for
-        // the gate is obvious. `MarkConversationsBackedUp` is the one whose
-        // need is NOT obvious and matters as much: it silences the warning
-        // that a conversation exists in one place only, and the party that
-        // benefits from silence is not the party that loses the
-        // conversation. An app that could set it without the user holding a
-        // backup would stop the warning for a conversation about to be lost
-        // with the machine -- worse than never warning, because the buyer
-        // stops looking. Same reasoning as the ghostkey vault gating
-        // `MarkBackedUp` on the `Export` scope only it is granted.
-        HarvestDelegateRequest::ExportBuyerConversation {
-            request_id,
-            store_contract_id,
-            buyer_public_key,
-        } => crate::messaging::export_buyer_conversation(
-            store,
-            request_id,
-            &store_contract_id,
-            &buyer_public_key,
-        ),
-
+        // A per-conversation string saved before the one backup file, still
+        // restorable from the Backup page.
         HarvestDelegateRequest::ImportBuyerConversation { request_id, backup } => {
             crate::messaging::import_buyer_conversation(store, request_id, &backup.0)
         }
-
-        HarvestDelegateRequest::MarkConversationBackedUp {
-            request_id,
-            store_contract_id,
-            buyer_public_key,
-        } => crate::messaging::mark_conversation_backed_up(
-            store,
-            request_id,
-            &store_contract_id,
-            &buyer_public_key,
-        ),
 
         HarvestDelegateRequest::ForgetBuyerConversation {
             request_id,
@@ -1294,13 +1274,13 @@ mod origin_gating_tests {
     /// **A foreign web app cannot carry a buyer's conversations off, nor
     /// silence the warning that they exist in one place only.**
     ///
-    /// The export half is the obvious one: it answers the secrets, which are
-    /// the capability to read the conversation and, after Phase 2, to file
-    /// the complaint it authorizes.
+    /// The export half is the obvious one: the backup file's pages answer
+    /// the secrets, which are the capability to read the conversation and,
+    /// after Phase 2, to file the complaint it authorizes.
     ///
     /// The MARKER half is the one worth having its own test. It writes no
-    /// secret and answers none, so it reads as harmless -- and what it does
-    /// is stop the UI saying "this exists only on this device" about a
+    /// secret and answers none, so it reads as harmless. What it does is
+    /// stop the UI saying "this exists only on this device" about a
     /// conversation nobody has a copy of. Silence costs the buyer everything
     /// and costs the app nothing, which is exactly the shape that needs a
     /// gate. The ghostkey vault reaches the same conclusion by gating
@@ -1323,10 +1303,9 @@ mod origin_gating_tests {
         let response = handle(
             &mut store,
             Some(&a_different_web_app()),
-            HarvestDelegateRequest::ExportBuyerConversation {
+            HarvestDelegateRequest::ExportPurchasesBackup {
                 request_id: 1,
-                store_contract_id: SELLERS_STORE_ID.to_vec(),
-                buyer_public_key: tag,
+                after: None,
             },
         );
         assert!(
@@ -1337,10 +1316,10 @@ mod origin_gating_tests {
         let response = handle(
             &mut store,
             Some(&a_different_web_app()),
-            HarvestDelegateRequest::MarkConversationBackedUp {
+            HarvestDelegateRequest::MarkBackedUp {
                 request_id: 2,
-                store_contract_id: SELLERS_STORE_ID.to_vec(),
-                buyer_public_key: tag,
+                conversations: vec![(SELLERS_STORE_ID, tag)],
+                orders: Vec::new(),
             },
         );
         assert!(
@@ -1382,12 +1361,14 @@ mod origin_gating_tests {
         assert!(refusal_message(&response).contains("Harvest web app"));
     }
 
-    /// **The buyer's own backup round trip, through the handler.**
+    /// **A per-conversation string saved before the one backup file still
+    /// restores, through the handler.**
     ///
-    /// Export on one node, import on another, and the restored conversation
-    /// derives the keys the seller derives -- which is what "readable" means.
+    /// The string as the old export made it on one node, imported on
+    /// another, and the restored conversation derives the keys the seller
+    /// derives, which is what "readable" means.
     #[test]
-    fn a_conversation_is_exported_and_imported_through_the_handler() {
+    fn an_old_conversation_string_restores_through_the_handler() {
         use x25519_dalek::{PublicKey, StaticSecret};
 
         let mut laptop = MemSecrets::default();
@@ -1399,20 +1380,11 @@ mod origin_gating_tests {
             store_conversation(buyer.to_bytes(), *PublicKey::from(&seller).as_bytes()),
         );
 
-        let backup = match handle(
-            &mut laptop,
-            Some(&harvest()),
-            HarvestDelegateRequest::ExportBuyerConversation {
-                request_id: 1,
-                store_contract_id: SELLERS_STORE_ID.to_vec(),
-                buyer_public_key: *PublicKey::from(&buyer).as_bytes(),
-            },
-        ) {
-            HarvestDelegateResponse::BuyerConversationExported { result, .. } => {
-                result.expect("must export")
-            }
-            other => panic!("expected BuyerConversationExported, got {other:?}"),
-        };
+        let backup = harvest_common::BackupString(crate::messaging::old_conversation_string(
+            &laptop,
+            &SELLERS_STORE_ID,
+            PublicKey::from(&buyer).as_bytes(),
+        ));
 
         let mut phone = MemSecrets::default();
         let outcome = match handle(

@@ -260,8 +260,8 @@ pub(crate) fn note_store_read<S: SecretStore>(
     if secrets.get_secret(&key).as_deref() == Some(value) {
         return false;
     }
-    secrets.set_secret(&key, value);
-    true
+    // A write the node refused changed nothing a heartbeat could report.
+    secrets.set_secret(&key, value)
 }
 
 /// The refusal the last read of the store's state gave ([`store_read_key`]).
@@ -3217,11 +3217,13 @@ pub(crate) fn decide<S: SecretStore>(
     }
     // Recorded before anything is published, as in `on_store_change`: an
     // order or decrement sent but not recorded would lose its hold, or be
-    // decremented again. The seller's own book first (step 2): an order
-    // published but not kept could roll off the store and leave nothing.
-    if !crate::seller_orders::keep_signed(secrets, &store_sk.verifying_key().to_bytes(), kept)
-        || !save_ledger(secrets, &arm.store_contract_id, &ledger)
-    {
+    // decremented again. The seller's own book first (step 2), so the
+    // ship-to is kept from the moment the order is signed; but a book that
+    // cannot take it (the most books this device keeps, or one that does
+    // not read) does not stop instant checkout: the request stays in the
+    // mailbox, and the seller's tab offers it to the book again.
+    let _ = crate::seller_orders::keep_signed(secrets, &store_sk.verifying_key().to_bytes(), kept);
+    if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
         return Decided {
             undecided: true,
             ..Decided::default()
@@ -6314,6 +6316,31 @@ mod tests {
         let entry = Buyer::new(86).request(&jam(), 1, 1, 12_000);
         f.record = held;
         assert!(run(&mut f, &[entry]).orders.is_empty());
+    }
+
+    /// Review round 2 of step 2 (codex): a store read whose write the node
+    /// refuses changed nothing, so no heartbeat goes out on the old answer
+    /// (a store paused would otherwise say it is taking orders). Mutated red
+    /// by answering true whatever the write did.
+    #[test]
+    fn a_store_read_the_node_did_not_keep_is_not_a_change() {
+        let mut secrets = MemSecrets::refusing_writes();
+        assert!(!note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
+        let mut secrets = MemSecrets::default();
+        assert!(note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
+        assert!(!note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
     }
 
     /// Review round 3 of batch 2: a closed store's heartbeat says closed for

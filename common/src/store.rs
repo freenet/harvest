@@ -459,6 +459,20 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Result<(), String> {
+        // The caps first: they are cheap, and a state over them is refused
+        // before a single signature is checked.
+        if self.listings.len() > MAX_LISTINGS {
+            return Err(format!(
+                "store holds {} listings, the most it keeps is {MAX_LISTINGS}",
+                self.listings.len()
+            ));
+        }
+        if let Some(big) = self.listings.iter().find(|l| !fits(l)) {
+            return Err(format!(
+                "listing {} is over {MAX_LISTING_BYTES} bytes",
+                big.listing.id
+            ));
+        }
         for authorized in &self.listings {
             authorized.verify(owner_key(parent_state)?)?;
             crate::listing_image::check_listing_images(&authorized.listing)?;
@@ -474,20 +488,8 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         // new contract starts empty, and the migration fold builds its state
         // through `apply_delta`, which normalises (see below), so no state
         // this generation holds was written by the old, permissive code.
-        // And within the caps `normalize` keeps (step 2), safe for the same
-        // reason.
-        if self.listings.len() > MAX_LISTINGS {
-            return Err(format!(
-                "store holds {} listings, the most it keeps is {MAX_LISTINGS}",
-                self.listings.len()
-            ));
-        }
-        if let Some(big) = self.listings.iter().find(|l| !fits(l)) {
-            return Err(format!(
-                "listing {} is over {MAX_LISTING_BYTES} bytes",
-                big.listing.id
-            ));
-        }
+        // And within the caps `normalize` keeps (step 2, checked above),
+        // safe for the same reason.
         for pair in self.listings.windows(2) {
             if pair[0].listing.id >= pair[1].listing.id {
                 return Err(format!(
@@ -574,10 +576,12 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
 /// removes a status, and a status for a listing the store does not hold is
 /// kept, since it may arrive first.
 ///
-/// Unbounded, as the listings are. Only the store key's holder can add one,
-/// and one is kept per listing id, but a status need not name a listing the
-/// store holds, so the holder can add as many as they sign. That is their own
-/// store's state to grow, the same exposure the listings already carry.
+/// Unbounded, unlike the listings (step 2 caps those). Only the store key's
+/// holder can add one, and one is kept per listing id, but a status need not
+/// name a listing the store holds, so the holder can add as many as they
+/// sign: their own store's state to grow. A cap that looked at which
+/// listings are held would depend on arrival order. What a long edit history
+/// costs instant checkout is measured (`tests/delegate-budget`).
 pub type ListingStatusesV1 = crate::backing::SignedSetV1<crate::listing::AuthorizedListingStatus>;
 
 impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
@@ -1059,15 +1063,18 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 }
 
 impl OrdersV1 {
-    /// Every record as the store keeps it ([`as_kept`]): for a state written
+    /// Every record as the store keeps it ([`as_kept`]), and at most
+    /// [`MAX_ORDERS`] of them (`enforce_order_cap`): for a state written
     /// before step 2, which a migration fold carries forward without passing
-    /// it through `apply_delta`.
+    /// it through `apply_delta` (the scaffold skips it when the other side
+    /// brings no new order).
     pub fn normalize(&mut self) {
         let held = std::mem::take(&mut self.orders);
         self.orders = held
             .into_iter()
             .map(|(id, record)| (id, as_kept(record)))
             .collect();
+        enforce_order_cap(&mut self.orders);
     }
 }
 
@@ -1643,6 +1650,19 @@ impl StoreStateV1 {
         next.normalize_fulfilment();
         *self = next;
         Ok(())
+    }
+
+    /// The whole state as this generation keeps it, for a state an earlier
+    /// generation wrote that a migration fold carries forward: the listings
+    /// sorted and capped, the orders as kept and capped, and what hangs on
+    /// them (a cut backing's slot, a despatch for a cut order) cut with
+    /// them. Each is what `apply_delta` does to what it touches; the fold's
+    /// merge skips the parts the other side brings nothing new for.
+    pub fn normalize_carried(&mut self) {
+        self.listings.normalize();
+        self.orders.normalize();
+        self.normalize_backings();
+        self.normalize_fulfilment();
     }
 }
 
@@ -6812,7 +6832,7 @@ mod listing_cap_tests {
     }
 }
 
-/// Step 2 (harvest#227): every signed record the store holds writes its
+/// Step 2 (harvest#230): every signed record the store holds writes its
 /// signed payload and signature as CBOR byte strings (`serde_bytes`), which
 /// a store at its order cap carried as arrays of integers, about twice the
 /// bytes and one decode call per byte. The bytes signed are unchanged: only

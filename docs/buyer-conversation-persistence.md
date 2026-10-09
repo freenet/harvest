@@ -484,20 +484,24 @@ code-addressed store generation (V17 on, from `legacy/store_contract.toml`) as
 well as its current one, and shows what it finds with the store. The
 conversation stays KEPT under the id it was opened with: the delegate never
 hands back the secret, so the app cannot re-keep it under the new id. It
-remembers that id instead (`BuyerConversation::kept_under`), and backing up,
-marking saved and forgetting the conversation name it, which is where the
-delegate looks. A conversation kept under a whole-key generation (V1 to V16,
-before the store code) is still not recalled; no store but test ones existed
-then.)
+remembers that id instead (`BuyerConversation::kept_under`), and forgetting
+the conversation names it, which is where the delegate looks. A conversation
+kept under a whole-key generation (V1 to V16, before the store code) is still
+not recalled; no store but test ones existed then.)
 
 ## The shape of the change, as built
 
 Six request families on the harvest delegate, behind the same
 `origin::authorize` gate every other family passes through:
 `StoreBuyerConversation`, `ListBuyerConversations`, `ForgetBuyerConversation`,
-and then `ExportBuyerConversations`, `ImportBuyerConversations`,
-`MarkConversationsBackedUp`. The cap is **in the delegate**, not the UI: a cap
-enforced by the caller is not a cap.
+and then an export, an import and a backed-up marker. The cap is **in the
+delegate**, not the UI: a cap enforced by the caller is not a cap.
+
+(Since step 2 the export and the marker are the one backup file's:
+`ExportPurchasesBackup` and `MarkBackedUp`. The per-conversation
+`ExportBuyerConversation` and `MarkConversationBackedUp` were removed with the
+panel that sent them. `ImportBuyerConversation` stays, so an old
+`harvest-conv-backup-v2:` string still restores from the Backup page.)
 
 `ListBuyerConversations` carries a request id and the UI files the answer
 under the store IT asked about rather than the one the answer echoes. That is
@@ -530,8 +534,9 @@ On the UI side:
   paste box that is offered **even on a device holding nothing**, since
   restoring onto a new machine is the case the whole thing exists for and
   there is nothing there to hang the control off.
-* Marking and importing both **re-ask the delegate** rather than updating the
-  screen from what they assume happened. The delegate is the only thing that
+* Importing **re-asks the delegate** rather than updating the screen from
+  what it assumes happened. (The per-conversation marker did too; it went
+  with the panel in step 2.) The delegate is the only thing that
   knows whether a record was written; a refused write leaves the warning in
   place, which is the safe direction and exactly what a local guess gets
   wrong.

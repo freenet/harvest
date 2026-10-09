@@ -490,10 +490,12 @@ impl Shop {
 
     /// [`Self::paid_order`] with its proof padded to about
     /// [`PADDED_PROOF_BYTES`] by claims of one satoshi each about other
-    /// outpoints, every one confirmed inside the window, so the store's
-    /// minimal-proof check (`store::as_kept`, step 2) has to decode and fold
-    /// them all before it finds the proof is not minimal (the genuine claim,
-    /// last, already covers the amount). The worst that check meets.
+    /// outpoints, every one confirmed inside the window (the genuine claim,
+    /// last, already covers the amount). The store's rule (`store::as_kept`,
+    /// step 2) checks the record's size first, so a record this large is kept
+    /// as its unpaid terms without its proof being folded: what this costs is
+    /// decoding the delta and re-encoding each record to size it. A record
+    /// under `MAX_PAID_ORDER_BYTES` is the one whose proof is folded.
     fn padded_paid_order(&self, label: &str, i: u64) -> Result<AuthorizedOrder> {
         let mut record = self.paid_order(label, i, 0)?;
         let Some(OrderPaymentProof::OnChain(proof)) = record.payment_proof.take() else {
@@ -781,12 +783,27 @@ impl Shop {
             && state.listings.listings.len() == harvest_common::store::MAX_LISTINGS
             // A status outlives the cut of its listing (step 2).
             && state.listing_statuses.records.len() >= state.listings.listings.len()
-            && state.pause.records.len() == 1;
+            && state.pause.records.len() == 1
+            // Every order still `Paid`: one the store kept as its unpaid
+            // terms (`store::as_kept`) would make this a cheaper state than
+            // the rows say it is.
+            && state
+                .orders
+                .orders
+                .values()
+                .all(|o| o.status == harvest_common::payment::OrderStatus::Paid);
         if !full {
             bail!(
-                "{what} is not at its caps: {} orders, {} despatches, {} backing slots, \
-                 {} backers with copies of {unretired} unretired, {} listings, {} statuses",
+                "{what} is not at its caps, every order paid: {} orders ({} paid), {} despatches, \
+                 {} backing slots, {} backers with copies of {unretired} unretired, {} listings, \
+                 {} statuses",
                 state.orders.orders.len(),
+                state
+                    .orders
+                    .orders
+                    .values()
+                    .filter(|o| o.status == harvest_common::payment::OrderStatus::Paid)
+                    .count(),
                 state.fulfilment.records.len(),
                 slots.len(),
                 per_backer.len(),
@@ -851,7 +868,7 @@ pub fn cases() -> Result<Vec<Case>> {
     }
     // (c) Step 2: `Paid` records padded to the proof bound, as anyone may
     // publish one, the newest orders there are. The store keeps each as its
-    // unpaid terms (`store::as_kept`), after decoding every claim.
+    // unpaid terms (`store::as_kept`), refused by its size.
     let padded = StoreStateV1Delta {
         owner: Some(shop.owner()),
         orders: Some(

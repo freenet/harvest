@@ -3362,6 +3362,85 @@ fn a_predecessor_with_4096_orders_is_folded_to_the_cap_with_its_listings() {
         .expect("this generation accepts the folded state");
 }
 
+/// The same cap with the predecessor where the driver puts it: the BASE of
+/// `merge_with_local` (a recovered state folded into the local one) and of
+/// `merge_generations(older, ..)`, where the scaffold's merge skips the
+/// orders' `apply_delta` when the other side brings no new order. Its
+/// oldest order carries a despatch, which must go with it. Red with the cap
+/// left out of `OrdersV1::normalize` (300 orders forwarded, refused by this
+/// generation's `verify`), or the despatch's cut left out of the fold.
+#[test]
+fn a_predecessor_over_the_order_cap_is_capped_whichever_side_it_is_on() {
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::SignedRecord;
+    use harvest_common::store::MAX_ORDERS;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    for i in 0..300i64 {
+        let order = signed_order(i);
+        older.orders.orders.insert(order.order.id.clone(), order);
+    }
+    let oldest = signed_order(0);
+    let despatch = harvest_common::fulfilment::Despatch {
+        order_id: oldest.order.id.clone(),
+        anchor: freenet_bitcoin_common::BlockAnchor {
+            height: 100,
+            hash: freenet_bitcoin_common::BlockHash([1u8; 32]),
+        },
+    };
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&despatch).expect("encode"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("encode");
+    let despatch = harvest_common::fulfilment::AuthorizedDespatch {
+        despatch,
+        signature: seller().sign(&scoped_payload).to_bytes().to_vec(),
+        scoped_payload,
+    };
+    despatch
+        .verify(&seller_vk())
+        .expect("precondition: the seller's");
+    older.fulfilment.records.insert(despatch.slot(), despatch);
+    let ops = store_ops();
+    let empty = StoreStateV1::default();
+    let local = store_with(&[signed_listing("Plum")]);
+    for (shape, state) in [
+        (
+            "merge_with_local(older, empty)",
+            ops.merge_with_local(older.clone(), &empty),
+        ),
+        (
+            "merge_with_local(older, local)",
+            ops.merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations(older, empty)",
+            ops.merge_generations(older.clone(), empty.clone()),
+        ),
+        (
+            "merge_generations(empty, older)",
+            ops.merge_generations(empty.clone(), older.clone()),
+        ),
+    ] {
+        assert_eq!(state.orders.orders.len(), MAX_ORDERS, "{shape}");
+        assert!(
+            !state.orders.orders.contains_key(&oldest.order.id),
+            "{shape}: the oldest goes"
+        );
+        assert!(
+            state.fulfilment.records.is_empty(),
+            "{shape}: its despatch goes with it"
+        );
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
 /// [`signed_order`] marked `Paid` on evidence that is not the minimal proof
 /// (here none that could be: no claims), as an earlier generation kept a
 /// padded one.

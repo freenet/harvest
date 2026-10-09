@@ -296,15 +296,18 @@ measured with the node's engine. Until 2026-10-02 decide was held to 70% of
 an older budget that was 30% too generous (see Calibration); that ceiling
 is gone.
 
-The one step-2 call over that guideline is the seller's book at its caps:
-the heartbeat wake-up that moves 128 paid orders from `unpaid` to `open`
-(66.6%; table below). It is accepted because the measured case is the most
-one wake-up can ever move (the `unpaid` stage holds at most 128) and is out
-of reach of ordinary traffic: it needs 128 orders paid between two wake-ups
-(5 minutes apart), more than a whole day of instant checkout
-(`auto_invoice::MAX_PER_DAY`, 100 a store). It can come near only when this
-node was offline while a day's orders were paid, or with manual invoices on
-top; even then it is 66.6%, within the budget.
+The step-2 calls over that guideline are the seller's book's wake-up at
+its caps (table below): moving 256 paid orders on (66.8%), and the same 256
+with the paid stage full (72.3%). They are accepted because each is the most
+one wake-up can ever do (`unpaid` holds at most 128 unpaid orders and 128
+paid ones waiting for room) and is out of reach of ordinary traffic. The
+first needs 128 orders paid between two wake-ups (5 minutes apart), more
+than a whole day of instant checkout (`auto_invoice::MAX_PER_DAY`, 100 a
+store), on top of 128 already waiting, which needs 512 paid orders not yet
+sent. The second needs the 512 too, and recurs each wake-up while they stay
+unsent. Both can come near only when this node was offline while a day's
+orders were paid, or with manual invoices on top; even then they are within
+the budget.
 
 **The next re-key (harvest#198 lane, branch `fix/delegate-rekey-batch2`)**
 moves one row: `DeriveConversationKeys` for 512 peers, store key and Ghost
@@ -370,12 +373,11 @@ delegation it reads for).
     are not marked read and are reopened on every notification.
   * `ImportMigratedSecret` of the RSA key (`harvest:rsa_pk:*`, which
     parses an RSA key; the ledger import is driven above),
-    `ExportBuyerConversation`
-    and `ImportBuyerConversation`, and the migration markers
+    `ImportBuyerConversation` (an old one-conversation backup string), and the migration markers
     (`GetMigrationMarker`, `SetMigrationMarker`, `GetPredecessorMarker`,
     `RecordPredecessorMarker`).
   * `GetRsaPublicKey`, `SetStoreArchived`, `ForgetBuyerConversation`,
-    `MarkConversationBackedUp`.
+    `MarkBackedUp`.
   * The Bitcoin delegate's `Watch`, `Unwatch`, `ListWatched`,
     `AssociateOrder`, `ConfigureBridge`, `GetBridge`, `GetPaymentXpub`.
   * `CreateListing`, which is a stub.
@@ -420,20 +422,30 @@ the figures are refreshed below:
 
 At the caps step 2 ships (`MAX_ORDERS` 256, `MAX_LISTINGS` 128), with the
 seller's book (three stages full: 128 unpaid, 512 paid unsent at 3.9 MiB,
-1024 sent at 6.7 MiB), delegate `3db237b3…`:
+1024 sent at 6.7 MiB), delegate `ee8125ce…` (step 2, review round 2):
 
 | call | step 2 |
 |---|---:|
-| instant decide against a store of 256 paid orders | 1,462,252,091 (48.7%) |
-| same, the seller's book full | 1,501,283,731 (50.0%) |
-| same, with 127 more listings of 32 KiB (every field at its largest) | 1,543,380,136 (51.4%) |
-| same, with 10,000 listing statuses | 1,573,683,252 (52.5%) |
-| `KeepSellerOrders`, 48 sent, a full book | 1,615,171,685 (53.8%) |
-| `ListSellerOrders`, a page, a full book | 617,729,910 (20.6%), 27 pages |
-| heartbeat wake-up moving 128 paid orders from `unpaid` to `open` | 1,997,814,267 (66.6%) |
-| `KeepPurchase`, the 1024th | 1,113,917,748 (37.1%) |
-| `ListKeptPurchases (1024)` | 1,099,787,581 (36.7%) |
-| `SetPaymentXpub`, a new key, two full stores' 512 scripts (pending, then made active) | 1,220,974,119 (40.7%), 2 calls |
+| instant decide against a store of 256 paid orders | 1,462,267,011 (48.7%) |
+| same, the seller's book full | 1,501,304,359 (50.0%) |
+| same, with 127 more listings of 32 KiB (every field at its largest) | 1,543,386,716 (51.4%) |
+| same, with 10,000 listing statuses | 1,573,692,618 (52.5%) |
+| `KeepSellerOrders`, 48 sent, a full book | 1,618,063,982 (53.9%) |
+| `ListSellerOrders`, a page, a full book | 622,087,056 (20.7%), 27 pages |
+| heartbeat wake-up moving 256 paid orders on (128 marked paid, 128 waiting for room) | 2,004,312,127 (66.8%) |
+| heartbeat wake-up with the same 256 and the paid stage full (128 wait, every one named) | 2,170,003,425 (72.3%) |
+| `ImportMigratedSecret`, a predecessor's full sent stage into a book that holds none | 893,746,049 (29.8%) |
+| same, its full paid stage after it | 1,601,382,610 (53.4%) |
+| `ImportMigratedSecret`, a full ledger into a full ledger | 704,031,349 (23.5%; 41.8% before) |
+| `KeepPurchase`, the 1024th | 1,113,917,725 (37.1%) |
+| `ListKeptPurchases (1024)` | 1,099,787,553 (36.7%) |
+| `SetPaymentXpub`, a new key, two full stores' 512 scripts (pending, then made active) | 1,220,971,781 (40.7%), 2 calls |
+
+The book's imports were 105% and 165% when first measured: a migrated
+secret's value crossed the wire as an array of integers, one item a byte.
+It is one byte string now (`MigratedSecretValue`), which is also why the
+ledger import fell, and a predecessor's book is taken as written (its
+signatures were checked when it was filed) rather than verified again.
 
 The new-key row used to take one full store's scripts; at 256 they fit in
 one call's scan (`FLOOR_SCAN_BUDGET`, 384), which would leave the pending
@@ -443,8 +455,9 @@ The store's signed records now write their signed payload and signature as
 CBOR byte strings, which is most of why the kept purchases halve, and
 decide's light read skips each listing's and listing status's signature,
 signed payload and certificate, and reads only the statuses of listings the
-store holds. A listing status costs decide about 11.1K fuel, so on a store
-of 4,096 paid orders (the former cap) decide reaches the budget at about 56,000 status edits
-with few listings, and at about 27,000 with both listing caps full: a store
-that edits that often stops answering Buy now (`docs/untested-invariants.md`,
-step 2).
+store holds. A listing status costs decide about 11K fuel, so on a store
+at today's caps (256 paid orders) decide reaches the budget at about 135,000
+status edits with few listings, and at about 128,000 with 128 listings at
+the bound (at the former caps, 4,096 paid orders and 512 listings, about
+56,000 and 27,000): a store that edits that often stops answering Buy now
+(`docs/untested-invariants.md`, step 2).

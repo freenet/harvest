@@ -13,18 +13,20 @@
 //! only the stage it writes:
 //!
 //! * `unpaid`: orders awaiting payment, at most [`MAX_SELLER_UNPAID_KEPT`];
-//!   past it the oldest unpaid one goes (nothing is owed on it). Small: no
-//!   proofs. Instant checkout appends here as it signs, and a store
-//!   notification marks one paid or drops one cancelled here, so neither
-//!   ever decodes the larger stages (the delegate budget's full-book row
-//!   measured that at 91% of a call). An order marked paid here stays until
-//!   the next tab call or wake-up moves it on (`Book::promote`); it is listed,
-//!   and shown, as paid meanwhile.
+//!   past it the oldest unpaid one goes. Small: no proofs. Instant checkout
+//!   appends here as it signs, and a store notification marks one paid or
+//!   drops one cancelled here, so neither ever decodes the larger stages
+//!   (the delegate budget's full-book row measured that at 91% of a call).
+//!   An order marked paid here stays until the next tab call or wake-up
+//!   moves it on (`Book::promote`); it is listed, and shown, as paid
+//!   meanwhile. An unpaid order that goes can still be paid later; it comes
+//!   back only from the tab, while the store still shows it.
 //! * `open`: paid orders not yet sent, at most [`MAX_SELLER_UNSENT_KEPT`],
 //!   with the minimal proof once the tab supplies it. A paid order is never
-//!   evicted: past the cap a new one stays where it was (marked paid in
-//!   `unpaid`, or not kept), is named in `paid_refused`, which the seller
-//!   is shown, and moves on once there is room.
+//!   evicted: past the cap it waits in `unpaid`, marked paid, with its
+//!   ship-to (up to [`MAX_SELLER_UNPAID_KEPT`] waiting so; past that only
+//!   its id), is named in `paid_refused`, which the seller is shown, and
+//!   moves on once there is room.
 //! * `done`: sent (or reversed) orders, the newest
 //!   [`MAX_SELLER_SENT_KEPT`] by `created_at`: history, which may decay,
 //!   without the proof.
@@ -44,9 +46,12 @@
 //!   order's proof, a despatch), and a despatch for an order the store no
 //!   longer holds, which is recorded here only (`sent_off_store`).
 //! * A wake-up ([`sweep`], one book at a time): what `unpaid` holds as paid
-//!   moves on; unpaid orders past their payment window go; and a sent
-//!   order's request goes once its complaint window has closed (the UI's
-//!   `fulfilment::address_retained`).
+//!   moves on, and unpaid orders past their payment window go.
+//!
+//! A sent order's request goes at the first tab call after its complaint
+//! window has closed (the UI's `fulfilment::address_retained`), judged by
+//! the chain tip instant checkout caches; with no tip cached (no store
+//! armed for instant checkout on that network) it stays.
 
 use freenet_migrate::SecretStore;
 use harvest_common::delegate::{
@@ -123,8 +128,16 @@ fn read<S: SecretStore, T: for<'de> Deserialize<'de> + Default>(
 
 impl Book {
     /// The book, or `None` if a stage is there and does not decode (then
-    /// nothing is written over it).
+    /// nothing is written over it). An order in two stages (a save refused
+    /// part-way) is read from the later one.
     fn load<S: SecretStore>(secrets: &S, store_key: &[u8; 32]) -> Option<Book> {
+        let mut book = Self::load_raw(secrets, store_key)?;
+        book.dedupe();
+        Some(book)
+    }
+
+    /// The three stages exactly as stored.
+    fn load_raw<S: SecretStore>(secrets: &S, store_key: &[u8; 32]) -> Option<Book> {
         Some(Book {
             unpaid: read(secrets, &unpaid_key(store_key))?,
             open: read(secrets, &open_key(store_key))?,
@@ -132,19 +145,37 @@ impl Book {
         })
     }
 
-    /// Write back each stage that differs from `before`. Answers whether
-    /// the node kept every write.
+    /// Each order in its latest stage only, after a save refused part-way
+    /// ([`Book::save`]). Over the stages read: a wake-up that read only
+    /// `unpaid` leaves a copy there that the next tab call clears.
+    fn dedupe(&mut self) {
+        let later: std::collections::BTreeSet<[u8; 32]> =
+            self.done.iter().map(|r| r.order.order.id.0).collect();
+        self.open
+            .orders
+            .retain(|r| !later.contains(&r.order.order.id.0));
+        let later: std::collections::BTreeSet<[u8; 32]> = later
+            .into_iter()
+            .chain(self.open.orders.iter().map(|r| r.order.order.id.0))
+            .collect();
+        self.unpaid.retain(|r| !later.contains(&r.order.order.id.0));
+    }
+
+    /// Write back each stage that differs from `before`, the later stages
+    /// first: a record moves on, so if a write is refused part-way it is in
+    /// two stages, never none, and [`Book::load`] keeps the later. Answers
+    /// whether the node kept every write.
     fn save<S: SecretStore>(&self, secrets: &mut S, store_key: &[u8; 32], before: &Book) -> bool {
         let mut ok = true;
-        if self.unpaid != before.unpaid {
-            ok &=
-                to_cbor(&self.unpaid).is_ok_and(|b| secrets.set_secret(&unpaid_key(store_key), &b));
-        }
-        if self.open != before.open {
-            ok &= to_cbor(&self.open).is_ok_and(|b| secrets.set_secret(&open_key(store_key), &b));
-        }
         if self.done != before.done {
             ok &= to_cbor(&self.done).is_ok_and(|b| secrets.set_secret(&done_key(store_key), &b));
+        }
+        if ok && self.open != before.open {
+            ok &= to_cbor(&self.open).is_ok_and(|b| secrets.set_secret(&open_key(store_key), &b));
+        }
+        if ok && self.unpaid != before.unpaid {
+            ok &=
+                to_cbor(&self.unpaid).is_ok_and(|b| secrets.set_secret(&unpaid_key(store_key), &b));
         }
         ok
     }
@@ -180,14 +211,12 @@ impl Book {
                 .map(|at| stage.remove(at))
         };
         // Where it was: a paid order already in `open` keeps its place there.
-        let mut was_open = false;
+        let mut was = Stage::None;
         let held = take(&mut self.unpaid)
-            .or_else(|| {
-                let held = take(&mut self.open.orders);
-                was_open = held.is_some();
-                held
-            })
-            .or_else(|| take(&mut self.done));
+            .inspect(|_| was = Stage::Unpaid)
+            .or_else(|| take(&mut self.open.orders).inspect(|_| was = Stage::Open))
+            .or_else(|| take(&mut self.done).inspect(|_| was = Stage::Done));
+        let was_open = was == Stage::Open;
         let unchanged = held
             .as_ref()
             .is_some_and(|h| merged(h.clone(), record.clone()) == *h);
@@ -195,7 +224,14 @@ impl Book {
             Some(held) => merged(held, record),
             None => record,
         };
-        let filed = |f: Filed| if unchanged { Filed::Unchanged } else { f };
+        // Nothing changed only if the record is as it was AND where it was.
+        let filed = |f: Filed, to: Stage| {
+            if unchanged && was == to {
+                Filed::Unchanged
+            } else {
+                f
+            }
+        };
         match next.order.status {
             OrderStatus::Cancelled => {
                 self.open.paid_refused.retain(|r| *r != id);
@@ -219,15 +255,21 @@ impl Book {
                 }
                 self.unpaid
                     .sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
-                filed(Filed::Kept)
+                filed(Filed::Kept, Stage::Unpaid)
             }
             OrderStatus::Paid if next.despatch.is_none() => {
                 if !was_open && self.open.orders.len() >= MAX_SELLER_UNSENT_KEPT {
-                    // Never evicted, nor makes room: one held stays in
-                    // `unpaid`, marked paid, keeping its ship-to; every one
-                    // is named, and the seller is shown it.
-                    if held.is_some() {
+                    // Never evicted, nor makes room: it waits in `unpaid`,
+                    // marked paid, keeping its ship-to, up to
+                    // `MAX_SELLER_UNPAID_KEPT` waiting so (which keeps the
+                    // stage instant checkout reads small); past that only
+                    // its id is kept. Every one is named, and the seller is
+                    // shown it.
+                    let waiting = self.unpaid.iter().filter(|r| !is_awaiting(r)).count();
+                    if waiting < MAX_SELLER_UNPAID_KEPT {
                         self.unpaid.push(next);
+                        self.unpaid
+                            .sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
                     }
                     if !self.open.paid_refused.contains(&id) {
                         self.open.paid_refused.push(id);
@@ -242,7 +284,7 @@ impl Book {
                 self.open
                     .orders
                     .sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
-                filed(Filed::Kept)
+                filed(Filed::Kept, Stage::Open)
             }
             _ => {
                 self.open.paid_refused.retain(|r| *r != id);
@@ -251,12 +293,10 @@ impl Book {
                 // mattered and which would make a sent order as large as its
                 // payment's transactions.
                 let mut next = next;
-                if next.order.status == OrderStatus::Paid {
-                    next.paid_height = next
-                        .paid_height
-                        .or_else(|| harvest_common::payment::paid_height(&next.order));
-                    next.order.payment_proof = None;
-                }
+                next.paid_height = next
+                    .paid_height
+                    .or_else(|| harvest_common::payment::paid_height(&next.order));
+                next.order.payment_proof = None;
                 self.done.push(next);
                 self.done
                     .sort_by_key(|r| (r.order.order.created_at, r.order.order.id.0));
@@ -264,7 +304,7 @@ impl Book {
                     let excess = self.done.len() - MAX_SELLER_SENT_KEPT;
                     self.done.drain(..excess);
                 }
-                filed(Filed::Kept)
+                filed(Filed::Kept, Stage::Done)
             }
         }
     }
@@ -314,14 +354,39 @@ pub(crate) fn bounded(request: KeptRequest) -> KeptRequest {
     }
 }
 
+/// Who a record comes from, which decides how much of it is checked.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Source {
+    /// The seller's tab, or a restored backup file: anything in it may have
+    /// been made up, so everything is checked as the store would keep it.
+    Tab,
+    /// A predecessor generation of this delegate (a re-key's migration),
+    /// which filed every record after the same checks: kept as it was
+    /// written, with only its shape held to this generation's bounds. A
+    /// full book re-verified here would cost several calls' budget (1,536
+    /// records, two or three signatures each).
+    Predecessor,
+}
+
 /// Check `incoming` as a record of the store `owner`, as the store would
 /// keep it: the order verifies, a `Paid` on anything but the minimal proof
 /// is its unpaid terms (`store::as_kept`), a despatch is the store key's and
 /// names this order, and the request is cut to its bounds.
+///
+/// A `Paid` without its proof says nothing a tab can be held to (the status
+/// is not signed, and every unpaid order's terms are public in the store),
+/// so from the tab it is kept only as its unpaid terms, unless the store
+/// key signed its despatch: filed into a book that already holds the order
+/// as paid (a store notification marked it, or its proof was checked
+/// before), it changes nothing there.
 fn checked(
     owner: &ed25519_dalek::VerifyingKey,
     incoming: SellerKeptOrder,
+    source: Source,
 ) -> Result<SellerKeptOrder, String> {
+    if source == Source::Predecessor {
+        return shaped(incoming);
+    }
     let mut order = incoming.order;
     let mut paid_height = incoming.paid_height;
     let id = order.order.id.clone();
@@ -330,11 +395,21 @@ fn checked(
             .verify_terms(owner)
             .map_err(|e| format!("order {id} does not verify: {e}"))
     };
+    if let Some(despatch) = &incoming.despatch {
+        despatch.verify(owner)?;
+        if despatch.despatch.order_id != id {
+            return Err(format!("the despatch names another order than {id}"));
+        }
+    }
     if order.status == OrderStatus::Paid && order.payment_proof.is_none() {
-        // Paid as a store notification showed it, or past the store's
-        // byte bound (below), kept here before: the terms are the store
-        // key's, and the payment was checked when it was first kept.
         terms(&order)?;
+        // Sent, by the store key's own word (checked above): history, kept
+        // as paid. Any other is its unpaid terms until the book or the store
+        // says paid.
+        if incoming.despatch.is_none() {
+            order = harvest_common::store::as_kept(order);
+            paid_height = None;
+        }
     } else if order.status == OrderStatus::Paid
         && !harvest_common::store::paid_within_cap(&order)
         && order
@@ -366,21 +441,35 @@ fn checked(
             order.order.id, order.status
         ));
     }
-    if let Some(despatch) = &incoming.despatch {
-        despatch.verify(owner)?;
-        if despatch.despatch.order_id != order.order.id {
-            return Err(format!(
-                "the despatch names another order than {}",
-                order.order.id
-            ));
-        }
-    }
     Ok(SellerKeptOrder {
         paid_height: paid_height.or_else(|| harvest_common::payment::paid_height(&order)),
         order,
         request: incoming.request.map(bounded),
         despatch: incoming.despatch,
         sent_off_store: incoming.sent_off_store,
+    })
+}
+
+/// A predecessor's record held to this generation's bounds without
+/// re-checking its signatures ([`Source::Predecessor`]).
+fn shaped(incoming: SellerKeptOrder) -> Result<SellerKeptOrder, String> {
+    let id = &incoming.order.order.id;
+    if !matches!(
+        incoming.order.status,
+        OrderStatus::AwaitingPayment | OrderStatus::Paid | OrderStatus::PaymentReversed
+    ) {
+        return Err(format!("order {id} is not unpaid, paid or reversed"));
+    }
+    if incoming
+        .despatch
+        .as_ref()
+        .is_some_and(|d| d.despatch.order_id != *id)
+    {
+        return Err(format!("the despatch names another order than {id}"));
+    }
+    Ok(SellerKeptOrder {
+        request: incoming.request.map(bounded),
+        ..incoming
     })
 }
 
@@ -407,6 +496,15 @@ pub(crate) fn merged(held: SellerKeptOrder, incoming: SellerKeptOrder) -> Seller
         despatch: held.despatch.or(incoming.despatch),
         sent_off_store: held.sent_off_store || incoming.sent_off_store,
     }
+}
+
+/// Where a record was held before it was filed.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stage {
+    None,
+    Unpaid,
+    Open,
+    Done,
 }
 
 /// What filing one record did.
@@ -449,17 +547,32 @@ pub(crate) fn keep<S: SecretStore>(
             "this device does not hold that store's key, so it keeps no orders for it".into(),
         ));
     }
-    match file_all(secrets, &store_key, orders, true) {
+    match file_all(secrets, &store_key, orders, Vec::new(), Source::Tab) {
         Ok(kept) => answer(Ok(kept)),
         Err(why) => answer(Err(why)),
     }
 }
 
-/// Whether one more book may be kept for `store_key`.
+/// Whether one more book may be kept for `store_key`. A book whose store
+/// key this device no longer holds does not count.
 fn book_room<S: SecretStore>(secrets: &S, store_key: &[u8; 32]) -> Result<(), String> {
     let encoded = bs58::encode(store_key).into_string().into_bytes();
     let held = books(secrets);
-    if !held.contains(&encoded) && held.len() >= MAX_SELLER_BOOKS {
+    if held.contains(&encoded) {
+        return Ok(());
+    }
+    let live = held
+        .iter()
+        .filter(|name| {
+            bs58::decode(name)
+                .into_vec()
+                .ok()
+                .and_then(|k| <[u8; 32]>::try_from(k).ok())
+                .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+                .is_some_and(|k| crate::store_keys::load(secrets, &k).is_some())
+        })
+        .count();
+    if live >= MAX_SELLER_BOOKS {
         return Err(format!(
             "this device already keeps the orders of {MAX_SELLER_BOOKS} stores, the most it keeps"
         ));
@@ -468,38 +581,58 @@ fn book_room<S: SecretStore>(secrets: &S, store_key: &[u8; 32]) -> Result<(), St
 }
 
 /// File every record into `store_key`'s book, after moving on what
-/// `unpaid` holds as paid, and save the stages that changed. `strict`
-/// refuses the whole call on a record that does not check (the tab's
-/// call); otherwise such a record is skipped (an import's).
+/// `unpaid` holds as paid, and save the stages that changed. A record from
+/// the tab that does not check refuses the whole call; a predecessor's is
+/// skipped.
 fn file_all<S: SecretStore>(
     secrets: &mut S,
     store_key: &[u8; 32],
     orders: Vec<SellerKeptOrder>,
-    strict: bool,
+    named: Vec<OrderId>,
+    source: Source,
 ) -> Result<u32, String> {
     let owner = ed25519_dalek::VerifyingKey::from_bytes(store_key)
         .map_err(|_| "that is not a store key".to_string())?;
     let mut checked_all = Vec::with_capacity(orders.len());
     for record in orders {
-        match checked(&owner, record) {
+        match checked(&owner, record, source) {
             Ok(record) => checked_all.push(record),
-            Err(why) if strict => return Err(why),
+            Err(why) if source == Source::Tab => return Err(why),
             Err(_) => {}
         }
     }
     book_room(secrets, store_key)?;
-    let Some(mut book) = Book::load(secrets, store_key) else {
+    let Some(before) = Book::load_raw(secrets, store_key) else {
         return Err(
             "this store's kept orders do not read, so nothing was written over them".into(),
         );
     };
-    let before = book.clone();
+    // Compared with the stages as stored, so a copy `dedupe` drops is
+    // written away too.
+    let mut book = before.clone();
+    book.dedupe();
     book.promote();
     book.drop_closed_requests(&cached_tips(secrets));
     let mut kept = 0u32;
     for record in checked_all {
         if book.file(record) == Filed::Kept {
             kept += 1;
+        }
+    }
+    // A predecessor's refused names, for orders this book does not hold
+    // past `unpaid` either.
+    for id in named {
+        let moved_on = book
+            .open
+            .orders
+            .iter()
+            .chain(&book.done)
+            .any(|r| r.order.order.id == id);
+        if !moved_on
+            && !book.open.paid_refused.contains(&id)
+            && book.open.paid_refused.len() < MAX_SELLER_UNSENT_KEPT
+        {
+            book.open.paid_refused.push(id);
         }
     }
     if !book.save(secrets, store_key, &before) {
@@ -531,6 +664,15 @@ pub(crate) fn keep_signed<S: SecretStore>(
         ..Book::default()
     };
     for record in orders {
+        // Only an order this stage does not hold: one held, perhaps marked
+        // paid since, is not this stage's alone to file again.
+        if book
+            .unpaid
+            .iter()
+            .any(|r| r.order.order.id == record.order.order.id)
+        {
+            continue;
+        }
         book.file(SellerKeptOrder {
             request: record.request.map(bounded),
             ..record
@@ -727,6 +869,7 @@ pub(crate) fn sweep<S: SecretStore>(secrets: &mut S) -> bool {
         }
     }
     let before = book.clone();
+    book.dedupe();
     book.promote();
     let lapse = harvest_common::payment::MAX_ANCHOR_AGE_BLOCKS
         + harvest_common::payment::PAYMENT_CONFIRMATION_SLACK_BLOCKS;
@@ -754,9 +897,13 @@ pub(crate) fn import<S: SecretStore>(
     let Some(rest) = key.strip_prefix(SELLER_ORDERS_PREFIX.as_bytes()) else {
         return SecretImport::Permanent("not a seller's order book".into());
     };
+    let mut named = Vec::new();
     let (records, name) = if let Some(name) = rest.strip_prefix(b"open:") {
         match from_cbor::<OpenBook>(value) {
-            Ok(book) => (book.orders, name),
+            Ok(book) => {
+                named = book.paid_refused;
+                (book.orders, name)
+            }
             Err(_) => {
                 return SecretImport::Permanent("the predecessor's book did not decode".into())
             }
@@ -782,7 +929,7 @@ pub(crate) fn import<S: SecretStore>(
     else {
         return SecretImport::Permanent("the predecessor's book names no store key".into());
     };
-    match file_all(secrets, &store_key, records, false) {
+    match file_all(secrets, &store_key, records, named, Source::Predecessor) {
         Ok(0) => SecretImport::AlreadyAuthoritative,
         Ok(_) => SecretImport::Written,
         Err(why) => SecretImport::Retryable(why),
@@ -1091,7 +1238,7 @@ pub(crate) mod tests {
     #[test]
     fn a_store_notification_marks_paid_and_drops_cancelled() {
         let mut secrets = seller();
-        // As instant checkout writes them: into the signed inbox.
+        // As instant checkout writes them: into the unpaid stage.
         keep_signed(
             &mut secrets,
             &store_key(),
@@ -1117,7 +1264,7 @@ pub(crate) mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].order.status, OrderStatus::Paid);
         assert!(all[0].request.is_some(), "with its ship-to");
-        // A wake-up files it into the book and empties the inbox.
+        // A wake-up moves it on from the unpaid stage.
         assert!(sweep(&mut secrets));
         let unpaid: Vec<SellerKeptOrder> =
             from_cbor(&secrets.get_secret(&unpaid_key(&store_key())).unwrap()).unwrap();
@@ -1259,17 +1406,406 @@ pub(crate) mod tests {
         assert!(one.request.is_some());
     }
 
-    /// At most `MAX_SELLER_BOOKS` stores' books. Mutated red by no cap.
+    /// At most `MAX_SELLER_BOOKS` stores' books, of stores whose key this
+    /// device still holds: a book left by a key it no longer holds does not
+    /// count. Mutated red by no cap, and by counting every book.
     #[test]
     fn books_are_capped() {
         let mut secrets = seller();
-        for b in 0..MAX_SELLER_BOOKS as u8 {
-            secrets.set_secret(&open_key(&[b; 32]), &to_cbor(&OpenBook::default()).unwrap());
-        }
-        assert!(
-            kept(&mut secrets, vec![record(1, OrderStatus::AwaitingPayment)])
-                .unwrap_err()
-                .contains("the most it keeps")
+        // A book of a store whose key is gone.
+        secrets.set_secret(
+            &open_key(&[0xEE; 32]),
+            &to_cbor(&OpenBook::default()).unwrap(),
         );
+        for b in 0..(MAX_SELLER_BOOKS as u8 - 1) {
+            let other = ed25519_dalek::SigningKey::from_bytes(&[0x40 + b; 32]);
+            secrets.set_secret(
+                &crate::store_keys::store_key_secret(&other.verifying_key()),
+                &other.to_bytes(),
+            );
+            secrets.set_secret(
+                &open_key(&other.verifying_key().to_bytes()),
+                &to_cbor(&OpenBook::default()).unwrap(),
+            );
+        }
+        assert_eq!(
+            kept(&mut secrets, vec![record(1, OrderStatus::AwaitingPayment)]),
+            Ok(1),
+            "the gone store's book leaves room for a sixteenth"
+        );
+        let more = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        secrets.set_secret(
+            &crate::store_keys::store_key_secret(&more.verifying_key()),
+            &more.to_bytes(),
+        );
+        let answer = keep(&mut secrets, 1, more.verifying_key().to_bytes(), Vec::new());
+        assert!(
+            matches!(&answer, HarvestDelegateResponse::SellerOrdersKept { result: Err(e), .. } if e.contains("the most it keeps")),
+            "{answer:?}"
+        );
+    }
+
+    /// The stage `open` full of paid orders not yet sent.
+    fn open_full(secrets: &mut MemSecrets) {
+        let orders = (0..MAX_SELLER_UNSENT_KEPT as u16)
+            .map(|n| SellerKeptOrder {
+                order: signed(2000 + n, OrderStatus::Paid),
+                request: None,
+                despatch: None,
+                paid_height: Some(100),
+                sent_off_store: false,
+            })
+            .collect();
+        secrets.set_secret(
+            &open_key(&store_key()),
+            &to_cbor(&OpenBook {
+                orders,
+                paid_refused: Vec::new(),
+            })
+            .unwrap(),
+        );
+    }
+
+    /// Review round 2 of step 2 (every lens): the 513th paid order, signed
+    /// by instant checkout and marked paid by a store notification, waits in
+    /// `unpaid` with its ship-to through the wake-up's move and the tab's
+    /// next call, and is named. It was lost: the move took it out of
+    /// `unpaid` before filing it, and a refusal kept only a record still
+    /// held there. Mutated red by keeping only a record held before (the
+    /// old condition), and by not keeping a waiting one at all.
+    #[test]
+    fn the_513th_paid_order_waits_with_its_ship_to_through_every_path() {
+        let mut secrets = seller();
+        open_full(&mut secrets);
+        let late = record(600, OrderStatus::AwaitingPayment);
+        assert!(keep_signed(&mut secrets, &store_key(), vec![late.clone()]));
+        let id = late.order.order.id.clone();
+        on_store_statuses(&mut secrets, &store_key(), |o| {
+            (*o == id).then_some(OrderStatus::Paid)
+        });
+        sweep(&mut secrets);
+        let check = |secrets: &MemSecrets, when: &str| {
+            let (all, refused) = whole(secrets);
+            let kept = all
+                .iter()
+                .find(|r| r.order.order.id == id)
+                .unwrap_or_else(|| panic!("{when}: the 513th paid order is lost"));
+            assert_eq!(kept.order.status, OrderStatus::Paid, "{when}");
+            assert_eq!(kept.request, late.request, "{when}: its ship-to");
+            assert!(refused.contains(&id), "{when}: named");
+        };
+        check(&secrets, "after the wake-up");
+        assert_eq!(kept(&mut secrets, Vec::new()), Ok(0));
+        check(&secrets, "after the tab's next call");
+    }
+
+    /// At most `MAX_SELLER_UNPAID_KEPT` paid orders wait in `unpaid` (which
+    /// instant checkout and every store notification read); past that only
+    /// the id is kept, and named. Mutated red by no bound on waiting ones.
+    #[test]
+    fn waiting_paid_orders_are_bounded_and_every_one_is_named() {
+        let mut book = Book::default();
+        for n in 0..MAX_SELLER_UNSENT_KEPT as u16 {
+            book.open.orders.push(SellerKeptOrder {
+                order: signed(n, OrderStatus::Paid),
+                request: None,
+                despatch: None,
+                paid_height: Some(100),
+                sent_off_store: false,
+            });
+        }
+        let waiting = MAX_SELLER_UNPAID_KEPT as u16;
+        for n in 0..=waiting {
+            let mut r = record(3000 + n, OrderStatus::AwaitingPayment);
+            r.order = signed(3000 + n, OrderStatus::Paid);
+            assert_eq!(book.file(r), Filed::Refused);
+        }
+        assert_eq!(book.unpaid.len(), MAX_SELLER_UNPAID_KEPT);
+        assert!(book.unpaid.iter().all(|r| r.request.is_some()));
+        let last = signed(3000 + waiting, OrderStatus::Paid).order.id;
+        assert!(!book.unpaid.iter().any(|r| r.order.order.id == last));
+        assert_eq!(book.open.paid_refused.len(), MAX_SELLER_UNPAID_KEPT + 1);
+        assert!(book.open.paid_refused.contains(&last));
+    }
+
+    /// Review round 2 of step 2 (codex, skeptical, code-first): a `Paid`
+    /// without its proof from the tab, or a restored file, says nothing the
+    /// store key signed, so it is kept as its unpaid terms; with the store
+    /// key's despatch it is history, kept paid; and into a book that holds
+    /// the order paid already it changes nothing. Mutated red by keeping a
+    /// proofless `Paid` as paid.
+    #[test]
+    fn a_tab_cannot_make_an_order_paid_without_its_proof() {
+        let proofless = |n: u16| {
+            let mut r = record(n, OrderStatus::AwaitingPayment);
+            r.order.status = OrderStatus::Paid;
+            r.order.payment_proof = None;
+            r
+        };
+        let mut secrets = seller();
+        assert_eq!(kept(&mut secrets, vec![proofless(1)]), Ok(1));
+        assert_eq!(
+            held(&secrets, 1).unwrap().order.status,
+            OrderStatus::AwaitingPayment,
+            "kept as its unpaid terms"
+        );
+        let mut sent = proofless(2);
+        sent.despatch = Some(despatch(&sent.order, 120));
+        assert_eq!(kept(&mut secrets, vec![sent]), Ok(1));
+        let sent = held(&secrets, 2).unwrap();
+        assert_eq!(
+            sent.order.status,
+            OrderStatus::Paid,
+            "sent, by the store key"
+        );
+        let mut forged = proofless(3);
+        let mut other = despatch(&signed(4, OrderStatus::Paid), 120);
+        other.despatch.order_id = forged.order.order.id.clone();
+        forged.despatch = Some(other);
+        assert!(
+            kept(&mut secrets, vec![forged]).is_err(),
+            "a forged despatch"
+        );
+        // Marked paid by the store's own notification first: the tab's
+        // proofless copy leaves it paid.
+        assert!(keep_signed(
+            &mut secrets,
+            &store_key(),
+            vec![record(5, OrderStatus::AwaitingPayment)]
+        ));
+        let five = signed(5, OrderStatus::AwaitingPayment).order.id;
+        on_store_statuses(&mut secrets, &store_key(), |o| {
+            (*o == five).then_some(OrderStatus::Paid)
+        });
+        kept(&mut secrets, vec![proofless(5)]).unwrap();
+        assert_eq!(held(&secrets, 5).unwrap().order.status, OrderStatus::Paid);
+    }
+
+    /// Review round 2 of step 2 (codex, skeptical): a record moving on is
+    /// written to its new stage before it leaves the old, so a host that
+    /// refuses a write part-way leaves it in two stages, never none, and the
+    /// book reads it from the later one. Mutated red by writing `unpaid`
+    /// first, and by reading a record in two stages twice.
+    #[test]
+    fn a_save_refused_part_way_loses_no_order() {
+        let mut secrets = seller();
+        let r = record(1, OrderStatus::AwaitingPayment);
+        assert!(keep_signed(&mut secrets, &store_key(), vec![r.clone()]));
+        let id = r.order.order.id.clone();
+        on_store_statuses(&mut secrets, &store_key(), |o| {
+            (*o == id).then_some(OrderStatus::Paid)
+        });
+        // The move to `open` written, the `unpaid` write refused.
+        secrets.refused_prefix = Some(unpaid_key(&store_key()));
+        assert!(kept(&mut secrets, Vec::new()).is_err());
+        secrets.refused_prefix = None;
+        let (all, _) = whole(&secrets);
+        assert_eq!(
+            all.iter().filter(|o| o.order.order.id == id).count(),
+            1,
+            "held once"
+        );
+        assert_eq!(
+            all.iter()
+                .find(|o| o.order.order.id == id)
+                .unwrap()
+                .order
+                .status,
+            OrderStatus::Paid
+        );
+        // And the write that was refused goes through next time.
+        assert_eq!(kept(&mut secrets, Vec::new()), Ok(0));
+        let unpaid: Vec<SellerKeptOrder> =
+            from_cbor(&secrets.get_secret(&unpaid_key(&store_key())).unwrap()).unwrap();
+        assert!(unpaid.is_empty());
+
+        // The move's destination refused: the order stays where it was.
+        let mut secrets = seller();
+        let r = record(2, OrderStatus::AwaitingPayment);
+        assert!(keep_signed(&mut secrets, &store_key(), vec![r.clone()]));
+        let id = r.order.order.id.clone();
+        on_store_statuses(&mut secrets, &store_key(), |o| {
+            (*o == id).then_some(OrderStatus::Paid)
+        });
+        secrets.refused_prefix = Some(open_key(&store_key()));
+        assert!(kept(&mut secrets, Vec::new()).is_err());
+        assert!(
+            held(&secrets, 2).is_some_and(|o| o.request == r.request),
+            "not lost with its ship-to"
+        );
+    }
+
+    /// Review round 2 of step 2 (code-first): instant checkout files only an
+    /// order its stage does not hold. One held and marked paid since, signed
+    /// again, stays as it is (it was moved to a stage `keep_signed` never
+    /// writes, and lost). Mutated red by filing it again.
+    #[test]
+    fn instant_checkout_never_refiles_an_order_it_holds() {
+        let mut secrets = seller();
+        let r = record(1, OrderStatus::AwaitingPayment);
+        assert!(keep_signed(&mut secrets, &store_key(), vec![r.clone()]));
+        let id = r.order.order.id.clone();
+        on_store_statuses(&mut secrets, &store_key(), |o| {
+            (*o == id).then_some(OrderStatus::Paid)
+        });
+        assert!(keep_signed(&mut secrets, &store_key(), vec![r]));
+        assert_eq!(held(&secrets, 1).unwrap().order.status, OrderStatus::Paid);
+    }
+
+    /// A predecessor's book is taken as it was written (its signatures are
+    /// not checked again, which a full book could not afford), held only to
+    /// this generation's bounds, and its refused names come with it.
+    /// Mutated red by dropping the names, and by checking a predecessor's
+    /// records as the tab's (the record below would fail).
+    #[test]
+    fn a_predecessors_book_is_taken_as_written_with_its_names() {
+        let mut old = seller();
+        let mut over = record(1, OrderStatus::Paid);
+        // As the predecessor kept it past the store's byte bound: no proof.
+        over.order.payment_proof = None;
+        over.paid_height = Some(100);
+        let named = signed(9, OrderStatus::Paid).order.id;
+        old.set_secret(
+            &open_key(&store_key()),
+            &to_cbor(&OpenBook {
+                orders: vec![over],
+                paid_refused: vec![named.clone()],
+            })
+            .unwrap(),
+        );
+        let mut new = seller();
+        let value = old.get_secret(&open_key(&store_key())).unwrap();
+        assert!(matches!(
+            crate::import::import_secret(&mut new, &open_key(&store_key()), &value),
+            harvest_common::delegate::SecretImport::Written
+        ));
+        let (all, refused) = whole(&new);
+        assert_eq!(all[0].order.status, OrderStatus::Paid, "kept paid");
+        assert_eq!(refused, vec![named]);
+    }
+
+    /// Review round 2 of step 2 (testing lens): the wake-up sweeps each
+    /// book in turn, not the first one every time. Mutated red by always
+    /// sweeping the first.
+    #[test]
+    fn the_sweep_takes_each_book_in_turn() {
+        let mut secrets = seller();
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        crate::store_keys::keep(&mut secrets, &other);
+        let mut ids = Vec::new();
+        for (key, signer) in [
+            (store_key(), store_signing_key()),
+            (other.verifying_key().to_bytes(), other.clone()),
+        ] {
+            let mut r = record(1, OrderStatus::AwaitingPayment);
+            r.order = authorized(&signer, order(1, 1), OrderStatus::AwaitingPayment, 1);
+            let id = r.order.order.id.clone();
+            assert!(keep_signed(&mut secrets, &key, vec![r]));
+            on_store_statuses(&mut secrets, &key, |o| {
+                (*o == id).then_some(OrderStatus::Paid)
+            });
+            ids.push(key);
+        }
+        assert!(sweep(&mut secrets));
+        assert!(sweep(&mut secrets));
+        for key in ids {
+            let unpaid: Vec<SellerKeptOrder> =
+                from_cbor(&secrets.get_secret(&unpaid_key(&key)).unwrap()).unwrap();
+            assert!(unpaid.is_empty(), "every book was swept");
+        }
+    }
+
+    /// A request is held to its bounds: each text cut to
+    /// `MAX_KEPT_REQUEST_TEXT` bytes at a character boundary, and no more
+    /// choices than a listing may have groups. Mutated red by leaving the
+    /// note, a choice or the choice count unbounded.
+    #[test]
+    fn a_request_is_held_to_its_bounds() {
+        let long = "é".repeat(MAX_KEPT_REQUEST_TEXT);
+        let r = bounded(KeptRequest {
+            shipping: long.clone(),
+            note: long.clone(),
+            region: Some(long.clone()),
+            choices: vec![long.clone(); harvest_common::listing::MAX_CHOICE_GROUPS + 3],
+            ..request("x")
+        });
+        for text in [&r.shipping, &r.note, r.region.as_ref().unwrap()]
+            .into_iter()
+            .chain(&r.choices)
+        {
+            assert!(text.len() <= MAX_KEPT_REQUEST_TEXT && text.len() > MAX_KEPT_REQUEST_TEXT - 2);
+            assert!(text.chars().all(|c| c == 'é'));
+        }
+        assert_eq!(r.choices.len(), harvest_common::listing::MAX_CHOICE_GROUPS);
+    }
+
+    /// Filing what the book already holds, where it holds it, changes
+    /// nothing and is not counted; a store notification that changes
+    /// nothing writes nothing. Mutated red by counting an unchanged record,
+    /// and by writing on every notification.
+    #[test]
+    fn nothing_changed_is_neither_counted_nor_written() {
+        let mut secrets = seller();
+        let r = record(1, OrderStatus::AwaitingPayment);
+        assert_eq!(kept(&mut secrets, vec![r.clone()]), Ok(1));
+        assert_eq!(kept(&mut secrets, vec![r.clone()]), Ok(0));
+        let writes = secrets.write_log.len();
+        on_store_statuses(&mut secrets, &store_key(), |_| {
+            Some(OrderStatus::AwaitingPayment)
+        });
+        assert_eq!(secrets.write_log.len(), writes);
+    }
+
+    /// The refused names are bounded too, the newest kept; and they come
+    /// with the first page of a listing only, however many pages there are.
+    /// Mutated red by no bound on the names, and by sending them on every
+    /// page.
+    #[test]
+    fn refused_names_are_bounded_and_listed_once() {
+        let mut book = Book::default();
+        for n in 0..MAX_SELLER_UNSENT_KEPT as u16 {
+            book.open.orders.push(SellerKeptOrder {
+                order: signed(n, OrderStatus::Paid),
+                request: Some(request(&"s".repeat(MAX_KEPT_REQUEST_TEXT))),
+                despatch: None,
+                paid_height: Some(100),
+                sent_off_store: false,
+            });
+        }
+        let over = MAX_SELLER_UNSENT_KEPT as u16 + 40;
+        for n in 0..over {
+            let paid = signed(4000 + n, OrderStatus::Paid);
+            book.file(SellerKeptOrder {
+                order: paid,
+                request: None,
+                despatch: None,
+                paid_height: Some(100),
+                sent_off_store: false,
+            });
+        }
+        assert_eq!(book.open.paid_refused.len(), MAX_SELLER_UNSENT_KEPT);
+        let newest = signed(4000 + over - 1, OrderStatus::Paid).order.id;
+        assert!(book.open.paid_refused.contains(&newest));
+        let mut secrets = seller();
+        assert!(book.save(&mut secrets, &store_key(), &Book::default()));
+        let mut pages = Vec::new();
+        let mut after = None;
+        loop {
+            match list(&secrets, 1, store_key(), after) {
+                HarvestDelegateResponse::SellerOrders {
+                    result: Ok(page), ..
+                } => {
+                    after = page.next.clone();
+                    pages.push(page);
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(pages.len() > 1, "several pages");
+        assert_eq!(pages[0].paid_refused.len(), MAX_SELLER_UNSENT_KEPT);
+        assert!(pages[1..].iter().all(|p| p.paid_refused.is_empty()));
     }
 }

@@ -261,6 +261,15 @@ pub fn BuyForm(
                             problem.set(Some("Add where to send it.".to_string()));
                             return;
                         }
+                        // The seller's book keeps each at most this many
+                        // bytes; `maxlength` counts characters, which run
+                        // to more bytes outside plain ASCII.
+                        if shipping().len() > harvest_common::delegate::MAX_KEPT_REQUEST_TEXT
+                            || note().len() > harvest_common::delegate::MAX_KEPT_REQUEST_TEXT
+                        {
+                            problem.set(Some(TOO_LONG.to_string()));
+                            return;
+                        }
                         let (Some(quantity_wanted), Some(total)) = (parsed_quantity, total) else {
                             problem.set(Some("This can\u{2019}t be bought with those choices.".to_string()));
                             return;
@@ -1656,6 +1665,10 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
         | PaymentBlocker::AnchorOffChain => Remedy::WalkAway,
     }
 }
+
+/// Said when the address or the note is longer than the seller's own copy
+/// of the order keeps.
+const TOO_LONG: &str = "That is too long for the seller to keep. Shorten the address or the note.";
 
 #[cfg(test)]
 mod tests {

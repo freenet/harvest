@@ -1903,7 +1903,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
 /// choice groups of 12 options, 12 delivery regions, every name at its
 /// longest, a certificate at the backing bound), then the description
 /// padded until one more character would not fit. A store at its listing
-/// cap holds 512 of these.
+/// cap holds `MAX_LISTINGS` (128) of these.
 fn listing_at_cap(
     base: &harvest_common::listing::Listing,
     i: usize,
@@ -2305,64 +2305,151 @@ fn book_calls(
         }
     }
     println!("  (seller's book: {pages} pages)");
-    // A wake-up's sweep of the full book, with every unpaid order marked
-    // paid by store notifications, to move on (the most it ever moves).
+    // A wake-up's sweep of the full book at its most: every unpaid order
+    // marked paid by store notifications, beside the most paid orders that
+    // wait there for room (`MAX_SELLER_UNPAID_KEPT` of each), and room in
+    // the paid stage for all of them, so the wake-up moves them all on.
+    use harvest_common::delegate::{MAX_SELLER_UNPAID_KEPT, MAX_SELLER_UNSENT_KEPT};
+    use harvest_common::payment::OrderStatus;
     let key = bs58::encode(at.verifying_key).into_string();
-    let mut marked: Vec<harvest_common::delegate::SellerKeptOrder> =
+    let stage = |name: &str| format!("harvest:seller_orders:{name}:{key}").into_bytes();
+    let mut unpaid: Vec<harvest_common::delegate::SellerKeptOrder> =
         ciborium::from_reader(inbox.as_slice()).context("the unpaid stage is not CBOR")?;
-    for record in marked.iter_mut() {
-        record.order.status = harvest_common::payment::OrderStatus::Paid;
+    for record in unpaid.iter_mut() {
+        record.order.status = OrderStatus::Paid;
     }
-    let marked_len = marked.len();
-    r.host.state.secrets.insert(
-        format!("harvest:seller_orders:unpaid:{key}").into_bytes(),
-        cbor(&marked),
-    );
-    // The paid, unsent stage with room for every one of them, so the
-    // wake-up moves them all and leaves it full (with no room, they would
-    // stay where they are, named as refused).
-    let room = harvest_common::delegate::MAX_SELLER_UNSENT_KEPT
-        .checked_sub(marked_len)
-        .ok_or_else(|| anyhow!("more unpaid orders than the paid stage holds"))?;
-    let open: Vec<_> = paid_unsent
+    let waiting: Vec<_> = paid_unsent
         .iter()
         .skip(SELLER_ORDERS_PER_CALL)
+        .take(MAX_SELLER_UNPAID_KEPT)
+        .cloned()
+        .collect();
+    unpaid.extend(waiting);
+    let moving = unpaid.len();
+    let room = MAX_SELLER_UNSENT_KEPT
+        .checked_sub(moving)
+        .ok_or_else(|| anyhow!("more paid orders waiting than the paid stage holds"))?;
+    let open: Vec<_> = paid_unsent
+        .iter()
+        .skip(SELLER_ORDERS_PER_CALL + MAX_SELLER_UNPAID_KEPT)
         .take(room)
         .cloned()
         .collect();
-    if open.len() != room {
+    if open.len() != room || moving != 2 * MAX_SELLER_UNPAID_KEPT {
         bail!(
-            "the book holds {} paid unsent orders, not {room}",
-            open.len()
+            "the book holds {} paid unsent orders and {moving} waiting, not {room} and {}",
+            open.len(),
+            2 * MAX_SELLER_UNPAID_KEPT
         );
     }
-    r.host.state.secrets.insert(
-        format!("harvest:seller_orders:open:{key}").into_bytes(),
-        cbor(&OpenBook { orders: open }),
-    );
+    r.host.state.secrets.insert(stage("unpaid"), cbor(&unpaid));
+    r.host
+        .state
+        .secrets
+        .insert(stage("open"), cbor(&OpenBook { orders: open }));
     let mut wakeup = vec![0x09, 0, 0, 0];
     wakeup.extend_from_slice(&9u64.to_le_bytes());
     wakeup.extend_from_slice(b"heartbeat");
     r.host.state.now += chrono::Duration::minutes(5);
     r.background(
-        "Background: heartbeat wake-up (a full seller's book swept, 128 paid moved on)",
+        &format!(
+            "Background: heartbeat wake-up (a full seller's book swept, {moving} paid moved on)"
+        ),
         &wakeup,
     )?;
-    let left: Vec<harvest_common::delegate::SellerKeptOrder> = r
-        .host
-        .state
-        .secrets
-        .get(format!("harvest:seller_orders:unpaid:{key}").as_bytes())
-        .map(|b| ciborium::from_reader(b.as_slice()))
-        .transpose()
-        .context("the unpaid stage is not CBOR")?
-        .unwrap_or_default();
-    if left
-        .iter()
-        .any(|o| o.order.status != harvest_common::payment::OrderStatus::AwaitingPayment)
+    let read_stage = |r: &Runner, name: &str| -> Result<Value> {
+        let bytes = r
+            .host
+            .state
+            .secrets
+            .get(&stage(name))
+            .ok_or_else(|| anyhow!("no {name} stage"))?;
+        ciborium::from_reader(bytes.as_slice()).with_context(|| format!("the {name} stage"))
+    };
+    let held_paid = |v: &Value| -> Result<usize> {
+        let Value::Array(records) = v else {
+            bail!("a stage is not a list");
+        };
+        Ok(records
+            .iter()
+            .filter(|r| {
+                field(r, &["order", "status"])
+                    .is_ok_and(|s| *s != Value::Text("AwaitingPayment".into()))
+            })
+            .count())
+    };
+    let opened = read_stage(r, "open")?;
+    let (open_len, refused_len) = (
+        list_len(&opened, &["orders"])?,
+        list_len(&opened, &["paid_refused"]).unwrap_or(0),
+    );
+    if held_paid(&read_stage(r, "unpaid")?)? != 0
+        || open_len != MAX_SELLER_UNSENT_KEPT
+        || refused_len != 0
     {
-        bail!("the wake-up left a paid order in the unpaid stage");
+        bail!(
+            "the wake-up did not move every paid order on: {open_len} in the paid stage, \
+             {refused_len} named as refused"
+        );
     }
+
+    // The same with the paid stage full: nothing moves, the most that may
+    // wait stay, and every one is named.
+    let fresh: Vec<_> = unpaid
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            record.order.order.id.0[31] ^= 0xA5;
+            record
+        })
+        .collect();
+    r.host.state.secrets.insert(stage("unpaid"), cbor(&fresh));
+    r.host.state.now += chrono::Duration::minutes(5);
+    r.background(
+        &format!("Background: heartbeat wake-up ({moving} paid orders, the paid stage full)"),
+        &wakeup,
+    )?;
+    let opened = read_stage(r, "open")?;
+    if held_paid(&read_stage(r, "unpaid")?)? != MAX_SELLER_UNPAID_KEPT
+        || list_len(&opened, &["paid_refused"])? != moving
+    {
+        bail!("a full paid stage did not keep the most that may wait, every one named");
+    }
+
+    // A re-key: a predecessor's full book imported into a successor that
+    // holds none, its sent stage then its paid one (each one call).
+    let snapshot = r.host.state.secrets.clone();
+    let exported: Vec<(&str, Vec<u8>)> = ["done", "open"]
+        .into_iter()
+        .map(|name| {
+            r.host
+                .state
+                .secrets
+                .remove(&stage(name))
+                .map(|v| (name, v))
+                .ok_or_else(|| anyhow!("no {name} stage to export"))
+        })
+        .collect::<Result<_>>()?;
+    r.host.state.secrets.remove(&stage("unpaid"));
+    for (name, value) in exported {
+        let answer = r.app(
+            &format!("ImportMigratedSecret (a predecessor's full {name} stage of a seller's book)"),
+            cbor(&HarvestDelegateRequest::ImportMigratedSecret {
+                predecessor: [0x29; 32],
+                key: stage(name),
+                value: harvest_common::delegate::MigratedSecretValue(value),
+            }),
+            "MigratedSecretImported",
+        )?;
+        let outcome = field(&answer, &["MigratedSecretImported", "outcome"])?;
+        if *outcome != Value::Text("Written".into()) {
+            bail!(
+                "the {name} stage's import answered {}, not Written",
+                brief(outcome)
+            );
+        }
+    }
+    r.host.state.secrets = snapshot;
     Ok(())
 }
 

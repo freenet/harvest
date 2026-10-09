@@ -643,10 +643,10 @@ mod boundary_tests {
             // The buyer's half. `ListBuyerConversations` answers the keys
             // that read this node's own side of a public mailbox;
             // `ForgetBuyerConversation` destroys a capability that exists
-            // nowhere else; `ExportBuyerConversations` answers the secrets
-            // themselves; and `MarkConversationsBackedUp` silences the
-            // warning that one of them exists in a single place, which is the
-            // one that reads as harmless and is not.
+            // nowhere else; `ExportPurchasesBackup` answers the secrets
+            // themselves; and `MarkBackedUp` silences the warning that one of
+            // them exists in a single place, which is the one that reads as
+            // harmless and is not.
             to_cbor(&HarvestDelegateRequest::StoreBuyerConversation {
                 request_id: 1,
                 store_contract_id: vec![3u8; 32],
@@ -667,10 +667,9 @@ mod boundary_tests {
                 buyer_public_key: [7u8; 32],
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::ExportBuyerConversation {
+            to_cbor(&HarvestDelegateRequest::ExportPurchasesBackup {
                 request_id: 1,
-                store_contract_id: vec![3u8; 32],
-                buyer_public_key: [7u8; 32],
+                after: None,
             })
             .expect("cbor"),
             to_cbor(&HarvestDelegateRequest::ImportBuyerConversation {
@@ -678,10 +677,10 @@ mod boundary_tests {
                 backup: harvest_common::BackupString("harvest-conv-backup-v2:whatever".into()),
             })
             .expect("cbor"),
-            to_cbor(&HarvestDelegateRequest::MarkConversationBackedUp {
+            to_cbor(&HarvestDelegateRequest::MarkBackedUp {
                 request_id: 1,
-                store_contract_id: vec![3u8; 32],
-                buyer_public_key: [7u8; 32],
+                conversations: vec![([3u8; 32], [7u8; 32])],
+                orders: Vec::new(),
             })
             .expect("cbor"),
             // The buyer's kept purchases (harvest#53 Phase C).

@@ -120,6 +120,11 @@ fn check(record: &KeptPurchase) -> Result<Vec<u8>, String> {
             .verify(&store_key)
             .map_err(|e| format!("the complaint does not verify: {e}"))?;
     }
+    // A despatch kept beside the order is the store key's and about it:
+    // a record from a restored file is checked as a fresh keep is.
+    if let Some(despatch) = &record.despatch {
+        despatch_checks(&record.store_key, &order.order.id, despatch)?;
+    }
     let bytes = to_cbor(record).map_err(|e| format!("could not encode the purchase: {e}"))?;
     if bytes.len() > MAX_KEPT_PURCHASE_BYTES {
         // Unreachable for anything that passed the checks above: the bound
@@ -1094,7 +1099,30 @@ mod tests {
             import(&mut successor, &key, &secrets.get_secret(&key).unwrap()),
             SecretImport::Written
         ));
-        assert_eq!(purchases(list(&successor))[0].despatch, Some(sent));
+        assert_eq!(purchases(list(&successor))[0].despatch, Some(sent.clone()));
+
+        // Review round 2 of step 2 (codex, skeptical): restored onto a node
+        // that holds nothing, a despatch is checked as a fresh keep's is: one
+        // the store key did not sign, or about another order, is refused, so
+        // it cannot stand in for the store's genuine one. Mutated red by not
+        // checking a record's despatch in `check`.
+        let mut forged = purchases(list(&successor)).remove(0);
+        forged.despatch = Some(harvest_common::fulfilment::AuthorizedDespatch {
+            signature: vec![0u8; 64],
+            ..sent.clone()
+        });
+        let mut empty = MemSecrets::default();
+        assert!(matches!(
+            import(&mut empty, &key, &to_cbor(&forged).unwrap()),
+            SecretImport::Permanent(_)
+        ));
+        let mut misfiled = forged;
+        misfiled.despatch = Some(despatch(&to_keep(2, 1, OrderStatus::Paid, 1).order, 120));
+        assert!(matches!(
+            import(&mut empty, &key, &to_cbor(&misfiled).unwrap()),
+            SecretImport::Permanent(_)
+        ));
+        assert!(empty.is_empty());
     }
 
     /// No complaint is kept about an unpaid order.

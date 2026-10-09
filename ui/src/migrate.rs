@@ -865,15 +865,14 @@ pub(crate) fn merge_store_reporting_discard(
     let snapshot = base.clone();
     let mut outcome =
         fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
-    // The scaffold's merge skips `ListingsV1::apply_delta` when the other side
-    // brings nothing new, so a base written under the old, permissive `verify`
-    // would be carried forward unsorted, and the current contract refuses that
-    // (harvest#26).
-    outcome.state.listings.normalize();
-    // And a `Paid` on padded evidence, which an earlier generation kept, is
-    // kept as its unpaid terms (step 2): carried as it was, the current
-    // contract would refuse the forward PUT.
-    outcome.state.orders.normalize();
+    // The scaffold's merge skips a part's `apply_delta` when the other side
+    // brings nothing new for it, so a base written under an older `verify`
+    // would be carried forward as it was, and the current contract refuses
+    // that: listings unsorted (harvest#26), more listings or orders than
+    // step 2's caps, or a `Paid` on padded evidence (kept as its unpaid
+    // terms since step 2). The predecessor is the BASE when the driver
+    // folds a recovered state into a local one (`merge_with_local`).
+    outcome.state.normalize_carried();
     // Nor does it touch a version-0 info, and a predecessor written before the
     // PR #82 re-review can hold unsigned content there: anything was accepted
     // at version 0. Carried forward, it would make the new contract refuse

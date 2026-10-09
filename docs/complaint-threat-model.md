@@ -735,7 +735,7 @@ same renewal, through the last block a complaint could count at. The seller's UI
   decoded, re-encoded and verified by `Complaint::verify` in every build, pins it
   (`a_complaint_from_the_first_build_still_verifies`).
 - **The encoding may change only where the old one still decodes, and never inside what is
-  signed.** Step 2 (harvest#227) writes every signed record's outer signed payload and
+  signed.** Step 2 (harvest#230) writes every signed record's outer signed payload and
   signature (the order's among them) as CBOR byte strings rather than integer arrays. The bytes
   signed are unchanged, and the earlier form still decodes (`serde_bytes` reads both). The
   frozen fixture now pins exactly that: it decodes and verifies, and it equals today's encoding

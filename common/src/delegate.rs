@@ -164,48 +164,15 @@ pub enum HarvestDelegateRequest {
         buyer_public_key: [u8; 32],
     },
 
-    /// Hand back this store's conversation secrets in a form the buyer can
-    /// save, and paste into another node.
+    /// Take one saved per-conversation backup string
+    /// (`harvest-conv-backup-v2:`) and make its conversation readable here.
     ///
-    /// # What this answers is a capability, not a copy
-    ///
-    /// The string contains the X25519 secrets themselves. Anyone holding it
-    /// can read that conversation, and -- once a seller's reply carries a
-    /// pre-signed statement -- can file the complaint it authorizes. It is
-    /// the buyer's recourse in a form they can lose, which is exactly what
-    /// makes it worth having and exactly why the UI says so beside the
-    /// button rather than in a tooltip.
-    ///
-    /// # Why one conversation and not one store
-    ///
-    /// This was per STORE until 2026-09-05, on the argument that a buyer
-    /// normally has one conversation with a store anyway, so the two differ
-    /// mainly in how many actions a complete backup takes -- and that a
-    /// backup silently omitting a conversation is the expensive failure. That
-    /// argument was right about the failure and wrong about when it happens:
-    /// it optimises for completeness AT EXPORT TIME, and what bites is
-    /// completeness OVER TIME. A store-wide string taken on Monday is
-    /// silently incomplete on Tuesday, and nothing about the artefact says
-    /// which conversations existed when it was taken.
-    ///
-    /// The marker settles it. A `backed_up` flag set from a store-wide export
-    /// would falsely cover a conversation created after that export -- the
-    /// "cannot silence a warning about a key it has no backup of" property,
-    /// defeated through granularity rather than through permission. Per
-    /// conversation it means something checkable: THIS secret exists in more
-    /// than one place.
-    ExportBuyerConversation {
-        request_id: RequestId,
-        store_contract_id: Vec<u8>,
-        /// Which conversation, by routing tag.
-        buyer_public_key: [u8; 32],
-    },
-
-    /// Take one saved backup string and make its conversation readable here.
-    ///
-    /// One string per call; a buyer restoring a machine pastes several in a
-    /// row. Nothing here is stateful between calls, so the order does not
-    /// matter and a failure part-way leaves what already landed.
+    /// The app no longer makes these strings: the one backup file
+    /// ([`Self::ExportPurchasesBackup`]) replaced them. A string saved before
+    /// that still restores, and this is how: the Backup page hands a pasted
+    /// one here. One string per call. Nothing here is stateful between calls,
+    /// so the order does not matter and a failure part-way leaves what
+    /// already landed.
     ///
     /// The store id is inside the string, so this needs nothing else -- a
     /// buyer on a new node has the string and nothing to relate it to.
@@ -213,37 +180,6 @@ pub enum HarvestDelegateRequest {
         request_id: RequestId,
         /// The pasted string. Prints as `BackupString(redacted)`.
         backup: BackupString,
-    },
-
-    /// Record that the buyer holds a copy of THIS conversation outside this
-    /// node.
-    ///
-    /// # Why the MARKER needs the origin gate, and not only the export
-    ///
-    /// The export's reason is obvious: it answers secrets. The marker's is
-    /// the one that looks harmless and is not. It **silences a warning** --
-    /// "this conversation exists only on this device" -- and the party that
-    /// benefits from the silence is not the party that bears the loss. An app
-    /// that could set this without the user holding a backup would make the
-    /// warning stop for a conversation about to be lost with the machine,
-    /// which is worse than never having warned: the buyer stops looking.
-    ///
-    /// So it is behind `origin::authorize` deliberately, for its own reason,
-    /// and not merely because it sits beside the export. This mirrors the
-    /// ghostkey vault, where `MarkBackedUp` is gated on the `Export` scope
-    /// that only the vault is ever granted, for the same stated reason
-    /// (`ghostkey-delegate/src/handlers.rs::handle_mark_backed_up`).
-    ///
-    /// Set only when the user says they have saved it -- exporting is not
-    /// saving.
-    MarkConversationBackedUp {
-        request_id: RequestId,
-        store_contract_id: Vec<u8>,
-        /// Which conversation, by routing tag. One, matching the export: a
-        /// request that marked a SET would let one saved string clear the
-        /// warning on a conversation it does not contain, which is the
-        /// granularity form of the defect the gate exists to prevent.
-        buyer_public_key: [u8; 32],
     },
 
     /// Record that THIS browser sent the mailbox entry with `digest`
@@ -349,11 +285,15 @@ pub enum HarvestDelegateRequest {
     /// Keep these orders in the seller's own book for the store
     /// `store_key` (step 2; see [`SellerKeptOrder`]): at most
     /// [`SELLER_ORDERS_PER_CALL`] a call, each checked as the store would
-    /// keep it (it verifies against `store_key`, a `Paid` carries the
-    /// minimal proof or is kept unpaid, a despatch is the store key's). Only
-    /// for a store whose key this node holds. Merged with what is held:
-    /// nothing held is lost. A paid order not yet sent past
-    /// [`MAX_SELLER_UNSENT_KEPT`] is not kept and is named in the book's
+    /// keep it (it verifies against `store_key`, a despatch is the store
+    /// key's, and a `Paid` carries the minimal proof or is kept unpaid; one
+    /// on the minimal proof past `store::MAX_PAID_ORDER_BYTES` is kept paid
+    /// without it, and one without a proof is kept paid only with the store
+    /// key's despatch, or where the book already holds it paid). Only for a
+    /// store whose key this node holds. Merged with what is held: nothing
+    /// held is lost. A paid order not yet sent past
+    /// [`MAX_SELLER_UNSENT_KEPT`] waits, unpaid stage, marked paid (up to
+    /// [`MAX_SELLER_UNPAID_KEPT`] so), and is named in the book's
     /// `paid_refused`. Answered with
     /// [`HarvestDelegateResponse::SellerOrdersKept`].
     KeepSellerOrders {
@@ -1272,36 +1212,10 @@ pub enum HarvestDelegateResponse {
         conversations: Vec<RecalledConversation>,
     },
 
-    /// One conversation, as a string the buyer can save.
-    ///
-    /// `Ok` carries the backup itself. It holds a secret: see
-    /// [`HarvestDelegateRequest::ExportBuyerConversation`]. That is why it is
-    /// a [`BackupString`], which does not print itself.
-    BuyerConversationExported {
-        request_id: RequestId,
-        store_contract_id: Vec<u8>,
-        buyer_public_key: [u8; 32],
-        result: Result<BackupString, String>,
-    },
-
     /// What a pasted backup did.
     BuyerConversationImported {
         request_id: RequestId,
         result: Result<ImportedConversation, String>,
-    },
-
-    /// Whether this conversation is now marked as held outside this node.
-    ///
-    /// `Ok(true)` means it is marked; `Ok(false)` means this node does not
-    /// hold that conversation, which is not an error and creates nothing. A
-    /// write the node REFUSED is an `Err`, because "not marked" and "could
-    /// not mark" are different situations and a boolean cannot tell them
-    /// apart.
-    BuyerConversationMarkedBackedUp {
-        request_id: RequestId,
-        store_contract_id: Vec<u8>,
-        buyer_public_key: [u8; 32],
-        result: Result<bool, String>,
     },
 
     /// The answer to [`HarvestDelegateRequest::NoteBuyerSent`] and
@@ -1667,9 +1581,9 @@ pub struct RecalledConversation {
     ///
     /// `false` means the secret exists in exactly one place, and losing the
     /// machine loses the conversation -- and, after Phase 2, the buyer's only
-    /// recourse against the seller they paid. The UI warns on this; nothing
-    /// but the user saying so can clear it. See
-    /// [`HarvestDelegateRequest::MarkConversationBackedUp`].
+    /// recourse against the seller they paid. The UI warns on this; only a
+    /// backup file the app has written sets it. See
+    /// [`HarvestDelegateRequest::MarkBackedUp`].
     pub backed_up: bool,
     /// The entries this buyer's browsers sent in this conversation
     /// ([`HarvestDelegateRequest::NoteBuyerSent`]), oldest first, at most
@@ -1805,8 +1719,8 @@ impl core::fmt::Debug for ConversationSecret {
     }
 }
 
-/// A conversation backup string: what `ExportBuyerConversation` answers and
-/// `ImportBuyerConversation` takes.
+/// A per-conversation backup string: what `ImportBuyerConversation` takes.
+/// The app no longer makes them, but one saved earlier still restores.
 ///
 /// It contains the conversation's X25519 secret, so it is worth exactly as
 /// much as [`ConversationSecret`] and gets the same treatment: `Debug` prints
@@ -1859,14 +1773,37 @@ pub enum SecretImport {
 ///
 /// Every secret this delegate holds can pass through here, private keys
 /// included, so `Debug` prints `MigratedSecretValue(redacted)` (harvest#94).
-/// `#[serde(transparent)]`: on the wire it is exactly the bytes.
+/// `#[serde(transparent)]`: on the wire it is exactly the bytes, as one CBOR
+/// byte string (step 2). It was an array of integers, one item a byte, and a
+/// seller's book stage (several MiB) could not be decoded from that within
+/// one call's budget; the integer form still decodes.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct MigratedSecretValue(pub Vec<u8>);
+pub struct MigratedSecretValue(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
 impl core::fmt::Debug for MigratedSecretValue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MigratedSecretValue(redacted)")
+    }
+}
+
+#[cfg(test)]
+mod migrated_value_tests {
+    use super::MigratedSecretValue;
+
+    /// Written as one byte string (step 2), and the integer array an earlier
+    /// UI wrote still reads. Red with the value written as an array.
+    #[test]
+    fn a_migrated_value_is_a_byte_string_and_the_array_still_reads() {
+        let value = MigratedSecretValue(vec![1, 2, 3]);
+        let wire = crate::to_cbor(&value).unwrap();
+        assert_eq!(wire, vec![0x43, 1, 2, 3], "one CBOR byte string");
+        let array = crate::to_cbor(&vec![1u8, 2, 3]).unwrap();
+        assert_ne!(array, wire);
+        assert_eq!(
+            crate::from_cbor::<MigratedSecretValue>(&array).unwrap(),
+            value
+        );
     }
 }
 
@@ -2115,10 +2052,10 @@ mod tests {
             R::BuyerConversationStored { .. } => (2, false),
             // Both direction keys of every recalled conversation.
             R::BuyerConversationList { .. } => (3, true),
-            // The backup string, which contains the X25519 secret.
-            R::BuyerConversationExported { .. } => (4, true),
+            R::SellerOrdersKept { .. } => (4, false),
             R::BuyerConversationImported { .. } => (5, false),
-            R::BuyerConversationMarkedBackedUp { .. } => (6, false),
+            // Buyers' ship-to addresses and notes.
+            R::SellerOrders { .. } => (6, true),
             R::BuyerConversationForgotten { .. } => (7, false),
             // Both direction keys for every buyer asked about.
             R::ConversationKeys { .. } => (8, true),
@@ -2163,12 +2100,9 @@ mod tests {
             R::PurchasesBackup { .. } => (36, true),
             R::PurchasesBackupImported { .. } => (37, false),
             R::BackedUpMarked { .. } => (38, false),
-            R::SellerOrdersKept { .. } => (39, false),
-            // Buyers' ship-to addresses and notes.
-            R::SellerOrders { .. } => (40, true),
         }
     }
-    const RESPONSE_VARIANTS: usize = 41;
+    const RESPONSE_VARIANTS: usize = 39;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -2181,10 +2115,11 @@ mod tests {
             Q::StoreBuyerConversation { .. } => (3, true),
             Q::ListBuyerConversations { .. } => (4, false),
             Q::ForgetBuyerConversation { .. } => (5, false),
-            Q::ExportBuyerConversation { .. } => (6, false),
+            // Buyers' ship-to addresses and notes.
+            Q::KeepSellerOrders { .. } => (6, true),
             // The pasted backup string.
             Q::ImportBuyerConversation { .. } => (7, true),
-            Q::MarkConversationBackedUp { .. } => (8, false),
+            Q::ListSellerOrders { .. } => (8, false),
             Q::CreateListing { .. } => (9, false),
             Q::RegisterStore { .. } => (10, false),
             Q::ListStores { .. } => (11, false),
@@ -2222,12 +2157,9 @@ mod tests {
             // Conversation secrets and receipt seeds, restored.
             Q::ImportPurchasesBackup { .. } => (37, true),
             Q::MarkBackedUp { .. } => (38, false),
-            // Buyers' ship-to addresses and notes.
-            Q::KeepSellerOrders { .. } => (39, true),
-            Q::ListSellerOrders { .. } => (40, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 41;
+    const REQUEST_VARIANTS: usize = 39;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -2276,24 +2208,12 @@ mod tests {
                 store_contract_id: store(),
                 conversations: vec![recalled()],
             },
-            R::BuyerConversationExported {
-                request_id: 42,
-                store_contract_id: store(),
-                buyer_public_key: [1u8; 32],
-                result: Ok(BackupString(SECRET_TEXT.to_string())),
-            },
             R::BuyerConversationImported {
                 request_id: 42,
                 result: Ok(ImportedConversation::Imported {
                     store_contract_id: store(),
                     buyer_public_key: [1u8; 32],
                 }),
-            },
-            R::BuyerConversationMarkedBackedUp {
-                request_id: 42,
-                store_contract_id: store(),
-                buyer_public_key: [1u8; 32],
-                result: Ok(true),
             },
             R::BuyerConversationForgotten {
                 request_id: 42,
@@ -2614,19 +2534,9 @@ mod tests {
                 store_contract_id: store(),
                 buyer_public_key: [1u8; 32],
             },
-            Q::ExportBuyerConversation {
-                request_id: 42,
-                store_contract_id: store(),
-                buyer_public_key: [1u8; 32],
-            },
             Q::ImportBuyerConversation {
                 request_id: 42,
                 backup: BackupString(SECRET_TEXT.to_string()),
-            },
-            Q::MarkConversationBackedUp {
-                request_id: 42,
-                store_contract_id: store(),
-                buyer_public_key: [1u8; 32],
             },
             Q::CreateListing {
                 request_id: 42,

@@ -628,33 +628,42 @@ registry entry). See `docs/untested-invariants.md`.
 
 ### The new surface: a backup is a portable capability
 
-A buyer can now export their conversations with a store as a single string and
-paste it into Harvest on another machine. That string holds the X25519 secrets
-themselves, which is what makes it work — and what makes it worth exactly as
-much as the conversations it restores. **Anyone holding it can read them, and
-once a seller's reply carries a pre-signed statement, can file the complaint
-that statement authorizes, as though they were the buyer.**
+A buyer carries their conversations to Harvest on another machine with one
+backup file. The Backup page makes it (`harvest-backup-v3`, saved as
+`harvest-purchases-<date>.txt`). It holds every conversation secret and every
+kept purchase on this device and, for a seller, the store's book with the
+ship-to addresses of orders not yet sent. The secrets are what make it work,
+and what make it worth exactly as much as what it restores. **Anyone holding
+it can read those conversations, and once a seller's reply carries a
+pre-signed statement, can file the complaint that statement authorizes, as
+though they were the buyer.** A seller's file also gives whoever holds it the
+delivery addresses of the buyers still waiting for their orders.
+
+The file is not encrypted. An optional passphrase is tracked on harvest#134,
+before mainnet; the format is versioned so an encrypted variant can be added.
 
 It is not a password. There is nothing to rotate: the secret IS the
-conversation, so a leaked backup cannot be revoked, only forgotten — and
-forgetting it makes the conversation unreadable to the buyer too.
+conversation, so a leaked backup cannot be revoked, only forgotten. Forgetting
+it makes the conversation unreadable to the buyer too.
 
 Three things follow, and all three are on screen rather than in a doc:
 
-* the string is shown only when asked for, and hidden again on request;
-* what holding it means is stated beside it, before the buyer copies it,
-  because that is the basis on which a person decides where to put it;
-* a conversation with no copy anywhere else is **warned about**, and only the
-  buyer saying they have saved it clears the warning. Exporting is not saving.
+* the Backup page says, beside the button that saves the file, to keep it
+  private like a password, and why;
+* for a seller, it says how many delivery addresses of orders not yet sent the
+  file holds;
+* a conversation or purchase with no copy anywhere else is **warned about**,
+  and only a saved file clears the warning. Making the file is not saving it:
+  only after the click that saves it are the items it holds marked as backed
+  up, and only those items.
 
-The warning's marker is gated to the Harvest web app for its own reason,
-separate from the export's: silencing a warning costs the silencer nothing and
-costs the buyer everything. See `buyer-conversation-persistence.md`.
+The marker is gated to the Harvest web app for its own reason, separate from
+the export's: silencing a warning costs the silencer nothing and costs the
+buyer everything. See `buyer-conversation-persistence.md`.
 
-**The export is per conversation**, so one string covers exactly one thread
-with one seller -- the smallest blast radius available, and the granularity at
-which the "saved elsewhere" marker means something checkable rather than
-"some snapshot was taken at some point".
+Before the one file, the export was one string per conversation
+(`harvest-conv-backup-v2:`). The app no longer makes them, but a string saved
+then still restores when pasted on the Backup page.
 
 ### The remaining limit: a different device is a different node
 
