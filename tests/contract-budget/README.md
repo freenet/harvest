@@ -145,11 +145,12 @@ caps. The module docs in `src/cases/` say what is at which cap and why.
     ordering the contract applies then falls through to the entry digest,
     which a build that hashes per comparison recomputes on every
     comparison.
-* **Store** (`cases/store.rs`): 4096 paid orders (`MAX_ORDERS`), each with a
+* **Store** (`cases/store.rs`): `MAX_ORDERS` paid orders (500; 4096 until step 2's
+  round 2), each with a
   genuine one-claim SPV payment proof and one despatch; 64 backing slots
   (`MAX_BACKINGS`) at the 4096-byte certificate cap, 32 retired and 32 with
-  `MAX_SCOPES_PER_BACKER` copies; the closure; the pause; 512 listings
-  (`MAX_LISTINGS`) each at `MAX_LISTING_BYTES` (32 KiB) with every field at
+  `MAX_SCOPES_PER_BACKER` copies; the closure; the pause; `MAX_LISTINGS`
+  listings (128; 512 until step 2's round 2) each at `MAX_LISTING_BYTES` (32 KiB) with every field at
   its largest (8 photos, full choices and regions) and the description
   padded to the bound. Every state stays under the node's 50 MiB
   `MAX_STATE_SIZE`. Delta: one new listing, the newest, as the UI sends it.
@@ -297,7 +298,7 @@ budget is about 0.45 s of work.
 
 ## Results on main
 
-One run on the contracts committed at main `b84af10` (mailbox `64fd7bfe…`,
+One run (at the former store caps, 4096 orders) on the contracts committed at main `b84af10` (mailbox `64fd7bfe…`,
 store `8e95714f…`, index `44bcc983…`, reputation `eab59c4e…`). Two runs gave
 byte-identical output. Exit 1.
 
@@ -348,7 +349,7 @@ What these say:
   integer arrays (the 3.3 MiB of ciphertext is a 6.7 MB state), and
   `dedupe_identical_entries` sorting with `sort_by_key(entry_digest)`, which
   re-hashes every message on each comparison.
-* **The store** at its caps is a state of about 41 MB, 34 MB of it the 4096
+* **The store** at its caps (4096 orders when measured; 500 since step 2's round 2) is a state of about 41 MB, 34 MB of it the 4096
   paid orders, whose byte fields are CBOR integer arrays too. Every call is
   10 to 36 times over, and the full-state merge runs out of the node's 256
   MiB of WASM memory inside `StoreStateV1::apply_delta` (cloning the
@@ -367,12 +368,15 @@ What these say:
 
 ## The store at step 2's caps
 
-Step 2 (`feat/store-pause-one-backup`) caps a store's listings (512, each at
-most 32 KiB as encoded), writes every signed record's signed payload and
+Step 2 (`feat/store-pause-one-backup`) caps a store's listings (first 512, and
+128 since round 2 of step 2, each at most 32 KiB as encoded), writes every signed record's signed payload and
 signature as a CBOR byte string, verifies each payment proof's signed tip once
 per distinct tip, and has `is_canonical_cbor` compare without copying the
-state. The store fixture follows: 512 listings at the per-listing bound, every
-field at its largest, and the pause. One run, store case only (report-only):
+state. The store fixture follows: the capped number of listings at the per-listing
+bound, every field at its largest, and the pause. One run, store case only
+(report-only). **The table below was measured at the former caps (4096 paid
+orders, 512 listings); round 2 lowered them to 500 and 128, and the figures
+are refreshed in that round:**
 
 | case | call | fuel | of budget |
 |---|---|---:|---:|

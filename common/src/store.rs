@@ -952,7 +952,8 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
             if record.status == crate::payment::OrderStatus::Paid && !paid_minimally(record) {
                 return Err(format!(
-                    "order {id} is Paid on evidence that is not the minimal proof"
+                    "order {id} is Paid on evidence that is not the minimal proof, or past \
+                     {MAX_PAID_ORDER_BYTES} bytes"
                 ));
             }
         }
@@ -1065,10 +1066,28 @@ impl OrdersV1 {
     }
 }
 
+/// The most bytes a `Paid` record may take, as it encodes, for the store to
+/// keep it as paid (step 2): see [`as_kept`].
+///
+/// A minimal proof carries only the claims a payment needs, but each claim
+/// carries its whole transaction, so a minimal proof is still as large as
+/// the transactions behind it: 32 needed outpoints of 64 KB transactions
+/// each come to the 256 KiB `MAX_PROOF_CLAIM_BYTES` allows, and on signet
+/// such transactions cost nothing. Sized by measurement (step 2's wall-time
+/// and contract-budget runs) as the largest power of two from 16 to 64 KiB
+/// at which a store of `MAX_ORDERS` paid orders at this bound and
+/// `MAX_LISTINGS` listings at theirs stays well under the node's 50 MiB and
+/// within its time limit. Before mainnet (harvest#134): an exchange's
+/// batched withdrawal straight to an order's address is a legitimate payment
+/// whose transaction can pass it; the store then keeps the order unpaid and
+/// the seller's and buyer's own copies hold it as paid.
+pub const MAX_PAID_ORDER_BYTES: usize = 64 * 1024;
+
 /// A record as the store keeps it (step 2): a `Paid` record whose payment
 /// proof is not the canonical minimal one
 /// ([`crate::payment::verify_minimal_proof`], the proof a complaint must
-/// carry) is kept as its unpaid terms, the seller-signed order anyone could
+/// carry), or that takes more than [`MAX_PAID_ORDER_BYTES`] as it encodes,
+/// is kept as its unpaid terms, the seller-signed order anyone could
 /// publish; every other record as it is.
 ///
 /// # Why
@@ -1076,7 +1095,8 @@ impl OrdersV1 {
 /// Whoever publishes `Paid` first chooses its evidence, and the verifier
 /// accepts any valid claims up to `MAX_PROOF_CLAIM_BYTES` (256 KiB): about
 /// 200 padded orders would fill a store to freenet-core's 50 MiB state limit.
-/// A minimal proof carries only the claims the payment needs.
+/// A minimal proof carries only the claims the payment needs, and the byte
+/// bound caps what those claims' transactions may add.
 ///
 /// # Why kept as unpaid rather than refused
 ///
@@ -1102,12 +1122,19 @@ pub fn as_kept(record: AuthorizedOrder) -> AuthorizedOrder {
     }
 }
 
-/// Whether a `Paid` record carries the canonical minimal proof.
+/// Whether a `Paid` record is one the store keeps as paid: the canonical
+/// minimal proof, within [`MAX_PAID_ORDER_BYTES`].
 fn paid_minimally(record: &AuthorizedOrder) -> bool {
-    record
-        .payment_proof
-        .as_ref()
-        .is_some_and(|proof| crate::payment::verify_minimal_proof(&record.order, proof).is_ok())
+    paid_within_cap(record)
+        && record
+            .payment_proof
+            .as_ref()
+            .is_some_and(|proof| crate::payment::verify_minimal_proof(&record.order, proof).is_ok())
+}
+
+/// Whether a record takes at most [`MAX_PAID_ORDER_BYTES`] as it encodes.
+pub fn paid_within_cap(record: &AuthorizedOrder) -> bool {
+    crate::to_cbor(record).is_ok_and(|bytes| bytes.len() <= MAX_PAID_ORDER_BYTES)
 }
 
 /// The key a store's records are verified against: its owner.
@@ -2045,6 +2072,131 @@ mod order_tests {
         let tip = SignedTipEntry::sign(bridge, &tip_body).unwrap();
 
         OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// [`make_payment_proof`] whose transaction also pays filler outputs
+    /// until it is at least `bytes` long: still the minimal proof (one
+    /// claim, the one needed), and as large as a big honest transaction
+    /// makes it.
+    fn make_big_payment_proof(
+        order: &Order,
+        bridge: &SigningKey,
+        bytes: usize,
+    ) -> OrderPaymentProof {
+        use freenet_bitcoin_common::spv::testing::{build_tx, mine, EASIEST_BITS};
+        use freenet_bitcoin_common::spv::SpvProof;
+        use freenet_bitcoin_common::Txid;
+        let mut outputs = vec![(order.amount_sats, order.payment_script_pubkey.clone())];
+        // Up to `bytes`, but never past the 64 KiB a bridge's evidence
+        // allows one transaction.
+        // Fewer than 0xfd outputs: `build_tx` writes the count as one byte.
+        while outputs.len() < 0xfc && build_tx(&outputs).len() < bytes {
+            let mut next = outputs.clone();
+            next.push((546, vec![0x6a; 250]));
+            if build_tx(&next).len() > 64 * 1024 {
+                break;
+            }
+            outputs = next;
+        }
+        let raw_tx = build_tx(&outputs);
+        let txid = Txid(sha2_d(&raw_tx));
+        let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+        let block_hash = BlockHash(sha2_d(&header.0));
+        let anchor = BlockAnchor {
+            height: 100,
+            hash: block_hash,
+        };
+        let claim = SignedClaim::sign(
+            bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch: Vec::new(),
+                        tx_index: 0,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let tip = SignedTipEntry::sign(
+            bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height: 100 + order.required_confirmations - 1,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// Bitcoin's double SHA-256.
+    fn sha2_d(bytes: &[u8]) -> [u8; 32] {
+        freenet_bitcoin_common::spv::testing::sha256d_pub(bytes)
+    }
+
+    /// Step 2: a `Paid` record on the minimal proof but past
+    /// `MAX_PAID_ORDER_BYTES` is kept as its unpaid terms, and a state
+    /// holding one does not verify; one just under it is kept paid. Mutated
+    /// red by dropping the byte bound.
+    #[test]
+    fn a_paid_record_past_the_byte_bound_is_kept_unpaid() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = make_order("big", 1_700_000_000, &[0x00, 0x14, 0xbb, 0xbb]);
+        let big = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(make_big_payment_proof(
+                &order,
+                &bridge,
+                MAX_PAID_ORDER_BYTES,
+            )),
+        );
+        let small = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(make_big_payment_proof(
+                &order,
+                &bridge,
+                // A claim's transaction encodes at about four bytes a byte
+                // in the record: an integer array inside the bridge's
+                // signed body, itself an integer array (freenet-bitcoin's
+                // encoding).
+                MAX_PAID_ORDER_BYTES / 8,
+            )),
+        );
+        let proof = big.payment_proof.as_ref().unwrap();
+        crate::payment::verify_minimal_proof(&order, proof).expect("still the minimal proof");
+        crate::payment::verify_payment_proof(&order, proof).expect("a genuine proof");
+        assert!(crate::to_cbor(&big).unwrap().len() > MAX_PAID_ORDER_BYTES);
+        assert!(crate::to_cbor(&small).unwrap().len() <= MAX_PAID_ORDER_BYTES);
+        assert_eq!(as_kept(big.clone()).status, OrderStatus::AwaitingPayment);
+        assert_eq!(as_kept(small.clone()), small);
+        assert!(orders_of([(order.id.clone(), big)])
+            .verify(&parent(), &p)
+            .is_err());
+        assert!(orders_of([(order.id.clone(), small)])
+            .verify(&parent(), &p)
+            .is_ok());
     }
 
     /// A valid, bridge-signed `ScannedTo` claim for this order's script.
@@ -4078,6 +4230,17 @@ mod order_tests {
                 order.clone(),
                 OrderStatus::Paid,
                 Some(padded_more),
+            ));
+            // Minimal, but past the byte bound.
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(make_big_payment_proof(
+                    &order,
+                    &bridge,
+                    MAX_PAID_ORDER_BYTES,
+                )),
             ));
         }
         let merge = |a: &OrdersV1, b: &OrdersV1| {

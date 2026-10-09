@@ -8,6 +8,20 @@ section below was added after the rest, at Ian's direction, and is the reason
 the "Cross-device recovery" section is now a correction rather than a
 limitation.
 
+**Current state of the backup (step 2, 2026-10).** The per-conversation
+export and its "Show my backup" / "I have saved this" panel under each
+thread are gone. There is one backup for everything a buyer holds: the
+Backup page (P9) makes a single file (`harvest-backup-v3`) of every purchase
+and conversation as it opens, the buyer's click saves it (download or copy),
+and only then is what the file holds marked as backed up, each purchase by
+order id and the digest of the copy the file holds. An order's page offers
+the backup outright once the order is paid, until a saved backup holds it.
+Restoring is from the same page, from a chosen file or pasted text, and an
+old one-conversation string (`harvest-conv-backup-v2:`, described below)
+still restores when pasted there. The sections below describe the
+per-conversation design as it was built and decided; where they say "export"
+or "show my backup" for one conversation, read the Backup page.
+
 ## The problem, stated at its cost
 
 A buyer's conversation keys lived in the browser tab and nowhere else. Close
@@ -511,7 +525,7 @@ On the UI side:
   storefront deliberately does not, since a subscription advertises a standing
   interest; a non-empty recall is exactly the evidence that this node has
   already written to that seller, so it tells the network nothing new.
-* The backup panel sits under the thread: the warning for conversations that
+* (Replaced in step 2 by the Backup page; see the note at the top.) The backup panel sits under the thread: the warning for conversations that
   exist in one place only, "Show my backup" and "I have saved this", and a
   paste box that is offered **even on a device holding nothing**, since
   restoring onto a new machine is the case the whole thing exists for and
@@ -551,8 +565,9 @@ Two things make this the right home rather than a workaround:
   reach**. It is the buyer's own secret store; nothing the seller can submit to
   a public contract touches it. That is the property the mailbox cannot offer
   for an open-write contract with a cap.
-* The buyer already carries it across machines. Per-conversation export
-  (`harvest-conv-backup-v2:`) is the mechanism, so a confession the buyer
+* The buyer already carries it across machines. The backup is the mechanism (a
+  per-conversation `harvest-conv-backup-v2:` string when this was written, the
+  one-file Backup page since step 2), so a confession the buyer
   backed up survives a lost laptop the same way the conversation keys do.
 
 ### The race, and why the ORDERING closes it rather than the speed

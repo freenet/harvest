@@ -534,6 +534,64 @@ pub(crate) mod fixtures {
         OrderPaymentProof::on_chain(vec![claim], tip)
     }
 
+    /// [`proof`], its transaction also paying filler outputs until it is at
+    /// least `bytes` long (within the bridge's 64 KiB): still the minimal
+    /// proof, as large as a big honest transaction makes it.
+    pub(crate) fn big_proof(order: &Order, bytes: usize) -> OrderPaymentProof {
+        use freenet_bitcoin_common::spv::testing::{build_tx, mine, sha256d_pub, EASIEST_BITS};
+        use freenet_bitcoin_common::spv::SpvProof;
+        use freenet_bitcoin_common::Txid;
+        let mut outputs = vec![(order.amount_sats, order.payment_script_pubkey.clone())];
+        while outputs.len() < 0xfc && build_tx(&outputs).len() < bytes {
+            outputs.push((546, vec![0x6a; 250]));
+        }
+        let raw_tx = build_tx(&outputs);
+        let txid = Txid(sha256d_pub(&raw_tx));
+        let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+        let anchor = BlockAnchor {
+            height: 100,
+            hash: BlockHash(sha256d_pub(&header.0)),
+        };
+        let bridge = bridge_key();
+        let claim = SignedClaim::sign(
+            &bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch: Vec::new(),
+                        tx_index: 0,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .expect("sign claim");
+        let tip = SignedTipEntry::sign(
+            &bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height: 100 + order.required_confirmations - 1,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .expect("sign tip");
+        OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
     /// A genuine confirmation of `order`'s payment at height 100, signed by
     /// the bridge at `as_of`: a later rung of the same payment.
     pub(crate) fn claim_as_of(order: &Order, as_of: u32) -> SignedClaim {

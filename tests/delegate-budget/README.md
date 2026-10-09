@@ -127,7 +127,7 @@ fails the run on any difference.
 | `ExportSecrets` | the migration export with the state above, after every instant-checkout step because it disarms instant checkout. The harness checks it carries at least as many entries as were seeded, and every seeded instant-checkout ledger by key |
 | a seller's published scripts, after the export (the payment key does not look at it), each run from the same secrets (the key active, and the one script the foreign-script step above sent already held: since #216 a script sent with `DeriveOrderAddress` is kept like any other): sent as `AddPublishedScripts` requests of `MAX_SCRIPTS_PER_REQUEST` (4096), then `SetPaymentXpub` (with `resume` when asked again) or `DeriveOrderAddress`, repeated while the delegate answers `CATCHING_UP_PREFIX`. One full store contiguous from the counter, driven to the end; every store full (64 x 4096 = `MAX_HELD`), 64 additions each measured and then ONE scan call; one full store with its scripts `PUBLISHED_INDEX_GAP` apart, 32 calls | no address is handed out, and no key made active, until the counter is past every published script the delegate holds; every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further, so the scan is cut into budgets (`FLOOR_SCAN_BUDGET`). The harness requires the scan's cursor (in the refusal, `{counter}/{cursor}`) to move on with every call and the final count, or the address handed out, to be one past the last script. The 64-store input is real: one delegate holds one payment key for every store, and the web app sends every owned store's scripts. The spaced run takes about 1,400 calls to finish; 32 show its per-call bound. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness and checked against the delegate's next ten addresses. A delegate without `AddPublishedScripts` (V29) is sent the scripts with the request, as its web app did |
 | a new device: a key that is not the active one, entered after its store's 4096 scripts are sent; then a stale resume | the new key's scan runs in the pending slot while the active key goes on: after one call the harness checks the new key is pending beside the active one, and at the end that it is active at count 4096 with the pending slot emptied. Then tab A's new key part-way, tab B enters another key, and tab A's `resume` must be refused with `KEY_SUPERSEDED_PREFIX` and change nothing. Not on V29, which has no pending slot |
-| instant checkout's decide again, on the same store of 4096 paid orders with 511 more listings at the store's caps (`MAX_LISTINGS`, each at `MAX_LISTING_BYTES` with every field the listing form offers at its largest and the description padded to the bound); and again with 10,000 listing statuses | step 2: the worst store the listing caps allow, and a long edit history, which nothing caps (one status per listing version ever published). The harness prints the description a full-field listing has left at the bound |
+| instant checkout's decide again, on the same store of `MAX_ORDERS` paid orders (500 since step 2's round 2; 4096 before) with the rest of `MAX_LISTINGS` (128; 512 before) filled, at the store's caps (`MAX_LISTINGS`, each at `MAX_LISTING_BYTES` with every field the listing form offers at its largest and the description padded to the bound); and again with 10,000 listing statuses | step 2: the worst store the listing caps allow, and a long edit history, which nothing caps (one status per listing version ever published). The harness prints the description a full-field listing has left at the bound |
 | `ExportPurchasesBackup`, every page in turn, with every kept conversation and kept purchase at its cap; then `ImportPurchasesBackup` of 16 paid purchases this node does not hold | step 2's purchases backup: a page of about 256 KiB of records, and a chunk of `BACKUP_IMPORT_ITEMS`, each purchase checked as a fresh keep is (the costly case). The harness checks the pages together hold every conversation and purchase, and that every imported item answers `Imported`; the state is put back after |
 
 ## Calibration
@@ -284,7 +284,7 @@ feeding the full 262,144 costs at most 15% a request. Instant checkout reads
 a store in one light pass and feeds its scripts once.
 
 The calls to watch each grow with a collection: instant checkout's decide
-against a full store of 4,096 paid orders (about 85%), a wake-up moving the
+against a full store of 4,096 paid orders (about 85%; measured at the former cap, 500 since step 2's round 2), a wake-up moving the
 payment counter's catch-up on (about 76%), `KeepPurchase` into a full store
 and `ListKeptPurchases (1024)` (about 74%), and the slow-plaintext mailbox
 run, its retry read and the wake-up with full watch delegations (about
@@ -392,12 +392,15 @@ delegation it reads for).
   many calls is bounded per call, not in total.
 
 **Step 2 (`feat/store-pause-one-backup`, delegate `3db9c759…` after merging
-#229)** moves these rows, one run of the harness:
+#229)** moves these rows, one run of the harness. These figures, and every
+row above that says 4,096 paid orders, were measured at the former caps
+(4,096 orders, 512 listings); step 2's round 2 lowered them to 500 and 128
+and the figures are refreshed in that round:
 
 | call | before (`9c8b3b3e…`) | step 2 |
 |---|---:|---:|
 | instant decide against a store of 4,096 paid orders | 2,578,928,712 (86.0%) | 2,374,452,135 (79.1%) |
-| same, with 511 more listings at both caps (32 KiB, every field at its largest) | (not driven) | 2,700,592,729 (90.0%) |
+| same, with 511 more listings at both caps (the former 512-listing cap; 32 KiB, every field at its largest) | (not driven) | 2,700,592,729 (90.0%) |
 | same, with 10,000 listing statuses | (not driven) | 2,485,481,223 (82.8%) |
 | `KeepPurchase`, the 1024th | 2,217,700,871 (73.9%) | 1,113,104,193 (37.1%) |
 | `ListKeptPurchases (1024)` | 2,202,396,316 (73.4%) | 1,098,972,710 (36.6%) |
@@ -409,7 +412,7 @@ CBOR byte strings, which is most of why the kept purchases halve, and
 decide's light read skips each listing's and listing status's signature,
 signed payload and certificate, and reads only the statuses of listings the
 store holds. A listing status costs decide about 11.1K fuel, so on a store
-of 4,096 paid orders decide reaches the budget at about 56,000 status edits
+of 4,096 paid orders (the former cap) decide reaches the budget at about 56,000 status edits
 with few listings, and at about 27,000 with both listing caps full: a store
 that edits that often stops answering Buy now (`docs/untested-invariants.md`,
 step 2).

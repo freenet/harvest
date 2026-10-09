@@ -836,6 +836,12 @@ pub struct AppState {
     /// The seller's own order books, by store key (step 2;
     /// `crate::seller_book`).
     pub seller_books: HashMap<[u8; 32], crate::seller_book::SellerBook>,
+    /// Orders this tab proved paid whose `Paid` record is past the store's
+    /// byte bound (`harvest_common::store::MAX_PAID_ORDER_BYTES`), so the
+    /// store keeps them unpaid: what the seller's views show for them,
+    /// rebuilt from the address claims each session.
+    pub paid_past_store_bound:
+        HashMap<harvest_common::payment::OrderId, harvest_common::payment::AuthorizedOrder>,
     /// A finished backup file, waiting for the buyer to save it.
     pub backup_file_ready: Option<crate::backup_flow::ReadyBackup>,
     /// A restore being sent a chunk at a time.
@@ -8901,6 +8907,16 @@ impl AppState {
             .retain(|_, (store, _)| store.as_slice() != store_contract_id);
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
+            // Past the store's byte bound for a `Paid` record (step 2): the
+            // store would keep it unpaid, so it is not sent there. This tab
+            // shows it paid, and the seller's own book keeps it paid.
+            if !harvest_common::store::paid_within_cap(&settled) {
+                self.paid_past_store_bound
+                    .insert(settled.order.id.clone(), settled.clone());
+                let out = self.keep_paid_past_bound(store_contract_id, settled);
+                crate::backup_flow::send_all(out);
+                continue;
+            }
             if self.settlement_hold(&settled.order).is_some() {
                 // Already confirmed and sent: do not offer it again.
                 if self.settlements_submitted.contains(&settled.order.id) {
@@ -11072,7 +11088,6 @@ impl AppState {
     ) -> Result<(), String> {
         use harvest_common::payment::OrderStatus;
 
-        let store_key = self.signing_store_key(store_contract_id)?;
         let order = self
             .browsing_stores
             .get(store_contract_id)
@@ -11080,6 +11095,18 @@ impl AppState {
             .cloned()
             .ok_or("this invoice is not in the store as this device last read it")?;
         let settled = match order.status {
+            // Paid as this tab or the seller's own book knows, though the
+            // store keeps it unpaid (step 2: a payment past the store's byte
+            // bound for a `Paid` record).
+            OrderStatus::AwaitingPayment
+                if self.paid_past_store_bound.contains_key(order_id)
+                    || self
+                        .seller_book(store_contract_id)
+                        .and_then(|b| b.orders.iter().find(|r| r.order.order.id == *order_id))
+                        .is_some_and(|r| r.order.status == OrderStatus::Paid) =>
+            {
+                Some("already paid")
+            }
             OrderStatus::AwaitingPayment => None,
             OrderStatus::Paid => Some("already paid"),
             OrderStatus::Cancelled => Some("already cancelled"),
@@ -11102,6 +11129,7 @@ impl AppState {
         {
             return Err("this invoice is already being cancelled".to_string());
         }
+        let store_key = self.signing_store_key(store_contract_id)?;
         info!("Cancelling invoice {}", order_id.short());
         self.request_store_key_signature(
             PendingSignature::Cancellation(Box::new(PendingCancellation {
@@ -27922,6 +27950,19 @@ mod buy_flow_tests {
         Vec<freenet_bitcoin_common::SignedClaim>,
         freenet_bitcoin_common::SignedTipEntry,
     ) {
+        a_paid_order_with_fillers(edit, 0)
+    }
+
+    /// [`a_paid_order_where`] whose payment's transaction also pays
+    /// `fillers` outputs: as large as a big honest transaction makes it.
+    fn a_paid_order_with_fillers(
+        edit: impl FnOnce(&mut Order),
+        fillers: usize,
+    ) -> (
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
         use freenet_bitcoin_common::spv::testing::payment_proof;
         use freenet_bitcoin_common::{
             BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
@@ -27949,8 +27990,29 @@ mod buy_flow_tests {
         };
 
         let confirmed_at = TIP_HEIGHT - 1;
-        let (spv, txid, block_hash) =
-            payment_proof(&order.order.payment_script_pubkey, paid_sats, 1, [7u8; 32]);
+        let (spv, txid, block_hash) = if fillers == 0 {
+            payment_proof(&order.order.payment_script_pubkey, paid_sats, 1, [7u8; 32])
+        } else {
+            // A big honest transaction: the payment, then `fillers` outputs.
+            use freenet_bitcoin_common::spv::testing::{build_tx, mine, sha256d_pub, EASIEST_BITS};
+            let mut outputs = vec![(paid_sats, order.order.payment_script_pubkey.clone())];
+            outputs.extend((0..fillers).map(|_| (546, vec![0x6a; 250])));
+            let raw_tx = build_tx(&outputs);
+            let txid = freenet_bitcoin_common::Txid(sha256d_pub(&raw_tx));
+            let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+            let block_hash = BlockHash(sha256d_pub(&header.0));
+            (
+                freenet_bitcoin_common::spv::SpvProof {
+                    raw_tx,
+                    merkle_branch: Vec::new(),
+                    tx_index: 0,
+                    header,
+                    following_headers: Vec::new(),
+                },
+                txid,
+                block_hash,
+            )
+        };
         let claim = SignedClaim::sign(
             &settling_bridge(),
             &ClaimBody {
@@ -28148,6 +28210,55 @@ mod buy_flow_tests {
         }
         state.refresh_same_address_orders();
         (state, order)
+    }
+
+    /// Step 2 (the overseer, 2026-10-09): an honest payment past the store's
+    /// byte bound for a `Paid` record still reaches the seller as paid. The
+    /// settlement is not sent to the store (which would keep it unpaid); the
+    /// seller's views show the paid copy, the seller's own book is asked to
+    /// keep it paid, and Cancel is refused. Mutated red by publishing it as
+    /// any other, and by offering Cancel.
+    #[test]
+    fn a_payment_past_the_store_bound_still_reads_paid_to_the_seller() {
+        let (order, claims, tip) = a_paid_order_with_fillers(|_| {}, 80);
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        assert!(
+            !harvest_common::store::paid_within_cap(&settled),
+            "past the bound"
+        );
+        harvest_common::payment::verify_minimal_proof(
+            &settled.order,
+            settled.payment_proof.as_ref().unwrap(),
+        )
+        .expect("an honest, minimal proof");
+
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "not sent to the store"
+        );
+        let shown = state.seller_orders_with_book(STORE);
+        assert!(shown
+            .iter()
+            .any(|o| o.order.id == order.order.id && o.status == OrderStatus::Paid));
+        assert!(state
+            .cancel_invoice(STORE, &order.order.id)
+            .unwrap_err()
+            .contains("already paid"));
     }
 
     /// Step 2, the seller's own book (`crate::seller_book`): a paid order

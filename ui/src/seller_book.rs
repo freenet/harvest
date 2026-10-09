@@ -406,14 +406,57 @@ impl AppState {
     }
 
     /// The orders the seller's to-send list and order pages read: the
-    /// store's, then the book's that the store no longer holds.
+    /// store's, then the book's that the store no longer holds. An order the
+    /// store keeps unpaid that this tab proved paid past the store's byte
+    /// bound reads as that paid copy (step 2).
     pub(crate) fn seller_orders_with_book(&self, store_contract_id: &[u8]) -> Vec<AuthorizedOrder> {
-        let mut orders = self
+        let mut orders: Vec<AuthorizedOrder> = self
             .browsing_stores
             .get(store_contract_id)
             .map(|s| s.orders.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| match self.paid_past_store_bound.get(&o.order.id) {
+                Some(paid) if o.status == OrderStatus::AwaitingPayment => paid.clone(),
+                _ => o,
+            })
+            .collect();
         orders.extend(self.book_only_orders(store_contract_id));
         orders
+    }
+
+    /// A paid order past the store's byte bound, into the seller's own book
+    /// for one of our stores, which keeps it paid (step 2).
+    pub(crate) fn keep_paid_past_bound(
+        &mut self,
+        store_contract_id: &[u8],
+        paid: AuthorizedOrder,
+    ) -> Outgoing {
+        let Some(key) = self.own_store_key(store_contract_id) else {
+            return Vec::new();
+        };
+        let held = self
+            .seller_books
+            .get(&key)
+            .and_then(|b| b.orders.iter().find(|r| r.order.order.id == paid.order.id))
+            .cloned();
+        if held
+            .as_ref()
+            .is_some_and(|r| r.order.status == OrderStatus::Paid)
+        {
+            return Vec::new();
+        }
+        let request_id = self.next_messaging_request_id();
+        vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
+            request_id,
+            store_key: key,
+            orders: vec![SellerKeptOrder {
+                order: paid,
+                request: held.and_then(|h| h.request),
+                despatch: None,
+                paid_height: None,
+                sent_off_store: false,
+            }],
+        }]
     }
 }

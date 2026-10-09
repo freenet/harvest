@@ -166,10 +166,41 @@ fn checked(
     owner: &ed25519_dalek::VerifyingKey,
     incoming: SellerKeptOrder,
 ) -> Result<SellerKeptOrder, String> {
-    let order = harvest_common::store::as_kept(incoming.order);
-    order
-        .verify(owner)
-        .map_err(|e| format!("order {} does not verify: {e}", order.order.id))?;
+    let mut order = incoming.order;
+    let mut paid_height = incoming.paid_height;
+    let id = order.order.id.clone();
+    let terms = |order: &harvest_common::payment::AuthorizedOrder| {
+        order
+            .verify_terms(owner)
+            .map_err(|e| format!("order {id} does not verify: {e}"))
+    };
+    if order.status == OrderStatus::Paid && order.payment_proof.is_none() {
+        // Paid as a store notification showed it, or past the store's
+        // byte bound (below), kept here before: the terms are the store
+        // key's, and the payment was checked when it was first kept.
+        terms(&order)?;
+    } else if order.status == OrderStatus::Paid
+        && !harvest_common::store::paid_within_cap(&order)
+        && order
+            .payment_proof
+            .as_ref()
+            .is_some_and(|p| harvest_common::payment::verify_minimal_proof(&order.order, p).is_ok())
+        && order.verify(owner).is_ok()
+    {
+        // Paid on the minimal proof, but past the store's byte bound
+        // (`store::MAX_PAID_ORDER_BYTES`): the store keeps it unpaid, and the
+        // seller's own book keeps it paid (the overseer, 2026-10-09: an
+        // honest payment over the bound still reaches the seller as paid).
+        // Without the proof, which would make the book as large as the
+        // payment's transactions, and with the height it confirmed at.
+        paid_height = paid_height.or_else(|| harvest_common::payment::paid_height(&order));
+        order.payment_proof = None;
+    } else {
+        order = harvest_common::store::as_kept(order);
+        order
+            .verify(owner)
+            .map_err(|e| format!("order {} does not verify: {e}", order.order.id))?;
+    }
     if !matches!(
         order.status,
         OrderStatus::AwaitingPayment | OrderStatus::Paid | OrderStatus::PaymentReversed
@@ -189,9 +220,7 @@ fn checked(
         }
     }
     Ok(SellerKeptOrder {
-        paid_height: incoming
-            .paid_height
-            .or_else(|| harvest_common::payment::paid_height(&order)),
+        paid_height: paid_height.or_else(|| harvest_common::payment::paid_height(&order)),
         order,
         request: incoming.request.map(bounded),
         despatch: incoming.despatch,
@@ -790,6 +819,43 @@ pub(crate) mod tests {
         let shipping = held(&secrets, 4).unwrap().request.unwrap().shipping;
         assert!(
             shipping.len() <= MAX_KEPT_REQUEST_TEXT && shipping.len() >= MAX_KEPT_REQUEST_TEXT - 1
+        );
+    }
+
+    /// Step 2 (the overseer, 2026-10-09): an honest payment past the
+    /// store's byte bound still reaches the seller as paid. The store keeps
+    /// such an order unpaid; the book keeps it paid, without the proof and
+    /// with the height it confirmed at, and keeps it so when it comes back
+    /// through an import. A padded proof is still kept unpaid. Mutated red by
+    /// keeping it unpaid as the store does.
+    #[test]
+    fn an_honest_payment_past_the_byte_bound_is_kept_paid() {
+        let mut secrets = seller();
+        let terms = order(9, 1);
+        let mut big = record(9, OrderStatus::Paid);
+        big.order = authorized(&store_signing_key(), terms.clone(), OrderStatus::Paid, 1);
+        big.order.payment_proof = Some(crate::kept_purchases::fixtures::big_proof(
+            &terms,
+            harvest_common::store::MAX_PAID_ORDER_BYTES,
+        ));
+        assert!(!harvest_common::store::paid_within_cap(&big.order));
+        assert_eq!(
+            harvest_common::store::as_kept(big.order.clone()).status,
+            OrderStatus::AwaitingPayment,
+            "the store keeps it unpaid"
+        );
+        kept(&mut secrets, vec![big]).unwrap();
+        let held = held(&secrets, 9).unwrap();
+        assert_eq!(held.order.status, OrderStatus::Paid);
+        assert!(held.order.payment_proof.is_none());
+        assert_eq!(held.paid_height, Some(100));
+        // Back through an import, it stays paid.
+        let mut successor = seller();
+        let key = open_key(&store_key());
+        crate::import::import_secret(&mut successor, &key, &secrets.get_secret(&key).unwrap());
+        assert_eq!(
+            super::tests::held(&successor, 9).unwrap().order.status,
+            OrderStatus::Paid
         );
     }
 

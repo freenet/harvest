@@ -399,12 +399,12 @@ nobody.
 
 **What closes an opened conversation again.** Rule (ii) matches the order's
 listing tag against listings named by requests in the conversation and
-listings the store lists. A store's listings set is grow-only (an edited or
-withdrawn listing stays in it), so an order stays matched after its request
+listings the store lists. A store's listings set keeps its newest `MAX_LISTINGS` (128) listings (an edited or
+withdrawn listing stays in it until that cut takes it), so an order stays matched after its request
 leaves the bounded mailbox, even if the mailbox is flooded to evict it. What
 can close it: the request gone AND the listing not in the store's listings
-(a store whose listings did not come across a migration), the order pruned
-from the store by its order cap (`MAX_ORDERS`, oldest out), or the store's copy of
+(a store whose listings did not come across a migration, or whose cap cut the listing), the order pruned
+from the store by its order cap (`MAX_ORDERS`, 500, oldest out; Buy now orders at 100 a day can roll an order off in about 5 days), or the store's copy of
 the order dropping from `Paid`. Then the seller's inbox holds the buyer's
 plain text back, and says it could not match it to a paid order.
 

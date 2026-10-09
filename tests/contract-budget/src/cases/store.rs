@@ -343,6 +343,44 @@ impl Shop {
     /// An instant-checkout order, `age` seconds old, paid by a transaction
     /// in a 12-deep Merkle tree and confirmed at [`CONFIRM_HEIGHT`].
     fn paid_order(&self, label: &str, i: u64, age: i64) -> Result<AuthorizedOrder> {
+        self.paid_order_with(label, i, age, 0)
+    }
+
+    /// [`Self::paid_order`] whose payment's transaction also pays the
+    /// largest number of filler outputs that keeps the record within
+    /// `bytes` as it encodes (step 2's `store::MAX_PAID_ORDER_BYTES`): still
+    /// the minimal proof, as large as a big honest transaction makes it.
+    fn paid_order_at(
+        &self,
+        label: &str,
+        i: u64,
+        age: i64,
+        bytes: usize,
+    ) -> Result<AuthorizedOrder> {
+        // At most 0xfc outputs in all: `build_tx` writes the count as one byte.
+        let (mut lo, mut hi) = (0usize, 0xf9);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if cbor(&self.paid_order_with(label, i, age, mid)?).len() <= bytes {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let record = self.paid_order_with(label, i, age, lo)?;
+        if cbor(&record).len() > bytes {
+            bail!("a paid order does not fit {bytes} bytes even with no filler");
+        }
+        Ok(record)
+    }
+
+    fn paid_order_with(
+        &self,
+        label: &str,
+        i: u64,
+        age: i64,
+        fillers: usize,
+    ) -> Result<AuthorizedOrder> {
         // P2WPKH, as the delegate derives from a seller's BIP-84 wallet.
         let mut script = vec![0x00, 0x14];
         script.extend_from_slice(&bytes(&format!("{label}/script"), i, 20));
@@ -378,10 +416,12 @@ impl Shop {
         // The payment and the buyer's change.
         let mut change = vec![0x00, 0x14];
         change.extend_from_slice(&bytes(&format!("{label}/change"), i, 20));
-        let raw_tx = build_tx(&[
+        let mut outputs = vec![
             (order.amount_sats, order.payment_script_pubkey.clone()),
             (1_734_221, change),
-        ]);
+        ];
+        outputs.extend((0..fillers).map(|_| (546, vec![0x6a; 250])));
+        let raw_tx = build_tx(&outputs);
         let txid = Txid(sha256d_pub(&raw_tx));
         let merkle_branch: Vec<[u8; 32]> = (0..MERKLE_DEPTH as u64)
             .map(|d| array(&format!("{label}/merkle"), i * 100 + d))
@@ -622,6 +662,20 @@ impl Shop {
         revision: u64,
         offset: i64,
     ) -> Result<StoreStateV1> {
+        self.at_cap_paid(label, version, listings, revision, offset, None)
+    }
+
+    /// [`Self::at_cap`], each paid order at `paid_bytes` as it encodes when
+    /// given.
+    fn at_cap_paid(
+        &self,
+        label: &str,
+        version: u32,
+        listings: std::ops::Range<u64>,
+        revision: u64,
+        offset: i64,
+        paid_bytes: Option<usize>,
+    ) -> Result<StoreStateV1> {
         let listings = listings
             .map(|i| self.listing("store/listing", i))
             .collect::<Result<Vec<_>>>()?;
@@ -630,7 +684,10 @@ impl Shop {
             .map(|l| self.listing_status(&l.listing.id, revision))
             .collect::<Result<Vec<_>>>()?;
         let orders = (0..MAX_ORDERS as u64)
-            .map(|i| self.paid_order(label, i, offset + 60 + 2 * i as i64))
+            .map(|i| match paid_bytes {
+                Some(bytes) => self.paid_order_at(label, i, offset + 60 + 2 * i as i64, bytes),
+                None => self.paid_order(label, i, offset + 60 + 2 * i as i64),
+            })
             .collect::<Result<Vec<_>>>()?;
         let fulfilment = orders
             .iter()
@@ -806,6 +863,18 @@ pub fn cases() -> Result<Vec<Case>> {
         kept.verify(&kept, &shop.parameters)
             .map_err(|e| anyhow!("the store after the padded delta fails verify: {e}"))?;
     }
+    // (d) Step 2: every paid order at the store's byte bound for a `Paid`
+    // record (`store::MAX_PAID_ORDER_BYTES`), as big honest payments make
+    // them, beside the listings at theirs.
+    let big = shop.at_cap_paid(
+        "store/held-big",
+        2,
+        0..LISTINGS,
+        1,
+        0,
+        Some(harvest_common::store::MAX_PAID_ORDER_BYTES),
+    )?;
+    fits_a_node("the store of paid orders at their byte bound", &big)?;
     fits_a_node("the held store fixture", &held)?;
     fits_a_node("the second store fixture", &other)?;
     fits_a_node("the merge of the two store fixtures", &merged)?;
@@ -824,6 +893,16 @@ pub fn cases() -> Result<Vec<Case>> {
             parameters: parameters.clone(),
             held: held_bytes.clone(),
             update: Update::State(cbor(&other)),
+        },
+        Case {
+            kind: Kind::Store,
+            name: format!(
+                "{MAX_ORDERS} Paid orders of {} KiB + one-listing delta",
+                harvest_common::store::MAX_PAID_ORDER_BYTES / 1024
+            ),
+            parameters: parameters.clone(),
+            held: cbor(&big),
+            update: Update::Delta(cbor(&one)),
         },
         Case {
             kind: Kind::Store,

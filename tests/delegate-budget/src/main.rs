@@ -1514,6 +1514,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation,
                 order: paid,
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeptPurchases",
@@ -1529,6 +1530,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             order: orders.paid(orders.order(n, receipt_key)),
             complaint: None,
             backed_up: false,
+            despatch: None,
         };
         let id: String = record
             .order
@@ -1573,6 +1575,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation: last_conversation,
                 order: orders.paid(orders.order(KEPT_PURCHASES as u32, last_receipt)),
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeptPurchases",
@@ -1589,6 +1592,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation: stranger,
                 order: orders.paid(orders.order(KEPT_PURCHASES as u32 + 1, last_receipt)),
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeepPurchaseRefused",
@@ -1752,6 +1756,19 @@ fn scenario(r: &mut Runner) -> Result<()> {
             listings_at_cap: false,
             statuses: 0,
             full_mailbox: true,
+            full_book: false,
+        },
+    )?;
+    // Step 2: the seller's own book at every cap; decide writes the order it
+    // signs into it.
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: 0,
+            full_mailbox: false,
+            full_book: true,
         },
     )?;
     // Step 2: the same store at both listing caps, the worst case the caps
@@ -1763,6 +1780,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             listings_at_cap: true,
             statuses: 0,
             full_mailbox: false,
+            full_book: false,
         },
     )?;
     instant_decide(
@@ -1772,6 +1790,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
             listings_at_cap: false,
             statuses: DECIDE_STATUSES,
             full_mailbox: false,
+            full_book: false,
         },
     )?;
 
@@ -2047,6 +2066,193 @@ struct DecideShape {
     statuses: usize,
     /// Also measure a full mailbox of instant requests (once is enough).
     full_mailbox: bool,
+    /// The seller's own order book at every cap (step 2), each request's
+    /// texts at their bound: decide writes the order it signs into it, and
+    /// the book's own calls are measured against it.
+    full_book: bool,
+}
+
+/// 32 bytes for the `n`th fixture of a kind.
+fn book_bytes(kind: &[u8], n: u64) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(kind);
+    h.update(&n.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// The delegate's open half of a seller's book, as `seller_orders` stores
+/// it.
+#[derive(serde::Serialize)]
+struct OpenBook {
+    orders: Vec<harvest_common::delegate::SellerKeptOrder>,
+}
+
+/// The seller's book for `at`, filled to every cap: the paid orders of
+/// `paid` not yet sent (up to `MAX_SELLER_UNSENT_KEPT`), as many unpaid
+/// ones as it keeps, and as many sent ones, every request's texts at their
+/// bound. Answers the paid-unsent records, for the calls measured on it.
+fn fill_book(
+    r: &mut Runner,
+    at: &InstantStore,
+    fx: &fixtures::OrderFx,
+    paid: &[harvest_common::payment::AuthorizedOrder],
+) -> Result<Vec<harvest_common::delegate::SellerKeptOrder>> {
+    use harvest_common::delegate::{
+        KeptRequest, SellerKeptOrder, MAX_KEPT_REQUEST_TEXT, MAX_SELLER_SENT_KEPT,
+        MAX_SELLER_UNPAID_KEPT, MAX_SELLER_UNSENT_KEPT,
+    };
+    let request = |n: u64| KeptRequest {
+        listing_id: harvest_common::listing::ListingId(book_bytes(b"listing", n)),
+        quantity: 1,
+        shipping: "s".repeat(MAX_KEPT_REQUEST_TEXT),
+        note: "n".repeat(MAX_KEPT_REQUEST_TEXT),
+        region: Some("r".repeat(40)),
+        choices: vec!["c".repeat(40); 4],
+        conversation: book_bytes(b"conversation", n),
+    };
+    let record = |order, n| SellerKeptOrder {
+        order,
+        request: Some(request(n)),
+        despatch: None,
+        paid_height: Some(100),
+        sent_off_store: false,
+    };
+    let mut paid_unsent: Vec<SellerKeptOrder> = Vec::new();
+    let mut extra = 0u32;
+    while paid_unsent.len() < MAX_SELLER_UNSENT_KEPT {
+        let order = match paid.get(paid_unsent.len()) {
+            Some(o) => o.clone(),
+            None => {
+                extra += 1;
+                fx.paid(fx.order(200_000 + extra, [0x5B; 32]))
+            }
+        };
+        let n = paid_unsent.len() as u64;
+        paid_unsent.push(record(order, n));
+    }
+    let mut open = paid_unsent.clone();
+    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
+        let mut order = fx.paid(fx.order(100_000 + k, [0x5B; 32]));
+        order.status = harvest_common::payment::OrderStatus::AwaitingPayment;
+        order.payment_proof = None;
+        open.push(record(order, 10_000 + u64::from(k)));
+    }
+    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    let mut done = Vec::new();
+    for k in 0..MAX_SELLER_SENT_KEPT as u32 {
+        let order = fx.paid(fx.order(300_000 + k, [0x5B; 32]));
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: freenet_bitcoin_common::BlockAnchor {
+                height: 120,
+                hash: freenet_bitcoin_common::BlockHash([7u8; 32]),
+            },
+        };
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(&signer, cbor(&despatch))
+                .map_err(|e| anyhow!("{e}"))?;
+        let mut r = record(order, 20_000 + u64::from(k));
+        r.despatch = Some(harvest_common::fulfilment::AuthorizedDespatch {
+            despatch,
+            scoped_payload,
+            signature,
+        });
+        done.push(r);
+    }
+    let key = bs58::encode(at.verifying_key).into_string();
+    let open_bytes = cbor(&OpenBook { orders: open });
+    let done_bytes = cbor(&done);
+    println!(
+        "  (seller's book: {} open records, {} KiB; {} sent, {} KiB)",
+        MAX_SELLER_UNSENT_KEPT + MAX_SELLER_UNPAID_KEPT,
+        open_bytes.len() / 1024,
+        done.len(),
+        done_bytes.len() / 1024
+    );
+    r.host
+        .state
+        .secrets
+        .insert(format!("harvest:seller_orders:open:{key}").into_bytes(), open_bytes);
+    r.host
+        .state
+        .secrets
+        .insert(format!("harvest:seller_orders:done:{key}").into_bytes(), done_bytes);
+    Ok(paid_unsent)
+}
+
+/// The seller's book's own calls, on the full book [`fill_book`] made.
+fn book_calls(
+    r: &mut Runner,
+    at: &InstantStore,
+    paid_unsent: &[harvest_common::delegate::SellerKeptOrder],
+) -> Result<()> {
+    use harvest_common::delegate::SELLER_ORDERS_PER_CALL;
+    let signer = SigningKey::from_bytes(&[12u8; 32]);
+    // A tab marking orders sent: each moves from the open half to the sent
+    // half, both rewritten, the oldest sent ones cut.
+    let sent: Vec<_> = paid_unsent
+        .iter()
+        .take(SELLER_ORDERS_PER_CALL)
+        .map(|record| {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: record.order.order.id.clone(),
+                anchor: freenet_bitcoin_common::BlockAnchor {
+                    height: 130,
+                    hash: freenet_bitcoin_common::BlockHash([7u8; 32]),
+                },
+            };
+            let (scoped_payload, signature) =
+                harvest_common::backing::sign_with_store_key(&signer, cbor(&despatch))
+                    .map_err(|e| anyhow!("{e}"))?;
+            let mut r = record.clone();
+            r.despatch = Some(harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            });
+            Ok(r)
+        })
+        .collect::<Result<_>>()?;
+    let kept = r.app(
+        &format!("KeepSellerOrders ({SELLER_ORDERS_PER_CALL} sent, a full book)"),
+        cbor(&HarvestDelegateRequest::KeepSellerOrders {
+            request_id: 960,
+            store_key: at.verifying_key,
+            orders: sent,
+        }),
+        "SellerOrdersKept",
+    )?;
+    match field(&kept, &["SellerOrdersKept", "result", "Ok"])? {
+        Value::Integer(n) if i128::from(*n) == SELLER_ORDERS_PER_CALL as i128 => {}
+        other => bail!("the full book kept {} of the sent orders", brief(other)),
+    }
+    let mut after: Option<harvest_common::payment::OrderId> = None;
+    let mut pages = 0;
+    loop {
+        let answer = r.app(
+            "ListSellerOrders (a page, a full book)",
+            cbor(&HarvestDelegateRequest::ListSellerOrders {
+                request_id: 961,
+                store_key: at.verifying_key,
+                after: after.clone(),
+            }),
+            "SellerOrders",
+        )?;
+        pages += 1;
+        match field(&answer, &["SellerOrders", "result", "Ok", "next"])? {
+            Value::Bytes(_) | Value::Array(_) => {
+                let page: harvest_common::delegate::SellerOrdersPage =
+                    field(&answer, &["SellerOrders", "result", "Ok"])?.deserialized()?;
+                after = page.next;
+            }
+            _ => break,
+        }
+        if pages > 10_000 {
+            bail!("the book's pages never end");
+        }
+    }
+    println!("  (seller's book: {pages} pages)");
+    Ok(())
 }
 
 fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Result<()> {
@@ -2191,6 +2397,12 @@ fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Res
             );
         }
     }
+    let book = if shape.full_book {
+        let paid: Vec<_> = store.orders.orders.values().cloned().collect();
+        Some(fill_book(r, at, &fx, &paid)?)
+    } else {
+        None
+    };
     let store_bytes = cbor(&store);
     println!(
         "  (full store: {} paid orders, {} listings, {} statuses, {} KiB)",
@@ -2289,6 +2501,9 @@ fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Res
     if shape.statuses > 0 {
         extra += &format!(", {} listing statuses", shape.statuses);
     }
+    if shape.full_book {
+        extra += ", the seller's book full";
+    }
     let name = format!("GetContractResponse: store, {n} paid orders{extra} (instant decide)");
     let counter = |r: &Runner| -> Result<u64> {
         let v = secret_value(r, XPUB_KEY)?;
@@ -2362,6 +2577,9 @@ fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Res
                  (one past the store's last)",
                 scripts.len()
             );
+        }
+        if let Some(book) = &book {
+            book_calls(r, at, book)?;
         }
         // Back as it was for the rest of the scenario.
         r.host.state.secrets = snapshot;
