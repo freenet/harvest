@@ -870,6 +870,10 @@ pub(crate) fn merge_store_reporting_discard(
     // would be carried forward unsorted, and the current contract refuses that
     // (harvest#26).
     outcome.state.listings.normalize();
+    // And a `Paid` on padded evidence, which an earlier generation kept, is
+    // kept as its unpaid terms (step 2): carried as it was, the current
+    // contract would refuse the forward PUT.
+    outcome.state.orders.normalize();
     // Nor does it touch a version-0 info, and a predecessor written before the
     // PR #82 re-review can hold unsigned content there: anything was accepted
     // at version 0. Carried forward, it would make the new contract refuse

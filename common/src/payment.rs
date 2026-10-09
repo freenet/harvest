@@ -1261,6 +1261,12 @@ std::thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many tips this thread has verified rather than recalled.
+    static TIP_VERIFICATIONS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
 /// `tip.verify(params)`, done once per distinct signed tip and parameters
 /// (step 2). Verifying a tip is a pure function of those bytes (the bridge's
 /// signature over the entry, against the bridges the order trusts), and the
@@ -1268,12 +1274,6 @@ std::thread_local! {
 /// validation re-checked one signature per paid order that it had already
 /// checked. Only an accepted tip is remembered: a refused one is verified
 /// again, and refused again, every time.
-#[cfg(test)]
-thread_local! {
-    /// How many tips this thread has verified rather than recalled.
-    static TIP_VERIFICATIONS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
-}
-
 fn verify_tip_once(
     tip: &freenet_bitcoin_common::SignedTipEntry,
     params: &freenet_bitcoin_common::BitcoinTipParameters,

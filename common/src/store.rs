@@ -744,6 +744,8 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 32] {
 /// This is a `max` over the total order `(rank, Reverse(cbor_bytes))`, so it
 /// is associative, commutative and idempotent -- the three properties the
 /// merge tests in this module pin directly on serialized bytes.
+///
+/// Every incoming record has been through [`as_kept`] first.
 fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: AuthorizedOrder) {
     let id = incoming.order.id.clone();
     let Some(existing) = orders.get(&id) else {
@@ -948,6 +950,11 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             record
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
+            if record.status == crate::payment::OrderStatus::Paid && !paid_minimally(record) {
+                return Err(format!(
+                    "order {id} is Paid on evidence that is not the minimal proof"
+                ));
+            }
         }
         Ok(())
     }
@@ -1022,6 +1029,9 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         let Some(incoming) = delta else {
             return Ok(());
         };
+        // Each record as the store keeps it, before anything else: a padded
+        // `Paid` is its unpaid terms from here on (`as_kept`).
+        let incoming: Vec<AuthorizedOrder> = incoming.iter().cloned().map(as_kept).collect();
         // Verify the WHOLE delta before merging any of it. Verifying and
         // merging in one pass left a delta of [valid, invalid] with the valid
         // record already folded into `self` when the error returned, so a
@@ -1029,17 +1039,75 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         // records from a delta it had been told to reject. The contract's
         // `update_state` happens to discard the mutated value on error, but
         // that is a property of that call site, not of this function.
-        for record in incoming {
+        for record in &incoming {
             record
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
         }
         for record in incoming {
-            merge_order(&mut self.orders, record.clone());
+            merge_order(&mut self.orders, record);
         }
         enforce_order_cap(&mut self.orders);
         Ok(())
     }
+}
+
+impl OrdersV1 {
+    /// Every record as the store keeps it ([`as_kept`]): for a state written
+    /// before step 2, which a migration fold carries forward without passing
+    /// it through `apply_delta`.
+    pub fn normalize(&mut self) {
+        let held = std::mem::take(&mut self.orders);
+        self.orders = held
+            .into_iter()
+            .map(|(id, record)| (id, as_kept(record)))
+            .collect();
+    }
+}
+
+/// A record as the store keeps it (step 2): a `Paid` record whose payment
+/// proof is not the canonical minimal one
+/// ([`crate::payment::verify_minimal_proof`], the proof a complaint must
+/// carry) is kept as its unpaid terms, the seller-signed order anyone could
+/// publish; every other record as it is.
+///
+/// # Why
+///
+/// Whoever publishes `Paid` first chooses its evidence, and the verifier
+/// accepts any valid claims up to `MAX_PROOF_CLAIM_BYTES` (256 KiB): about
+/// 200 padded orders would fill a store to freenet-core's 50 MiB state limit.
+/// A minimal proof carries only the claims the payment needs.
+///
+/// # Why kept as unpaid rather than refused
+///
+/// It is a pure function of the one record, and idempotent, applied before
+/// `merge_order`'s `max`, so merging stays commutative, associative and
+/// idempotent. Refusing the delta would refuse every listing and order
+/// beside it, and a migration fold would discard a whole earlier generation
+/// holding one padded record. Any tab that sees the payment publishes the
+/// minimal `Paid` again (`AppState::settled_orders`), which then wins on
+/// rank. `PaymentReversed` is left as it is: its evidence carries a
+/// retraction, which no minimal proof can (and nothing produces one yet).
+pub fn as_kept(record: AuthorizedOrder) -> AuthorizedOrder {
+    use crate::payment::OrderStatus;
+    if record.status != OrderStatus::Paid || paid_minimally(&record) {
+        return record;
+    }
+    AuthorizedOrder {
+        status: OrderStatus::AwaitingPayment,
+        payment_proof: None,
+        status_scoped_payload: None,
+        status_signature: None,
+        ..record
+    }
+}
+
+/// Whether a `Paid` record carries the canonical minimal proof.
+fn paid_minimally(record: &AuthorizedOrder) -> bool {
+    record
+        .payment_proof
+        .as_ref()
+        .is_some_and(|proof| crate::payment::verify_minimal_proof(&record.order, proof).is_ok())
 }
 
 /// The key a store's records are verified against: its owner.
@@ -3914,22 +3982,35 @@ mod order_tests {
             "the attack works at an exact rank tie; anything else is a different bug"
         );
 
-        // Both are individually valid -- the attacker has broken no rule.
+        // Step 2: a state holding the padded record does not verify, and a
+        // padded record that arrives is kept as its unpaid terms
+        // (`as_kept`), whichever way round the two meet.
         let honest_state = orders_of([(order.id.clone(), honest.clone())]);
         let padded_state = orders_of([(order.id.clone(), padded.clone())]);
         assert!(honest_state.verify(&parent(), &p).is_ok());
         assert!(
-            padded_state.verify(&parent(), &p).is_ok(),
-            "the padded record must still verify -- that is what makes this an \
-             attack rather than a rejected update"
+            padded_state.verify(&parent(), &p).is_err(),
+            "a store does not hold Paid on padded evidence"
+        );
+        assert_eq!(
+            as_kept(padded.clone()),
+            make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None),
+            "kept as its unpaid terms"
         );
 
-        // Whichever way round they meet, the compact record is what survives.
         let mut honest_then_padded = honest_state.clone();
         honest_then_padded
             .merge(&parent(), &p, &padded_state)
             .unwrap();
-        let mut padded_then_honest = padded_state.clone();
+        let mut padded_then_honest = OrdersV1::default();
+        padded_then_honest
+            .merge(&parent(), &p, &padded_state)
+            .unwrap();
+        assert_eq!(
+            padded_then_honest.orders[&order.id].status,
+            OrderStatus::AwaitingPayment,
+            "a padded Paid arriving first is held unpaid"
+        );
         padded_then_honest
             .merge(&parent(), &p, &honest_state)
             .unwrap();
@@ -3942,8 +4023,95 @@ mod order_tests {
         assert_eq!(
             crate::to_cbor(&padded_then_honest.orders[&order.id]).unwrap(),
             honest_bytes,
-            "and it must not survive merely by having arrived first"
+            "and the minimal one replaces the unpaid terms it was kept as"
         );
+        assert!(padded_then_honest.verify(&parent(), &p).is_ok());
+    }
+
+    /// Step 2: the minimal-proof rule keeps the merge laws. States reached
+    /// by merging deltas that mix, for the same orders, the unpaid terms, a
+    /// minimal `Paid`, a `Paid` padded in two different ways and a
+    /// cancellation: merging them in any order and grouping gives the same
+    /// bytes, every result verifies, and no result holds a padded `Paid`.
+    /// Mutated red by keeping a padded `Paid` in `apply_delta`.
+    #[test]
+    fn the_minimal_proof_rule_obeys_the_merge_laws() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let mut versions: Vec<AuthorizedOrder> = Vec::new();
+        for n in 0..4u8 {
+            let order = make_order(
+                &format!("buyer-{n}"),
+                1_700_000_000 + i64::from(n),
+                &[0x00, 0x14, n, 0xbb],
+            );
+            let minimal = make_payment_proof(&order, &bridge, 5);
+            let mut padded = minimal.clone();
+            on_chain_mut(&mut padded)
+                .claims
+                .push(scanned_to_claim(&order, &bridge, 1));
+            let mut padded_more = padded.clone();
+            on_chain_mut(&mut padded_more)
+                .claims
+                .push(scanned_to_claim(&order, &bridge, 2));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::AwaitingPayment,
+                None,
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(minimal),
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(padded),
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(padded_more),
+            ));
+        }
+        let merge = |a: &OrdersV1, b: &OrdersV1| {
+            let mut out = a.clone();
+            out.merge(&parent(), &p, b).expect("merges");
+            out
+        };
+        let mut rng = crate::merge_laws::Rng::new(0x5ec_0d);
+        let mut states = vec![OrdersV1::default()];
+        for _ in 0..16 {
+            let mut delta = OrdersV1::default();
+            for _ in 0..1 + rng.below(5) {
+                let v = versions[rng.below(versions.len())].clone();
+                delta.orders.insert(v.order.id.clone(), v);
+            }
+            // Held only as the store keeps it: through `apply_delta`.
+            let mut state = OrdersV1::default();
+            state
+                .apply_delta(&parent(), &p, &Some(delta.orders.into_values().collect()))
+                .expect("applies");
+            states.push(state);
+        }
+        for s in &states {
+            s.verify(&parent(), &p).expect("every state verifies");
+        }
+        assert!(
+            states
+                .iter()
+                .any(|s| s.orders.values().any(|o| o.status == OrderStatus::Paid)),
+            "a minimal Paid is held somewhere"
+        );
+        crate::merge_laws::assert_laws(&states, 300, &mut rng, merge, |s| {
+            crate::to_cbor(s).unwrap()
+        });
     }
 
     /// A field the status does not use must be REJECTED, not merely ignored.

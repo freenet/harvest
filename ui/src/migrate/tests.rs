@@ -3361,3 +3361,74 @@ fn a_predecessor_with_4096_orders_is_folded_to_the_cap_with_its_listings() {
         .verify(&state, &store_ops().params)
         .expect("this generation accepts the folded state");
 }
+
+/// [`signed_order`] marked `Paid` on evidence that is not the minimal proof
+/// (here none that could be: no claims), as an earlier generation kept a
+/// padded one.
+fn padded_paid_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
+    use freenet_bitcoin_common::{BlockAnchor, BlockHash, SignedTipEntry, TipEntryBody};
+    let mut order = signed_order(secs);
+    let tip = SignedTipEntry::sign(
+        &SigningKey::from_bytes(&[9u8; 32]),
+        &TipEntryBody {
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            anchor: BlockAnchor {
+                height: 100,
+                hash: BlockHash([1u8; 32]),
+            },
+            prev_hash: BlockHash([2u8; 32]),
+            block_time: 1_700_000_000,
+            tx_count: 1,
+            median_time: 1_700_000_000,
+        },
+    )
+    .expect("sign the tip");
+    order.status = harvest_common::payment::OrderStatus::Paid;
+    order.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+        Vec::new(),
+        tip,
+    ));
+    order
+}
+
+/// Step 2: a generation that holds a `Paid` on padded evidence (anything
+/// but the minimal proof) is folded, not refused: the order is carried as
+/// its unpaid terms, on either side of the fold, its listings with it, and
+/// the result is a state this generation's contract accepts. Red if the
+/// store refused such a record in `apply_delta` (the predecessor would be
+/// discarded whole), or if the fold did not normalise the local side.
+#[test]
+fn a_predecessor_with_a_padded_paid_order_is_folded_with_its_listings() {
+    use harvest_common::payment::OrderStatus;
+    let mut older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    let theirs = padded_paid_order(1);
+    older
+        .orders
+        .orders
+        .insert(theirs.order.id.clone(), theirs.clone());
+    let mut local = store_with(&[signed_listing("Plum")]);
+    let ours = padded_paid_order(2);
+    local
+        .orders
+        .orders
+        .insert(ours.order.id.clone(), ours.clone());
+    let folded = merge_store_reporting_discard(
+        local,
+        &older,
+        &store_ops().params,
+        &seller_vk(),
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded, "the generation is folded, not refused");
+    let state = folded.state;
+    assert_eq!(state.listings.listings.len(), 3, "every listing is carried");
+    for id in [&theirs.order.id, &ours.order.id] {
+        let held = &state.orders.orders[id];
+        assert_eq!(held.status, OrderStatus::AwaitingPayment);
+        assert!(held.payment_proof.is_none());
+    }
+    use freenet_scaffold::ComposableState;
+    state
+        .verify(&state, &store_ops().params)
+        .expect("this generation accepts the folded state");
+}

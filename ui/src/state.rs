@@ -8346,8 +8346,10 @@ impl AppState {
     ///
     /// An order whose status has already moved, and an order whose evidence
     /// does not carry the transition. The second is the one that matters:
-    /// `assemble_on_chain_proof` verifies before it returns, so a record this
-    /// produces is one the network accepts. Publishing `Paid` on evidence
+    /// `minimal_on_chain_proof` verifies before it returns, so a record this
+    /// produces is one the network accepts. And it is the minimal proof: the
+    /// store keeps a `Paid` on any other as its unpaid terms (step 2,
+    /// `harvest_common::store::as_kept`), so a padded one would never show. Publishing `Paid` on evidence
     /// that fails verification is a state every peer refuses, and on the
     /// buyer's screen that looks like the payment never registering.
     ///
@@ -8357,7 +8359,7 @@ impl AppState {
         &self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
-        use harvest_common::payment::{assemble_on_chain_proof, OrderStatus};
+        use harvest_common::payment::{minimal_on_chain_proof, OrderStatus};
 
         // Scoped to the orders this node may settle, which is the SAME set
         // the twin guard compares against -- see `orders_we_may_settle` for
@@ -8395,7 +8397,7 @@ impl AppState {
             // Declines for every ordinary reason -- nothing seen yet, not
             // deep enough, short of the amount -- which is the common case
             // and not worth a line anywhere.
-            let Ok(proof) = assemble_on_chain_proof(&order.order, &view.claims, tip) else {
+            let Ok(proof) = minimal_on_chain_proof(&order.order, &view.claims, tip) else {
                 continue;
             };
             let mut paid = order.clone();
@@ -27929,6 +27931,39 @@ mod buy_flow_tests {
         settled
             .verify(&seller_signing_key().verifying_key())
             .expect("a settled order must verify as Paid");
+    }
+
+    /// Step 2: the settlement publishes the minimal proof, the one the store
+    /// keeps a `Paid` on, even when the address view also holds a scan
+    /// watermark (which the view always puts first). With the whole view as
+    /// evidence, the store would keep the order unpaid. Mutated red by
+    /// assembling the proof from every claim the view holds.
+    #[test]
+    fn a_settlement_carries_the_minimal_proof() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, SignedClaim};
+        let (order, claims, tip) = a_paid_order();
+        let watermark = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::ScannedTo,
+            },
+        )
+        .expect("sign the watermark");
+        let mut view = vec![watermark];
+        view.extend(claims);
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, view, tip);
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let proof = settled.payment_proof.as_ref().expect("a proof");
+        harvest_common::payment::verify_minimal_proof(&settled.order, proof)
+            .expect("the minimal proof");
+        assert_eq!(harvest_common::store::as_kept(settled.clone()), settled);
     }
 
     /// This seller's store, loaded, holding a provable payment for `order`,
