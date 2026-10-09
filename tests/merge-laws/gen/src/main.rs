@@ -2841,6 +2841,7 @@ impl BackingFx {
             copies: (!copies.is_empty()).then_some(copies),
             fulfilment: None,
             listing_statuses: None,
+            pause: None,
         };
         s.apply_delta(&StoreStateV1::default(), &self.fx.params, &Some(delta))
             .unwrap();
@@ -3293,6 +3294,7 @@ fn gen_retire98(root: &Path) {
         copies: None,
         fulfilment: None,
         listing_statuses: None,
+        pause: None,
     };
     let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
         ("ret1", d(vec![], vec![r1.clone()], vec![], true)),

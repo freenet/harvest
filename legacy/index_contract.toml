@@ -61,6 +61,6 @@ code_hash = "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a"
 
 [[entry]]
 version = "V8"
-description = "Superseded by step 2, which changed `harvest-common` (the store pause, the listing caps, the store's signed records as byte strings). `harvest-common` is compiled into every artifact, so its changes move these bytes; this contract's behaviour did not change, and its state, parameters and wire format are V8's. The generation harvest#215 shipped (`57979f8`), unchanged through #221 and #229."
+description = "Superseded by step 2, which changed `harvest-common` (the store pause, the listing and order caps, the minimal proof on `Paid`, the store's signed records as byte strings). `harvest-common` is compiled into every artifact, so its changes move these bytes; this contract's behaviour did not change, and its state, parameters and wire format are V8's. The generation harvest#215 shipped (`57979f8`), unchanged through #221 and #229."
 date = "2026-10-04"
 code_hash = "44bcc983a6e6c21896f3cd72aa086ec8832cffcd2085a6ce28630250d4fe8abc"
