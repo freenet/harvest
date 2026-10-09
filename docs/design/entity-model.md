@@ -159,7 +159,7 @@ This section describes the code as it is, before any of the changes below.
 | **Store** | A contract whose parameters are a 16-character base58 prefix ("store code") of the Ghost Key's public key (#91). The full key is the store's `owner`, held in state. Holds owner key, store details, listings, orders. | Network (`StoreStateV1`). |
 | **Store details** | Name, markdown description, certificate PEM, seller fingerprint, reputation contract id, inbox encryption public key. Signed, versioned. | Inside the store (`StoreInfoV1`). |
 | **Listing** | Title, description, a sats price and fixed delivery (included, or a price per region), optional choices, date. Signed by the Ghost Key. Listings from before 2026-09-26 may carry a kind (Gift / Request) or a free-text price and currency instead; those are shown and cannot be bought until the seller gives them a sats price. | Inside the store. |
-| **Order / invoice** | An amount in sats, a fresh Bitcoin address, required confirmations, trusted bridges, an anchor block, a status (Awaiting payment, Paid, Payment reversed, Cancelled). Signed by the seller, published before payment. | Inside the store (`OrdersV1`, up to 500, oldest out), and in the seller's own order book in the seller's delegate (per store key), which keeps an order after the store has dropped it. |
+| **Order / invoice** | An amount in sats, a fresh Bitcoin address, required confirmations, trusted bridges, an anchor block, a status (Awaiting payment, Paid, Payment reversed, Cancelled). Signed by the seller, published before payment. | Inside the store (`OrdersV1`, up to 256, oldest out; a Paid record is kept as paid only on the canonical minimal proof and within 8 KiB as it encodes, `store::MAX_PAID_ORDER_BYTES`, else the store holds its unpaid terms), and in the seller's own order book in the seller's delegate (per store key; three stages, unpaid, open and done, `delegates/harvest-delegate/src/seller_orders.rs`), which keeps an order after the store has dropped it. |
 | **Payment proof** | Bridge-signed evidence that the order's address was paid. Moves an order to Paid. | Inside the order. |
 | **Mailbox (inbox)** | An open-write contract of padded, encrypted messages. Parameters: the Ghost Key's public key. | Network. |
 | **Inbox encryption key** | A long-term X25519 key per Ghost Key. Public half published in store details; secret half in the Harvest delegate. **Generated randomly on each device.** | Harvest delegate, `harvest:x25519_sk:{fp}`. |
@@ -193,7 +193,7 @@ erDiagram
 
     STORE ||--|| STORE_DETAILS : "signed, versioned"
     STORE ||--o{ LISTING : "signed"
-    STORE ||--o{ ORDER : "signed, max 500"
+    STORE ||--o{ ORDER : "signed, max 256"
     STORE_DETAILS }o--|| REPUTATION : "names its id"
     STORE_DETAILS }o--|| INBOX_KEY : "publishes public half"
 

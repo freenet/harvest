@@ -427,7 +427,7 @@ fn apply_published_floor(
 /// How many indices one call's scan may derive (#206). Each is a public-key
 /// derivation, about 3.2 million units of the node's fuel, so this is about a
 /// third of a call. A device whose counter is far behind its published orders
-/// (a new device for a busy key; a store holds up to 500 orders) catches up
+/// (a new device for a busy key; a store holds up to 256 orders) catches up
 /// over several calls, the cursor saved after each, rather than in one call
 /// the node would stop.
 pub(crate) const FLOOR_SCAN_BUDGET: u32 = 384;

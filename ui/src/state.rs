@@ -35379,6 +35379,44 @@ mod buy_flow_tests {
         assert_eq!(state.complaint_refusal(STORE, &purchase), None);
     }
 
+    /// Step 2 (the overseer, 2026-10-09): an honest payment past the store's
+    /// byte bound for a `Paid` record reads paid to the buyer too. The store
+    /// holds the order's unpaid terms (`store::as_kept`); the buyer's node
+    /// proves the payment, keeps the paid copy, shows it paid, offers no
+    /// Cancel, and can complain with it. Red if the buyer's view or the
+    /// upgrade held the paid copy to the store's bound.
+    #[test]
+    fn a_payment_past_the_store_bound_still_reads_paid_to_the_buyer() {
+        let (unpaid, claims, tip) = a_paid_order_with_fillers(|_| {}, 80);
+        let recognised = recognise_settling_bridge();
+        let (mut state, _) = buyer_after_acceptance(&unpaid);
+        state.test_guards.push(recognised);
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("ready to keep");
+        let keep = state.keep_requests.pop().expect("sent");
+        state.on_kept_purchases(vec![kept(&keep.order)]);
+        give_the_node_the_chain(&mut state, &unpaid, claims.clone(), tip.clone());
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        let as_kept = harvest_common::store::as_kept(paid.clone());
+        assert_eq!(as_kept.status, OrderStatus::AwaitingPayment, "precondition");
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![as_kept];
+
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+        assert!(
+            !harvest_common::store::paid_within_cap(&upgrade.order),
+            "past the store's bound"
+        );
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order), "paid");
+        assert!(!purchase.cancellable(), "a paid order is not cancelled");
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+    }
+
     /// **Fabricated `Paid` orders naming the buyer's receipt key** (R2-3):
     /// backed by a bridge this build does not recognise, or for 0 sats, they
     /// are not shown as paid, not kept, and offered no complaint. Red if the

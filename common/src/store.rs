@@ -602,7 +602,8 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
 /// on a node, a store of 500 paid orders and 512 listings was refused on
 /// PUT one time in three and on a one-listing delta every time, while 256
 /// listings with 500 orders fitted every run (2026-10-04 wall-time matrix).
-/// 128 leaves room for listings at the per-listing bound. The seller's own
+/// 128 leaves room for listings at the per-listing bound, and for paid
+/// records at [`MAX_PAID_ORDER_BYTES`] (see [`MAX_ORDERS`]). The seller's own
 /// delegate reads the whole store on every instant-checkout decision too,
 /// within one call's budget (`tests/delegate-budget`).
 pub const MAX_LISTINGS: usize = 128;
@@ -625,23 +626,27 @@ pub const MAX_LISTING_BYTES: usize = 32 * 1024;
 /// summary -- see `OrdersV1`'s `Summary`) would grow without bound. On
 /// overflow the oldest orders are dropped first: see `enforce_order_cap`.
 ///
-/// # Why 500
+/// # Why 256
 ///
 /// It is a bound on work, and has to hold for PAID orders, which cost
 /// nothing of value on signet. Every call validates every order's proof:
 /// on a node, a store of 1,000 paid orders took 3 to 4 s to PUT and 4 to 6
 /// s for a one-listing delta against the node's 5 s limit, and every PUT of
-/// 4,096 was refused; 500 fitted every run with up to 256 listings
-/// (2026-10-04 wall-time matrix, chosen with [`MAX_LISTINGS`]).
+/// 4,096 was refused. 500 fitted every run with ordinary proofs, but a paid
+/// record may take up to [`MAX_PAID_ORDER_BYTES`] (8 KiB), and with every
+/// order at that bound and [`MAX_LISTINGS`] full at 32 KiB, 384 orders took
+/// up to 3.1 s to PUT and 4.5 s for a one-listing delta, while 256 took at
+/// most 1.8 s and 2.2 s, every run (2026-10-09 wall-time runs, step 2).
 ///
 /// The store is the place an order lives while it is acted on: paid, sent,
 /// and complained about (Ian, 2026-10-09: the store holds an order until
 /// its complaint window closes, and history then lives in each side's
-/// delegate). With honest traffic 500 orders outlast that window up to about
-/// 24 instant orders a day; under Buy-now spam (100 a day, see
-/// `enforce_order_cap`) an order rolls off after about 5 days, which is why
-/// the seller's and the buyer's delegates each keep their own copies.
-pub const MAX_ORDERS: usize = 500;
+/// delegate). With honest traffic 256 orders outlast that window (about 21
+/// days) up to about 12 instant orders a day; under Buy-now spam (100 a
+/// day, see `enforce_order_cap`) an order rolls off after about 2.5 days,
+/// which is why the seller's and the buyer's delegates each keep their own
+/// copies.
+pub const MAX_ORDERS: usize = 256;
 
 /// Small state-change fingerprint for one order, used only to let
 /// [`OrdersV1::delta`] detect a same-rank content change (see that impl's
@@ -830,8 +835,8 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// are: instant checkout makes the seller's delegate sign an order for any
 /// Buy now, which needs no Ghost Key and no payment, up to the delegate's
 /// limits (100 a day per store). So anyone can push old orders out, at
-/// about 100 a day: at `MAX_ORDERS` 500, a paid order can roll off about 5
-/// days after it was made. An instant-checkout answer is dated by its
+/// about 100 a day: at `MAX_ORDERS` 256, a paid order can roll off about
+/// 2.5 days after it was made. An instant-checkout answer is dated by its
 /// buyer's `requested_at`; the seller's delegate answers only one within a
 /// day of its own clock, and a seller answering by hand is refused one
 /// further off.
@@ -1074,10 +1079,11 @@ impl OrdersV1 {
 /// the transactions behind it: 32 needed outpoints of 64 KB transactions
 /// each come to the 256 KiB `MAX_PROOF_CLAIM_BYTES` allows, and on signet
 /// such transactions cost nothing. Sized by measurement (step 2's wall-time
-/// and contract-budget runs) as the largest power of two from 16 to 64 KiB
-/// at which a store of `MAX_ORDERS` paid orders at this bound and
-/// `MAX_LISTINGS` listings at theirs stays well under the node's 50 MiB and
-/// within its time limit. Before mainnet (harvest#134): an exchange's
+/// runs): with 500 paid orders at 16, 32 or 64 KiB and `MAX_LISTINGS`
+/// listings at theirs, the node's calls ran past its time limit; at 8 KiB
+/// they fitted, and `MAX_ORDERS` was then lowered to keep every call within
+/// about 2.5 s. An ordinary payment fits: a segwit spend of 20 inputs, or a
+/// legacy one of 9 (`the_paid_byte_bound_admits_ordinary_payments`). Before mainnet (harvest#134): an exchange's
 /// batched withdrawal straight to an order's address is a legitimate payment
 /// whose transaction can pass it; the store then keeps the order unpaid and
 /// the seller's and buyer's own copies hold it as paid.

@@ -18,7 +18,7 @@
 //!   notification marks one paid or drops one cancelled here, so neither
 //!   ever decodes the larger stages (the delegate budget's full-book row
 //!   measured that at 91% of a call). An order marked paid here stays until
-//!   the next tab call or wake-up moves it on ([`promote`]); it is listed,
+//!   the next tab call or wake-up moves it on (`Book::promote`); it is listed,
 //!   and shown, as paid meanwhile.
 //! * `open`: paid orders not yet sent, at most [`MAX_SELLER_UNSENT_KEPT`],
 //!   with the minimal proof once the tab supplies it. A paid order is never

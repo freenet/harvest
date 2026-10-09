@@ -2318,6 +2318,28 @@ fn book_calls(
         format!("harvest:seller_orders:unpaid:{key}").into_bytes(),
         cbor(&marked),
     );
+    // The paid, unsent stage with room for every one of them, so the
+    // wake-up moves them all and leaves it full (with no room, they would
+    // stay where they are, named as refused).
+    let room = harvest_common::delegate::MAX_SELLER_UNSENT_KEPT
+        .checked_sub(marked_len)
+        .ok_or_else(|| anyhow!("more unpaid orders than the paid stage holds"))?;
+    let open: Vec<_> = paid_unsent
+        .iter()
+        .skip(SELLER_ORDERS_PER_CALL)
+        .take(room)
+        .cloned()
+        .collect();
+    if open.len() != room {
+        bail!(
+            "the book holds {} paid unsent orders, not {room}",
+            open.len()
+        );
+    }
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:open:{key}").into_bytes(),
+        cbor(&OpenBook { orders: open }),
+    );
     let mut wakeup = vec![0x09, 0, 0, 0];
     wakeup.extend_from_slice(&9u64.to_le_bytes());
     wakeup.extend_from_slice(b"heartbeat");
@@ -2335,8 +2357,11 @@ fn book_calls(
         .transpose()
         .context("the unpaid stage is not CBOR")?
         .unwrap_or_default();
-    if left.len() >= marked_len {
-        bail!("the wake-up moved nothing on from the unpaid stage");
+    if left
+        .iter()
+        .any(|o| o.order.status != harvest_common::payment::OrderStatus::AwaitingPayment)
+    {
+        bail!("the wake-up left a paid order in the unpaid stage");
     }
     Ok(())
 }
@@ -3110,7 +3135,7 @@ fn held_key(r: &Runner, key: &[u8]) -> Result<Option<String>> {
     }
 }
 
-/// A new device: a key that is not the active one, entered with a store's
+/// A new device: a key that is not the active one, entered with its stores'
 /// published scripts held. Its scan runs in the pending slot, the active
 /// key going on handing out addresses meanwhile, and only once complete is
 /// it made active (#216). Then the stale case: a tab resuming a key's
@@ -3133,9 +3158,17 @@ fn pending_key(r: &mut Runner) -> Result<()> {
     let chain = bip32::AccountXpub::parse(&new)
         .and_then(|a| a.external_chain())
         .map_err(|e| anyhow!("derive the new key's chain: {e}"))?;
+    // More scripts than one call scans, in whole stores: since step 2 one
+    // store's `MAX_ORDERS` fits in a single call's `FLOOR_SCAN_BUDGET`, so
+    // the new device that takes more than one call is a key with several.
     let per_store = harvest_common::store::MAX_ORDERS;
-    let label = format!("{per_store} published scripts, a new key");
-    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, true)?;
+    let budget = delegate_u32("bitcoin.rs", "FLOOR_SCAN_BUDGET")? as usize;
+    let scripts = per_store * (budget / per_store + 1);
+    let label = format!(
+        "{scripts} published scripts, a new key ({} full stores)",
+        scripts / per_store
+    );
+    feed(r, &label, &scripts_at(&chain, 0..scripts as u32)?, true)?;
     let set = |xpub: &str, resume: bool| {
         cbor(&BitcoinDelegateRequest::SetPaymentXpub {
             request_id: 415,
@@ -3156,7 +3189,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         &set(&new, false),
         &set(&new, true),
         "PaymentXpubSet",
-        per_store,
+        scripts,
         Some(1),
         &mut stood,
     )?
@@ -3176,13 +3209,13 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         &set(&new, true),
         &set(&new, true),
         "PaymentXpubSet",
-        per_store,
+        scripts,
         None,
         &mut stood,
     )?
     .ok_or_else(|| anyhow!("{name}: never finished"))?;
     let count = field(&done, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
-    if *count != Value::Integer((per_store as u64).into())
+    if *count != Value::Integer((scripts as u64).into())
         || held_key(r, XPUB_KEY)?.as_deref() != Some(new.as_str())
         || held_key(r, XPUB_PENDING_KEY)?.is_some()
     {
@@ -3197,7 +3230,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
     // has no published scripts, so it is made active at once), then tab A
     // asks again.
     r.host.state.secrets = snapshot.clone();
-    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, false)?;
+    feed(r, &label, &scripts_at(&chain, 0..scripts as u32)?, false)?;
     r.quiet_send(&set(&new, false))?;
     r.app(
         "SetPaymentXpub (another new key, entered in another tab)",

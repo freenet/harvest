@@ -132,7 +132,7 @@ pub(crate) const MAX_HELD: usize = crate::store_keys::MAX_STORE_KEYS * PUBLISHED
 
 /// How many published scripts the list allows for each store. It bounds the
 /// list's churn, not what one store shows: it was the store's order cap
-/// (4096) until step 2 lowered that to 500, and is kept where it was, so a
+/// (4096) until step 2 lowered that to 256, and is kept where it was, so a
 /// script a store has pruned stays remembered for as long as before
 /// (split-investigation section 4).
 pub(crate) const PUBLISHED_PER_STORE: usize = 4096;

@@ -1,7 +1,7 @@
 //! The seller's own copy of its orders, as this tab reads and fills it
 //! (step 2; the delegate's `seller_orders`).
 //!
-//! The store keeps its newest 500 orders and the mailbox its newest 512
+//! The store keeps its newest 256 orders and the mailbox its newest 512
 //! messages, so a paid order not yet sent, or the request with its ship-to,
 //! can roll off either. The seller's delegate keeps a book per store key:
 //! instant checkout writes each order it signs with its request; this tab

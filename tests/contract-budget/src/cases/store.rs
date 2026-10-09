@@ -2,7 +2,7 @@
 //!
 //! What `harvest_common::store` bounds, and what this fixture puts there:
 //!
-//! * **Orders: [`MAX_ORDERS`] (500)**, every one `Paid` with a genuine SPV
+//! * **Orders: [`MAX_ORDERS`] (256)**, every one `Paid` with a genuine SPV
 //!   payment proof, the status whose `verify` costs the most (the seller's
 //!   signature on the terms, then the bridge's signed tip, the bridge's
 //!   signed claim and the SPV proof inside it). Each is an instant-checkout
@@ -15,7 +15,7 @@
 //!   on the minimal proof (`store::as_kept`). The padding case below
 //!   measures what a padded `Paid` costs on arrival.
 //! * **Despatches: one per order** (they are kept only while their order is,
-//!   so the order cap is theirs): 500.
+//!   so the order cap is theirs): 256.
 //! * **Backing slots: `MAX_BACKINGS` (64)** Ghost Keys, each backing carrying
 //!   a certificate of `MAX_CERTIFICATE_PEM_BYTES` (4096). Half are retired,
 //!   which is how a store reaches the bound in practice (rotation keeps the

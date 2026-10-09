@@ -3317,7 +3317,7 @@ fn signed_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
     }
 }
 
-/// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (500). A
+/// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (256). A
 /// predecessor generation that holds 4096 orders is folded, not refused: the
 /// fold keeps the newest `MAX_ORDERS` by `created_at` and carries every one
 /// of its listings, and the result is a state this generation's contract

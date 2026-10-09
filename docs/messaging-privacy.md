@@ -404,7 +404,7 @@ withdrawn listing stays in it until that cut takes it), so an order stays matche
 leaves the bounded mailbox, even if the mailbox is flooded to evict it. What
 can close it: the request gone AND the listing not in the store's listings
 (a store whose listings did not come across a migration, or whose cap cut the listing), the order pruned
-from the store by its order cap (`MAX_ORDERS`, 500, oldest out; Buy now orders at 100 a day can roll an order off in about 5 days), or the store's copy of
+from the store by its order cap (`MAX_ORDERS`, 256, oldest out; Buy now orders at 100 a day can roll an order off in about 2.5 days), or the store's copy of
 the order dropping from `Paid`. Then the seller's inbox holds the buyer's
 plain text back, and says it could not match it to a paid order.
 

@@ -145,12 +145,11 @@ caps. The module docs in `src/cases/` say what is at which cap and why.
     ordering the contract applies then falls through to the entry digest,
     which a build that hashes per comparison recomputes on every
     comparison.
-* **Store** (`cases/store.rs`): `MAX_ORDERS` paid orders (500; 4096 until step 2's
-  round 2), each with a
+* **Store** (`cases/store.rs`): `MAX_ORDERS` paid orders (256; 4096 until step 2), each with a
   genuine one-claim SPV payment proof and one despatch; 64 backing slots
   (`MAX_BACKINGS`) at the 4096-byte certificate cap, 32 retired and 32 with
   `MAX_SCOPES_PER_BACKER` copies; the closure; the pause; `MAX_LISTINGS`
-  listings (128; 512 until step 2's round 2) each at `MAX_LISTING_BYTES` (32 KiB) with every field at
+  listings (128; 512 until step 2) each at `MAX_LISTING_BYTES` (32 KiB) with every field at
   its largest (8 photos, full choices and regions) and the description
   padded to the bound. Every state stays under the node's 50 MiB
   `MAX_STATE_SIZE`. Delta: one new listing, the newest, as the UI sends it.
@@ -226,7 +225,9 @@ call is a `::warning::` naming the issue that will make it gate, and the run
 does not fail on it.
 
 * The store gates once harvest#230 (store caps and byte strings) is fixed;
-  its target is both store cases under 100% at the new caps.
+  its target is both store cases under 100% at the new caps. At 256 orders
+  `validate_state` is still 293% to 338% (see "The store at step 2's caps"),
+  so it does not gate yet.
 * Reputation gates once harvest#228 is fixed.
 
 Making a contract gate is part of the change that brings it within budget.
@@ -349,7 +350,7 @@ What these say:
   integer arrays (the 3.3 MiB of ciphertext is a 6.7 MB state), and
   `dedupe_identical_entries` sorting with `sort_by_key(entry_digest)`, which
   re-hashes every message on each comparison.
-* **The store** at its caps (4096 orders when measured; 500 since step 2's round 2) is a state of about 41 MB, 34 MB of it the 4096
+* **The store** at its caps (4096 orders when measured; 256 since step 2) is a state of about 41 MB, 34 MB of it the 4096
   paid orders, whose byte fields are CBOR integer arrays too. Every call is
   10 to 36 times over, and the full-state merge runs out of the node's 256
   MiB of WASM memory inside `StoreStateV1::apply_delta` (cloning the
@@ -368,15 +369,53 @@ What these say:
 
 ## The store at step 2's caps
 
-Step 2 (`feat/store-pause-one-backup`) caps a store's listings (first 512, and
-128 since round 2 of step 2, each at most 32 KiB as encoded), writes every signed record's signed payload and
+Step 2 (`feat/store-pause-one-backup`) caps a store's listings (first 512, then
+128, each at most 32 KiB as encoded), writes every signed record's signed payload and
 signature as a CBOR byte string, verifies each payment proof's signed tip once
 per distinct tip, and has `is_canonical_cbor` compare without copying the
 state. The store fixture follows: the capped number of listings at the per-listing
-bound, every field at its largest, and the pause. One run, store case only
-(report-only). **The table below was measured at the former caps (4096 paid
-orders, 512 listings); round 2 lowered them to 500 and 128, and the figures
-are refreshed in that round:**
+bound, every field at its largest, and the pause. Store case only
+(report-only), budget 2.2 billion fuel a call.
+
+**At the current caps** (256 paid orders, 128 listings; store wasm blake3
+`a4cf4e03`), as percentages of the budget:
+
+| case | call | of budget |
+|---|---|---:|
+| 256 orders at caps + one-listing delta | `update_state` | 36.8% |
+| | `validate_state` (merged) | **322.0%, over (WARN)** |
+| | `summarize_state` | 39.3% |
+| | `get_state_delta` (co-host) | 39.6% |
+| | `get_state_delta` (new subscriber) | 33.3% |
+| 256 orders at caps + another at-caps state | `validate_state` (incoming) | **322.0%, over** |
+| | `update_state` | **286.6%, over** |
+| | `validate_state` (merged) | **325.7%, over** |
+| | `summarize_state` | 39.8% |
+| | `get_state_delta` (co-host) | 36.4% |
+| | `get_state_delta` (new subscriber) | 33.8% |
+| | `update_state` (idempotency probe) | **175.3%, over** |
+| 256 Paid orders of 8 KiB (`MAX_PAID_ORDER_BYTES`) + one-listing delta | `update_state` | 42.5% |
+| | `validate_state` (merged) | **338.1%, over** |
+| | `summarize_state` | 45.6% |
+| | `get_state_delta` (co-host) | 45.9% |
+| | `get_state_delta` (new subscriber) | 39.0% |
+| 256 orders at caps + 64 Paid padded to 256 KiB (kept unpaid) | `update_state` | **450.9%, over** |
+| | `validate_state` | **293.1%, over** |
+| | `summarize_state` | 34.0% |
+| | `get_state_delta` (co-host) | 33.9% |
+| | `get_state_delta` (new subscriber) | 28.6% |
+
+No call in these states ran out of memory. The delta and summary calls are
+within budget in every one; `validate_state` (and the full-state
+`update_state`) is over. The case stays report-only, so each is a warning and
+the run does not fail on it. Fuel is not the node's limit, which is wall
+clock: with 256 orders at the 8 KiB bound and 128 listings full at 32 KiB,
+a PUT took at most 1.82 s and a one-listing delta at most 2.15 s, and a
+merge under 2 s a call, in 3 of 3 runs (the wall-time runs that chose the
+caps, recorded in the `# Why 256` note on `harvest_common::store::MAX_ORDERS`).
+
+**Measured at the former caps** (4096 paid orders, 512 listings), kept for
+comparison:
 
 | case | call | fuel | of budget |
 |---|---|---:|---:|
