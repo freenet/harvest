@@ -93,6 +93,15 @@ impl crate::backing::SignedRecord for AuthorizedDespatch {
     const WHAT: &'static str = "despatch";
 }
 
+/// How many blocks after payment the seller has to send: about a week.
+/// Shared by the app's order stages and the seller's delegate, which drops a
+/// sent order's ship-to once its complaint window has closed.
+pub const DESPATCH_WINDOW_BLOCKS: u32 = 1008;
+
+/// How many blocks a buyer has to complain, from the later of the despatch
+/// deadline and the despatch's own anchor: about two weeks.
+pub const COMPLAINT_WINDOW_BLOCKS: u32 = 2016;
+
 /// Every despatch a store holds, one per order it still holds.
 ///
 /// Bounded by the store's own order cap: a despatch is kept only while its

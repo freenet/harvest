@@ -980,6 +980,7 @@ mod tests {
                 status_signature: None,
             },
             complaint: None,
+            despatch: None,
             backed_up: false,
         };
         let purchases: Vec<KeptPurchase> = (0..2).map(kept).collect();
@@ -1106,6 +1107,7 @@ mod tests {
                 status_signature: None,
             },
             complaint: None,
+            despatch: None,
             backed_up,
         };
         state.kept_purchases = vec![kept(&order, false), kept(&other, true)];

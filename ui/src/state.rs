@@ -7552,6 +7552,7 @@ impl AppState {
                         conversation: kept.conversation,
                         order,
                         complaint: None,
+                        despatch: None,
                     },
                 ))
             })
@@ -7648,6 +7649,7 @@ impl AppState {
                 conversation: purchase.conversation,
                 order,
                 complaint: None,
+                despatch: None,
             },
         );
         Ok(())
@@ -11899,6 +11901,7 @@ impl AppState {
                 conversation: parts.conversation,
                 order: complaint.order.clone(),
                 complaint: Some(harvest_common::delegate::KeptComplaint::of(&complaint)),
+                despatch: None,
             },
         );
         Ok(())
@@ -34453,6 +34456,7 @@ mod buy_flow_tests {
                 .to_bytes(),
             order: order.clone(),
             complaint: None,
+            despatch: None,
             backed_up: false,
         }
     }
@@ -34578,6 +34582,7 @@ mod buy_flow_tests {
                 conversation: the_buyers_conversation().buyer_public_key,
                 order: unpaid.clone(),
                 complaint: None,
+                despatch: None,
             }]
         );
         state

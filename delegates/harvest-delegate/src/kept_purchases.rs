@@ -158,6 +158,21 @@ fn conversation_seed<S: SecretStore>(store: &S, conversation: &[u8; 32]) -> Opti
         .map(|secret| harvest_common::mailbox::buyer_receipt_seed_from_secret(&secret))
 }
 
+/// Whether `despatch` is the store key's statement about `order`.
+fn despatch_checks(
+    store_key: &[u8; 32],
+    order: &harvest_common::payment::OrderId,
+    despatch: &harvest_common::fulfilment::AuthorizedDespatch,
+) -> Result<(), String> {
+    let key = VerifyingKey::from_bytes(store_key)
+        .map_err(|e| format!("{} is not an Ed25519 store key: {e}", hex_lower(store_key)))?;
+    despatch.verify(&key)?;
+    if despatch.despatch.order_id != *order {
+        return Err("the despatch is about another order".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> HarvestDelegateResponse {
     let order_id = keep.order.order.id.clone();
     let key = kept_purchase_key(&order_id.0);
@@ -184,6 +199,14 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
             }
         },
     };
+    // The store's despatch of it (step 2): the store key's, about this
+    // order, or the keep is refused.
+    if let Some(despatch) = &keep.despatch {
+        if let Err(why) = despatch_checks(&keep.store_key, &order_id, despatch) {
+            return refuse(&order_id, why);
+        }
+    }
+    let despatch = keep.despatch;
     let offered = KeptPurchase {
         store_key: keep.store_key,
         conversation: keep.conversation,
@@ -192,6 +215,7 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
         complaint: keep.complaint,
         // A new or upgraded copy is not in any backup yet.
         backed_up: false,
+        despatch: despatch.clone(),
     };
 
     let next = match held {
@@ -212,7 +236,10 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
         }
         Some(held) => match (held.order.status, offered.order.status) {
             // The upgrade: the buyer's node has seen it paid.
-            (OrderStatus::AwaitingPayment, OrderStatus::Paid) => offered,
+            (OrderStatus::AwaitingPayment, OrderStatus::Paid) => KeptPurchase {
+                despatch: offered.despatch.or(held.despatch),
+                ..offered
+            },
             // A paid copy stays as it is, but may gain the filed complaint,
             // once, about that very copy.
             // Not in any backup made before it (round 1 of step 2's review:
@@ -221,9 +248,14 @@ pub(crate) fn keep<S: SecretStore>(store: &mut S, keep: PurchaseToKeep) -> Harve
                 KeptPurchase {
                     complaint: offered.complaint,
                     backed_up: false,
+                    despatch: held.despatch.or(despatch),
                     ..held
                 }
             }
+            // The despatch the store shows, which this copy lacks: added,
+            // and the copy stays as it is otherwise, its backup mark too
+            // (`KeptPurchase::despatch`).
+            _ if held.despatch.is_none() && despatch.is_some() => KeptPurchase { despatch, ..held },
             // Anything else keeps what is held: a second unpaid copy, an
             // unpaid copy of a paid order, another paid copy (a kept paid
             // copy is never replaced: revision 4 of
@@ -288,10 +320,32 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
                 record.order.status == OrderStatus::Paid,
             )
         };
+        // A despatch the held copy lacks is added (step 2), whatever else.
+        let gains_despatch = held.despatch.is_none()
+            && incoming
+                .despatch
+                .as_ref()
+                .is_some_and(|d| despatch_checks(&held.store_key, &held.order.order.id, d).is_ok());
+        let with_despatch = |store: &mut S, held: KeptPurchase| -> SecretImport {
+            let next = KeptPurchase {
+                despatch: incoming.despatch.clone(),
+                ..held
+            };
+            match to_cbor(&next) {
+                Ok(bytes) if store.set_secret(key, &bytes) => SecretImport::Written,
+                _ => SecretImport::Retryable("the node refused to save the purchase".into()),
+            }
+        };
         if held.complaint.is_some() || completeness(&incoming) <= completeness(&held) {
+            if gains_despatch {
+                return with_despatch(store, held);
+            }
             return SecretImport::AlreadyAuthoritative;
         }
         if held.order.status == OrderStatus::Paid && held.order != incoming.order {
+            if gains_despatch {
+                return with_despatch(store, held);
+            }
             return SecretImport::AlreadyAuthoritative;
         }
         return if store.set_secret(key, &bytes) {
@@ -540,6 +594,7 @@ pub(crate) mod fixtures {
             conversation: conversation(c),
             order: authorized(&store_signing_key(), order(n, c), status, proof_seed),
             complaint: None,
+            despatch: None,
         }
     }
 
@@ -932,6 +987,56 @@ mod tests {
         ));
         assert_eq!(purchases(list(&successor)), vec![kept]);
         assert_eq!(successor.get_secret(&key), Some(current));
+    }
+
+    /// Step 2 (the buyer's side of "history lives in each side's
+    /// delegate"): the store's despatch of a kept order is added to the
+    /// kept copy, without clearing its backup mark, and carried by a
+    /// migration (or a restore) into a copy that lacks it; one the store
+    /// key did not sign, or about another order, is refused. Mutated red by
+    /// dropping the despatch arm, and by clearing the mark.
+    #[test]
+    fn the_stores_despatch_is_kept_with_the_purchase() {
+        use crate::seller_orders::tests::despatch;
+        let mut secrets = holding(1);
+        let paid = purchases(keep(&mut secrets, to_keep(1, 1, OrderStatus::Paid, 1))).remove(0);
+        let key = kept_purchase_key(&paid.order.order.id.0);
+        // Marked as in a backup.
+        let mut marked = paid.clone();
+        marked.backed_up = true;
+        secrets.set_secret(&key, &to_cbor(&marked).unwrap());
+        let sent = despatch(&paid.order, 120);
+        let with = purchases(keep(
+            &mut secrets,
+            PurchaseToKeep {
+                despatch: Some(sent.clone()),
+                ..to_keep(1, 1, OrderStatus::Paid, 1)
+            },
+        ))
+        .remove(0);
+        assert_eq!(with.despatch, Some(sent.clone()));
+        assert!(with.backed_up, "the mark stays");
+        assert_eq!(with.backup_digest(), paid.backup_digest());
+
+        // About another order: refused.
+        let other = despatch(&to_keep(2, 1, OrderStatus::Paid, 1).order, 120);
+        let (_, why) = refusal(keep(
+            &mut secrets,
+            PurchaseToKeep {
+                despatch: Some(other),
+                ..to_keep(1, 1, OrderStatus::Paid, 1)
+            },
+        ));
+        assert!(why.contains("another order"), "{why}");
+
+        // Carried into a copy that lacks it.
+        let mut successor = holding(1);
+        keep(&mut successor, to_keep(1, 1, OrderStatus::Paid, 1));
+        assert!(matches!(
+            import(&mut successor, &key, &secrets.get_secret(&key).unwrap()),
+            SecretImport::Written
+        ));
+        assert_eq!(purchases(list(&successor))[0].despatch, Some(sent));
     }
 
     /// No complaint is kept about an unpaid order.

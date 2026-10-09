@@ -1745,6 +1745,7 @@ mod tests {
                 receipt_seed: [0; 32],
                 order: kept_order,
                 complaint: None,
+                despatch: None,
                 backed_up: false,
             });
         let kept = ComplaintTarget::Kept {

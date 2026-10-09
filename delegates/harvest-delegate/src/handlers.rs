@@ -68,6 +68,9 @@ pub(crate) fn all_secret_key_shapes(fp: &str) -> Vec<Vec<u8>> {
         crate::published_set::PUBLISHED_META_KEY.to_vec(),
         crate::published_set::CURSOR_ACTIVE_KEY.to_vec(),
         crate::published_set::CURSOR_PENDING_KEY.to_vec(),
+        crate::seller_orders::open_key(&[9u8; 32]),
+        crate::seller_orders::done_key(&[9u8; 32]),
+        crate::seller_orders::SWEEP_CURSOR_KEY.to_vec(),
     ]
 }
 
@@ -252,6 +255,19 @@ pub fn handle<S: SecretStore + RemovableSecrets>(
             conversations,
             orders,
         } => crate::backup::mark(store, request_id, conversations, orders),
+
+        // The seller's own order book (step 2). Gated as the rest: a book
+        // holds buyers' addresses.
+        HarvestDelegateRequest::KeepSellerOrders {
+            request_id,
+            store_key,
+            orders,
+        } => crate::seller_orders::keep(store, request_id, store_key, orders),
+        HarvestDelegateRequest::ListSellerOrders {
+            request_id,
+            store_key,
+            after,
+        } => crate::seller_orders::list(store, request_id, store_key, after),
 
         // Backup. The export answers the secrets themselves, so its need for
         // the gate is obvious. `MarkConversationsBackedUp` is the one whose

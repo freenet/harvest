@@ -346,6 +346,31 @@ pub enum HarvestDelegateRequest {
         orders: Vec<(crate::payment::OrderId, [u8; 32])>,
     },
 
+    /// Keep these orders in the seller's own book for the store
+    /// `store_key` (step 2; see [`SellerKeptOrder`]): at most
+    /// [`SELLER_ORDERS_PER_CALL`] a call, each checked as the store would
+    /// keep it (it verifies against `store_key`, a `Paid` carries the
+    /// minimal proof or is kept unpaid, a despatch is the store key's). Only
+    /// for a store whose key this node holds. Merged with what is held:
+    /// nothing held is lost. A paid order not yet sent past
+    /// [`MAX_SELLER_UNSENT_KEPT`] is not kept and is named in the book's
+    /// `paid_refused`. Answered with
+    /// [`HarvestDelegateResponse::SellerOrdersKept`].
+    KeepSellerOrders {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        orders: Vec<SellerKeptOrder>,
+    },
+
+    /// One page of the seller's book for `store_key`, by order id after
+    /// `after`, about [`SELLER_ORDERS_PAGE_BYTES`] a page. Answered with
+    /// [`HarvestDelegateResponse::SellerOrders`].
+    ListSellerOrders {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        after: Option<crate::payment::OrderId>,
+    },
+
     // === Listing Management ===
     /// Create and sign a new listing using the seller's ghostkey.
     CreateListing {
@@ -886,6 +911,11 @@ pub struct PurchaseToKeep {
     /// order, and only once.
     #[serde(default)]
     pub complaint: Option<KeptComplaint>,
+    /// The seller's despatch of it, as the store showed it (step 2): kept
+    /// so the order still reads as sent once the store's cap has dropped
+    /// it. Skipped when absent, so a keep without one encodes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub despatch: Option<crate::fulfilment::AuthorizedDespatch>,
 }
 
 /// A buyer's kept copy of one of their orders, as the delegate holds and
@@ -917,7 +947,99 @@ pub struct KeptPurchase {
     /// so a record without it encodes exactly as before the field existed.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub backed_up: bool,
+    /// See [`PurchaseToKeep::despatch`]. Added to a held copy without
+    /// clearing `backed_up`: it is what the store showed, not the buyer's
+    /// evidence, so a backup without it still restores everything a
+    /// complaint needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub despatch: Option<crate::fulfilment::AuthorizedDespatch>,
 }
+
+/// The buyer's request behind an order the seller keeps (step 2): what to
+/// send, and where. Each text is cut to [`MAX_KEPT_REQUEST_TEXT`] bytes.
+/// Prints its ship-to and note as `redacted`: a buyer's address does not
+/// belong in a log.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct KeptRequest {
+    pub listing_id: crate::listing::ListingId,
+    pub quantity: u32,
+    pub shipping: String,
+    pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// The buyer's conversation (its routing tag), where the request came.
+    pub conversation: [u8; 32],
+}
+
+impl core::fmt::Debug for KeptRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeptRequest")
+            .field("listing_id", &self.listing_id)
+            .field("quantity", &self.quantity)
+            .field("shipping", &Redacted)
+            .field("note", &Redacted)
+            .field("region", &self.region)
+            .field("choices", &self.choices)
+            .field("conversation", &self.conversation)
+            .finish()
+    }
+}
+
+/// One of the seller's own orders as its delegate keeps it (step 2), so an
+/// order that rolls off the store never vanishes from the seller's list.
+/// See `harvest-delegate`'s `seller_orders`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SellerKeptOrder {
+    /// The order: its terms and the store key's signature, its status as
+    /// last seen, and once paid the minimal proof, when the tab has
+    /// supplied it.
+    pub order: crate::payment::AuthorizedOrder,
+    /// The buyer's request, while it is kept: dropped once a sent order's
+    /// complaint window has closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<KeptRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub despatch: Option<crate::fulfilment::AuthorizedDespatch>,
+    /// The block the payment confirmed at, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_height: Option<u32>,
+    /// The despatch was recorded only here: the store no longer held the
+    /// order, and drops a despatch whose order it does not hold.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub sent_off_store: bool,
+}
+
+/// One page of a seller's book
+/// ([`HarvestDelegateRequest::ListSellerOrders`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SellerOrdersPage {
+    pub orders: Vec<SellerKeptOrder>,
+    /// Where the next page starts; `None` when this was the last.
+    pub next: Option<crate::payment::OrderId>,
+    /// Paid orders not yet sent that the book could not keep, being full
+    /// (on the first page only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paid_refused: Vec<crate::payment::OrderId>,
+}
+
+/// The most bytes of each text in a [`KeptRequest`].
+pub const MAX_KEPT_REQUEST_TEXT: usize = 2048;
+/// The most unpaid orders a seller's book keeps per store: the oldest go.
+pub const MAX_SELLER_UNPAID_KEPT: usize = 128;
+/// The most paid orders not yet sent a seller's book keeps per store. One
+/// past it is never evicted for, nor evicts: it is named in
+/// [`SellerOrdersPage::paid_refused`] and the seller is told.
+pub const MAX_SELLER_UNSENT_KEPT: usize = 512;
+/// The most sent orders a seller's book keeps per store, the newest.
+pub const MAX_SELLER_SENT_KEPT: usize = 1024;
+/// The most stores whose books one node keeps.
+pub const MAX_SELLER_BOOKS: usize = 16;
+/// The most orders one [`HarvestDelegateRequest::KeepSellerOrders`] takes.
+pub const SELLER_ORDERS_PER_CALL: usize = 48;
+/// About how many bytes one page of a seller's book carries.
+pub const SELLER_ORDERS_PAGE_BYTES: usize = 256 * 1024;
 
 /// One conversation in a purchases backup: what the buyer's node needs to
 /// read the thread again (the conversation's secret and the seller key it
@@ -979,8 +1101,11 @@ impl KeptPurchase {
     /// with `backed_up` cleared, so a copy that moved on after the export
     /// (paid, or a complaint filed) is not marked as backed up by it.
     pub fn backup_digest(&self) -> [u8; 32] {
+        // Without the despatch too, which a copy gains without leaving the
+        // backup it is in (see `despatch`).
         let unmarked = KeptPurchase {
             backed_up: false,
+            despatch: None,
             ..self.clone()
         };
         // A record that does not encode cannot have been exported either.
@@ -1004,6 +1129,7 @@ impl core::fmt::Debug for KeptPurchase {
             .field("order", &self.order)
             .field("complaint", &self.complaint)
             .field("backed_up", &self.backed_up)
+            .field("despatch", &self.despatch)
             .finish()
     }
 }
@@ -1215,6 +1341,21 @@ pub enum HarvestDelegateResponse {
     PurchasesBackupImported {
         request_id: RequestId,
         result: Result<Vec<BackupItemOutcome>, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::KeepSellerOrders`]: how many
+    /// were kept or changed.
+    SellerOrdersKept {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        result: Result<u32, String>,
+    },
+
+    /// The answer to [`HarvestDelegateRequest::ListSellerOrders`].
+    SellerOrders {
+        request_id: RequestId,
+        store_key: [u8; 32],
+        result: Result<SellerOrdersPage, String>,
     },
 
     /// The answer to [`HarvestDelegateRequest::MarkBackedUp`]: how many
@@ -2022,9 +2163,12 @@ mod tests {
             R::PurchasesBackup { .. } => (36, true),
             R::PurchasesBackupImported { .. } => (37, false),
             R::BackedUpMarked { .. } => (38, false),
+            R::SellerOrdersKept { .. } => (39, false),
+            // Buyers' ship-to addresses and notes.
+            R::SellerOrders { .. } => (40, true),
         }
     }
-    const RESPONSE_VARIANTS: usize = 39;
+    const RESPONSE_VARIANTS: usize = 41;
 
     /// Every request variant, as for [`classify_response`].
     fn classify_request(r: &HarvestDelegateRequest) -> (usize, bool) {
@@ -2078,9 +2222,12 @@ mod tests {
             // Conversation secrets and receipt seeds, restored.
             Q::ImportPurchasesBackup { .. } => (37, true),
             Q::MarkBackedUp { .. } => (38, false),
+            // Buyers' ship-to addresses and notes.
+            Q::KeepSellerOrders { .. } => (39, true),
+            Q::ListSellerOrders { .. } => (40, false),
         }
     }
-    const REQUEST_VARIANTS: usize = 39;
+    const REQUEST_VARIANTS: usize = 41;
 
     /// A valid Ed25519 verifying key for samples that need one.
     fn sample_key() -> ed25519_dalek::VerifyingKey {
@@ -2283,6 +2430,7 @@ mod tests {
                     receipt_seed: SECRET,
                     order: crate::test_orders::paid(1),
                     complaint: None,
+                    despatch: None,
                     backed_up: false,
                 }],
             },
@@ -2347,6 +2495,7 @@ mod tests {
                         receipt_seed: SECRET,
                         order: crate::test_orders::paid(1),
                         complaint: None,
+                        despatch: None,
                         backed_up: true,
                     }],
                     next: Some("harvest:kept_purchase:00".into()),
@@ -2392,6 +2541,7 @@ mod tests {
             conversation: [1u8; 32],
             order: crate::test_orders::paid(1),
             complaint: None,
+            despatch: None,
         }
     }
 
@@ -2690,6 +2840,7 @@ mod tests {
             receipt_seed: [0xff; 32],
             order: paid,
             complaint: Some(KeptComplaint::of(&complaint)),
+            despatch: None,
             backed_up: false,
         };
         let len = crate::to_cbor(&kept).expect("encodes").len();

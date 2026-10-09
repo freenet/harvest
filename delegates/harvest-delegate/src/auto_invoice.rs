@@ -2107,6 +2107,11 @@ fn on_store_change<S: SecretStore>(
         return out;
     }
     note_paid_scripts(secrets, &store);
+    // The seller's own book (step 2): an open order the store now shows
+    // paid, or cancelled before payment.
+    crate::seller_orders::on_store_statuses(secrets, &store_sk.verifying_key().to_bytes(), |id| {
+        store.orders.orders.get(id).map(|o| o.status)
+    });
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
         return out;
@@ -2482,7 +2487,8 @@ fn open_instant(
             order_binding,
             buyer_receipt_key,
             instant: Some(instant),
-            ..
+            shipping,
+            note,
         } if crate::messaging::is_canonical_tag(&tag) => Some((
             tag,
             from_seller,
@@ -2493,6 +2499,8 @@ fn open_instant(
                 order_binding,
                 buyer_receipt_key,
                 instant,
+                shipping,
+                note,
             },
         )),
         _ => None,
@@ -2506,6 +2514,10 @@ struct OpenedRequest {
     order_binding: [u8; 32],
     buyer_receipt_key: Option<[u8; 32]>,
     instant: InstantSelection,
+    /// Where to send it and the buyer's note: kept in the seller's own
+    /// book with the order it answers (step 2, `seller_orders`).
+    shipping: String,
+    note: String,
 }
 
 /// Whether a request made at `at_ms` (the buyer's clock) is within the day
@@ -3114,6 +3126,7 @@ pub(crate) fn decide<S: SecretStore>(
     };
     decided.statuses = settle(&mut ledger, store, Some(anchor.height), &store_sk, now_ms);
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
+    let mut kept: Vec<harvest_common::delegate::SellerKeptOrder> = Vec::new();
     // Counted once a run, not per request: up to MAX_ADDRESS_RUN
     // derivations each time. Every invoice this run adds one unpaid address
     // on top, and nothing else moves the counter.
@@ -3152,10 +3165,21 @@ pub(crate) fn decide<S: SecretStore>(
             now_ms,
         );
         match outcome {
-            Ok(Answer::Invoice { order, reply }) => {
+            Ok(Answer::Invoice {
+                order,
+                reply,
+                request,
+            }) => {
                 if let Some(request) = order.order.request_id {
                     decided.retry.push((digest, request));
                 }
+                kept.push(harvest_common::delegate::SellerKeptOrder {
+                    order: (*order).clone(),
+                    request: Some(*request),
+                    despatch: None,
+                    paid_height: None,
+                    sent_off_store: false,
+                });
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
                 decided.held_back.push(reply.clone());
@@ -3193,8 +3217,11 @@ pub(crate) fn decide<S: SecretStore>(
     }
     // Recorded before anything is published, as in `on_store_change`: an
     // order or decrement sent but not recorded would lose its hold, or be
-    // decremented again.
-    if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
+    // decremented again. The seller's own book first (step 2): an order
+    // published but not kept could roll off the store and leave nothing.
+    if !crate::seller_orders::keep_signed(secrets, &store_sk.verifying_key().to_bytes(), kept)
+        || !save_ledger(secrets, &arm.store_contract_id, &ledger)
+    {
         return Decided {
             undecided: true,
             ..Decided::default()
@@ -3244,6 +3271,8 @@ enum Answer {
     Invoice {
         order: Box<AuthorizedOrder>,
         reply: EncryptedMessage,
+        /// The request it answers, for the seller's own book.
+        request: Box<harvest_common::delegate::KeptRequest>,
     },
     Decline(EncryptedMessage),
 }
@@ -3473,6 +3502,15 @@ fn decide_one<S: SecretStore>(
     Ok(Answer::Invoice {
         order: Box::new(signed),
         reply,
+        request: Box::new(harvest_common::delegate::KeptRequest {
+            listing_id: request.listing_id.clone(),
+            quantity: request.quantity,
+            shipping: request.shipping.clone(),
+            note: request.note.clone(),
+            region: request.instant.region.clone(),
+            choices: request.instant.choices.clone(),
+            conversation: tag,
+        }),
     })
 }
 
@@ -5041,6 +5079,37 @@ mod tests {
         assert!(load_ledger(&f.secrets, &f.record.arm.store_contract_id)
             .sales
             .is_empty());
+    }
+
+    /// Step 2: an order instant checkout signs goes into the seller's own
+    /// book with the request it answers (the ship-to), with no tab open; a
+    /// store notification showing it paid marks it so. So an order that
+    /// rolls off the store, or a request a mailbox flood pushes out, still
+    /// leaves the seller what to send and where. Mutated red by not keeping
+    /// the signed orders, and by not marking paid.
+    #[test]
+    fn a_signed_order_and_its_ship_to_go_into_the_sellers_book() {
+        let mut f = fixture();
+        let decided = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.orders.len(), 1);
+        let store_key = store_sk().verifying_key().to_bytes();
+        let book = |f: &Fixture| match crate::seller_orders::list(&f.secrets, 1, store_key, None) {
+            HarvestDelegateResponse::SellerOrders {
+                result: Ok(page), ..
+            } => page.orders,
+            other => panic!("{other:?}"),
+        };
+        let kept = book(&f);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].order.order.id, decided.orders[0].order.id);
+        let request = kept[0].request.as_ref().expect("the request it answers");
+        assert!(!request.shipping.is_empty(), "with the ship-to");
+        assert_eq!(request.listing_id, jam().id);
+
+        publish(&mut f, &decided);
+        with_status(&mut f, &decided.orders[0].order.id, OrderStatus::Paid);
+        store_change(&mut f);
+        assert_eq!(book(&f)[0].order.status, OrderStatus::Paid);
     }
 
     /// A listing the store's cap has cut (step 2) has no stock to take off:

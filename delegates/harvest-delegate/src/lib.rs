@@ -17,6 +17,7 @@ mod node_glue;
 mod origin;
 mod published_set;
 mod secrets;
+mod seller_orders;
 mod store_keys;
 mod watch_delegation;
 
@@ -573,6 +574,7 @@ mod boundary_tests {
         use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
         harvest_common::delegate::PurchaseToKeep {
             complaint: None,
+            despatch: None,
             store_key: [1u8; 32],
             conversation: [2u8; 32],
             order: AuthorizedOrder {
