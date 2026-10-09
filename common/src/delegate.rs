@@ -2509,7 +2509,41 @@ mod tests {
                 request_id: 26,
                 result: Ok(2),
             },
+            R::SellerOrdersKept {
+                request_id: 27,
+                store_key: [3u8; 32],
+                result: Ok(1),
+            },
+            R::SellerOrders {
+                request_id: 28,
+                store_key: [3u8; 32],
+                result: Ok(SellerOrdersPage {
+                    orders: vec![seller_kept()],
+                    next: None,
+                    paid_refused: Vec::new(),
+                }),
+            },
         ]
+    }
+
+    /// A seller's kept order whose request carries the sentinel where a
+    /// buyer's address and note go.
+    fn seller_kept() -> SellerKeptOrder {
+        SellerKeptOrder {
+            order: crate::test_orders::paid(1),
+            request: Some(KeptRequest {
+                listing_id: crate::listing::ListingId([4u8; 32]),
+                quantity: 1,
+                shipping: SECRET_TEXT.into(),
+                note: SECRET_TEXT.into(),
+                region: None,
+                choices: Vec::new(),
+                conversation: [5u8; 32],
+            }),
+            despatch: None,
+            paid_height: None,
+            sent_off_store: false,
+        }
     }
 
     fn backup_conversation() -> BackupConversation {
@@ -2757,6 +2791,16 @@ mod tests {
                 request_id: 27,
                 conversations: vec![([3u8; 32], [1u8; 32])],
                 orders: vec![(crate::payment::OrderId([4u8; 32]), [5u8; 32])],
+            },
+            Q::KeepSellerOrders {
+                request_id: 28,
+                store_key: [3u8; 32],
+                orders: vec![seller_kept()],
+            },
+            Q::ListSellerOrders {
+                request_id: 29,
+                store_key: [3u8; 32],
+                after: None,
             },
         ]
     }

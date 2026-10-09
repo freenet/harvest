@@ -276,6 +276,25 @@ pub(crate) fn header_status(
     }
 }
 
+/// What an order's page says when only this device's own book still holds
+/// it (step 2): the store keeps its newest orders.
+pub(crate) const ONLY_HERE_LINE: &str = "Your store no longer lists this order, so it is kept on \
+     this device only. If you mark it as sent here, the buyer won\u{2019}t see that it was sent.";
+
+/// What Home says when the seller's own book holds as many paid orders not
+/// yet sent as it keeps (step 2), with how many more it could not keep.
+pub(crate) fn book_full_note(refused: usize) -> Option<String> {
+    (refused > 0).then(|| {
+        format!(
+            "This device keeps up to {} paid orders you haven\u{2019}t sent, and {} more \
+             could not be kept here. They show while your store still lists them: mark \
+             orders as sent to make room.",
+            harvest_common::delegate::MAX_SELLER_UNSENT_KEPT,
+            refused
+        )
+    })
+}
+
 /// What a paused store's header says under its pill, on Home.
 pub(crate) const PAUSED_LINE: &str =
     "Buyers see \u{201c}Closed for now\u{201d} and can\u{2019}t use \
@@ -535,12 +554,10 @@ pub(crate) struct SellerData {
 impl SellerData {
     pub(crate) fn of(state: &AppState, store: &SellerStore) -> SellerData {
         let id = &store.contract_id;
+        // The store's orders, then those only the seller's own book still
+        // keeps (step 2, `crate::seller_book`).
         let orders = super::invoice_form::invoices_issued_by(
-            state
-                .browsing_stores
-                .get(id)
-                .map(|s| s.orders.as_slice())
-                .unwrap_or_default(),
+            &state.seller_orders_with_book(id),
             &store.fingerprint,
             |order| state.withheld_settlements.contains_key(order),
         );
@@ -863,6 +880,17 @@ fn home_content(state: &AppState, store: &SellerStore) -> HomeContent {
     let alerts = state.store_alerts(&id, store.closed);
     for alert in alerts {
         notes.push((alert, None));
+    }
+    // The seller's own book is full of paid orders not yet sent (step 2):
+    // never evicted, so the ones past it are said.
+    if let Some(note) = book_full_note(state.book_refused(&id)) {
+        notes.push((
+            note,
+            Some((
+                "Orders to send",
+                seller_page(&id, SellerView::Orders(OrderFilter::ToSend)),
+            )),
+        ));
     }
     let has_wallet = state.bitcoin.payment_xpub.is_some();
     let wallet_known = state.bitcoin.payment_xpub_loaded;
@@ -1316,6 +1344,7 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                     tag: thread.as_ref().map(|t| t.tag),
                     name,
                     others,
+                    only_here: state.order_only_in_book(&id, &o.order.id),
                     order: o,
                     live: state.bitcoin.clone(),
                 }
@@ -1362,6 +1391,9 @@ fn SellerOrderPage(store: SellerStore, order: OrderId) -> Element {
                 span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
             }
             " \u{00b7} order {o.order.id.short()}"
+        }
+        if view.only_here {
+            p { class: "text-muted small", "{ONLY_HERE_LINE}" }
         }
         div { class: "two-col",
             div { class: "col-main",
@@ -1514,6 +1546,9 @@ struct OrderView {
     name: String,
     others: usize,
     live: crate::state::BitcoinState,
+    /// Kept by this device's own book alone: the store no longer holds it
+    /// (step 2).
+    only_here: bool,
 }
 
 /// An order's history on its page (S4): when it was ordered and paid, sent

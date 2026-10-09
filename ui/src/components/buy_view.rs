@@ -192,6 +192,8 @@ pub fn BuyForm(
                 textarea {
                     id: "buy-ship-to",
                     class: "form-textarea",
+                    // What the seller's book keeps of it (step 2).
+                    maxlength: harvest_common::delegate::MAX_KEPT_REQUEST_TEXT as i64,
                     value: "{shipping}",
                     placeholder: "Name and postal address, or whatever this seller needs.",
                     oninput: move |event| shipping.set(event.value()),
@@ -208,6 +210,7 @@ pub fn BuyForm(
                     id: "buy-note",
                     class: "form-textarea grow-textarea",
                     rows: 1,
+                    maxlength: harvest_common::delegate::MAX_KEPT_REQUEST_TEXT as i64,
                     value: "{note}",
                     placeholder: "Delivery date, gift message\u{2026}",
                     oninput: move |event| {

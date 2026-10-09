@@ -24,6 +24,7 @@ mod migrate;
 mod order_threads;
 mod pause_flow;
 mod presence_flow;
+mod seller_book;
 mod state;
 mod store_link;
 mod voucher_flow;

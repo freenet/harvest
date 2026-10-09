@@ -241,10 +241,10 @@ fn file(open: &mut OpenBook, done: &mut Vec<SellerKeptOrder>, record: SellerKept
     let id = record.order.order.id.clone();
     let held = if let Some(at) = open.orders.iter().position(|r| r.order.order.id == id) {
         Some(open.orders.remove(at))
-    } else if let Some(at) = done.iter().position(|r| r.order.order.id == id) {
-        Some(done.remove(at))
     } else {
-        None
+        done.iter()
+            .position(|r| r.order.order.id == id)
+            .map(|at| done.remove(at))
     };
     let unchanged = held
         .as_ref()

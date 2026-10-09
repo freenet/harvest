@@ -549,7 +549,7 @@ pub fn BackupPage() -> Element {
         }
     });
     let _ = clock();
-    let (purchases, conversations, message, busy, restoring, ready) = {
+    let (purchases, conversations, message, busy, restoring, ready, addresses) = {
         let state = APP_STATE.read();
         let (purchases, conversations) = state.not_backed_up();
         (
@@ -559,6 +559,7 @@ pub fn BackupPage() -> Element {
             state.backup_busy_at(crate::state::now_ms()),
             state.backup_restore.is_some(),
             state.backup_file_ready.clone(),
+            state.unsent_addresses_in_backup(),
         )
     };
     let restore = |text: String| {
@@ -566,20 +567,20 @@ pub fn BackupPage() -> Element {
         crate::backup_flow::send_all(out);
     };
     let save = move |copy: bool| {
-        let Some(ready) = APP_STATE.read().backup_file_ready.clone() else {
+        let Some((name, text)) = APP_STATE.read().ready_backup_file() else {
             return;
         };
         #[cfg(target_arch = "wasm32")]
         if copy {
             let _ = document::eval(&format!(
                 "navigator.clipboard.writeText({});",
-                js_string(&ready.text)
+                js_string(&text)
             ));
         } else {
-            download(&ready.name, &ready.text);
+            download(&name, &text);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (copy, &ready);
+        let _ = (copy, &name, &text);
         let out = APP_STATE.write().backup_saved();
         crate::backup_flow::send_all(out);
     };
@@ -604,6 +605,9 @@ pub fn BackupPage() -> Element {
                 },
             }
             p { class: "text-muted small", "{crate::backup_flow::KEEP_IT_PRIVATE}" }
+            if let Some(line) = crate::backup_flow::addresses_line(addresses) {
+                p { class: "text-warning", "{line}" }
+            }
             div { class: "row",
                 button {
                     class: "btn btn-primary",

@@ -4085,7 +4085,7 @@ mod order_tests {
             out.merge(&parent(), &p, b).expect("merges");
             out
         };
-        let mut rng = crate::merge_laws::Rng::new(0x5ec_0d);
+        let mut rng = crate::merge_laws::Rng::new(0x5ec0d);
         let mut states = vec![OrdersV1::default()];
         for _ in 0..16 {
             let mut delta = OrdersV1::default();

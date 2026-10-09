@@ -47,8 +47,8 @@
 use std::collections::VecDeque;
 
 use harvest_common::delegate::{
-    BackupConversation, BackupItemOutcome, KeptPurchase, PurchasesBackupPage, BACKUP_IMPORT_ITEMS,
-    BACKUP_MARK_ITEMS,
+    BackupConversation, BackupItemOutcome, KeptPurchase, PurchasesBackupPage, SellerKeptOrder,
+    BACKUP_IMPORT_ITEMS, BACKUP_MARK_ITEMS, SELLER_ORDERS_PER_CALL,
 };
 use harvest_common::store::StoreParameters;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,16 @@ pub struct BundleConversation {
     pub conversation: BackupConversation,
 }
 
+/// One of the seller's own stores' books in a bundle (step 2): its orders,
+/// each open one (not yet sent) with the buyer's request, each sent one
+/// without (the overseer, 2026-10-09: a seller's file holding hundreds of
+/// customers' home addresses is a different exposure from a buyer's own).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BundleSellerBook {
+    pub store_key: [u8; 32],
+    pub orders: Vec<SellerKeptOrder>,
+}
+
 /// What a purchases backup holds.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Bundle {
@@ -98,6 +108,16 @@ pub struct Bundle {
     pub stores: Vec<BundleStore>,
     pub conversations: Vec<BundleConversation>,
     pub purchases: Vec<KeptPurchase>,
+    /// The seller's own stores' books, when this device sells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seller_orders: Vec<BundleSellerBook>,
+}
+
+/// One delegate call of a restore.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RestoreChunk {
+    Purchases(Vec<BackupConversation>, Vec<KeptPurchase>),
+    SellerOrders([u8; 32], Vec<SellerKeptOrder>),
 }
 
 /// The bundle's format version.
@@ -246,19 +266,23 @@ pub struct BackupExport {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BackupRestore {
     pub request_id: u64,
-    pub chunks: VecDeque<(Vec<BackupConversation>, Vec<KeptPurchase>)>,
+    pub chunks: VecDeque<RestoreChunk>,
     pub restored: usize,
     pub already: usize,
     pub refused: Vec<String>,
     /// When the last chunk was sent.
     pub asked_at_ms: u64,
+    /// How many of the seller's orders the last chunk carried.
+    pub seller_orders_sent: usize,
 }
 
-/// A finished backup file, waiting for the buyer to save it.
+/// A finished backup, waiting for the buyer to save it. The file is made
+/// from it as it is saved ([`AppState::ready_backup_file`]), with the
+/// seller's books as this tab holds them then.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadyBackup {
     pub name: String,
-    pub text: String,
+    pub bundle: Bundle,
     pub purchases: usize,
     pub conversations: usize,
     /// The marks for exactly what the file holds, sent once it is saved.
@@ -349,6 +373,56 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    /// The file to save now, `(name, text)`: the backup made, with the
+    /// seller's own books as this tab holds them.
+    pub(crate) fn ready_backup_file(&self) -> Option<(String, String)> {
+        let ready = self.backup_file_ready.as_ref()?;
+        let mut bundle = ready.bundle.clone();
+        bundle.seller_orders = self.seller_books_for_backup();
+        encode_file(&bundle)
+            .ok()
+            .map(|text| (ready.name.clone(), text))
+    }
+
+    /// Each of our stores' books, open orders with their requests and sent
+    /// ones without.
+    pub(crate) fn seller_books_for_backup(&self) -> Vec<BundleSellerBook> {
+        let mut books: Vec<BundleSellerBook> = self
+            .seller_books
+            .iter()
+            .filter(|(_, b)| b.loaded && !b.orders.is_empty())
+            .map(|(key, b)| BundleSellerBook {
+                store_key: *key,
+                orders: b
+                    .orders
+                    .iter()
+                    .cloned()
+                    .map(|mut r| {
+                        if r.despatch.is_some()
+                            || r.order.status
+                                == harvest_common::payment::OrderStatus::PaymentReversed
+                        {
+                            r.request = None;
+                        }
+                        r
+                    })
+                    .collect(),
+            })
+            .collect();
+        books.sort_by_key(|b| b.store_key);
+        books
+    }
+
+    /// How many delivery addresses of orders not yet sent a backup made now
+    /// would hold: said on the Backup page.
+    pub fn unsent_addresses_in_backup(&self) -> usize {
+        self.seller_books_for_backup()
+            .iter()
+            .flat_map(|b| b.orders.iter())
+            .filter(|r| r.request.is_some())
+            .count()
     }
 
     /// The buyer saved the file (or copied its text): mark exactly what it
@@ -443,13 +517,13 @@ impl AppState {
         let made_at_ms = crate::state::now_ms();
         let bundle = self.bundle_of(export, made_at_ms);
         match encode_file(&bundle) {
-            Ok(text) => {
+            Ok(_) => {
                 self.backup_file_ready = Some(ReadyBackup {
                     name: file_name(made_at_ms),
-                    text,
                     purchases: bundle.purchases.len(),
                     conversations: bundle.conversations.len(),
                     marks: marks_for(&bundle, request_id),
+                    bundle,
                 });
             }
             Err(why) => {
@@ -488,6 +562,7 @@ impl AppState {
             stores,
             conversations,
             purchases: export.purchases,
+            seller_orders: Vec::new(),
         }
     }
 
@@ -543,12 +618,17 @@ impl AppState {
                 conversation
             })
             .collect();
-        let mut chunks: VecDeque<(Vec<BackupConversation>, Vec<KeptPurchase>)> = VecDeque::new();
+        let mut chunks: VecDeque<RestoreChunk> = VecDeque::new();
         for chunk in conversations.chunks(BACKUP_IMPORT_ITEMS) {
-            chunks.push_back((chunk.to_vec(), Vec::new()));
+            chunks.push_back(RestoreChunk::Purchases(chunk.to_vec(), Vec::new()));
         }
         for chunk in bundle.purchases.chunks(BACKUP_IMPORT_ITEMS) {
-            chunks.push_back((Vec::new(), chunk.to_vec()));
+            chunks.push_back(RestoreChunk::Purchases(Vec::new(), chunk.to_vec()));
+        }
+        for book in &bundle.seller_orders {
+            for chunk in book.orders.chunks(SELLER_ORDERS_PER_CALL) {
+                chunks.push_back(RestoreChunk::SellerOrders(book.store_key, chunk.to_vec()));
+            }
         }
         let request_id = self.next_messaging_request_id();
         // The file made before this restore no longer holds everything.
@@ -569,7 +649,7 @@ impl AppState {
             return Vec::new();
         };
         match restore.chunks.pop_front() {
-            Some((conversations, purchases)) => {
+            Some(RestoreChunk::Purchases(conversations, purchases)) => {
                 restore.asked_at_ms = crate::state::now_ms();
                 vec![
                     harvest_common::HarvestDelegateRequest::ImportPurchasesBackup {
@@ -578,6 +658,15 @@ impl AppState {
                         purchases,
                     },
                 ]
+            }
+            Some(RestoreChunk::SellerOrders(store_key, orders)) => {
+                restore.asked_at_ms = crate::state::now_ms();
+                restore.seller_orders_sent = orders.len();
+                vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
+                    request_id: restore.request_id,
+                    store_key,
+                    orders,
+                }]
             }
             None => {
                 let done = self.backup_restore.take().unwrap_or_default();
@@ -624,6 +713,29 @@ impl AppState {
         self.next_restore_chunk()
     }
 
+    /// A restore's chunk of the seller's orders was answered, if it was
+    /// one: count it, and send the next. Answers `None` for a keep that is
+    /// not the restore's.
+    pub(crate) fn on_restored_seller_orders(
+        &mut self,
+        request_id: u64,
+        result: &Result<u32, String>,
+    ) -> Option<Outgoing> {
+        let restore = self
+            .backup_restore
+            .as_mut()
+            .filter(|r| r.request_id == request_id)?;
+        match result {
+            Ok(kept) => {
+                let kept = *kept as usize;
+                restore.restored += kept;
+                restore.already += restore.seller_orders_sent.saturating_sub(kept);
+            }
+            Err(why) => restore.refused.push(why.clone()),
+        }
+        Some(self.next_restore_chunk())
+    }
+
     /// The marks were recorded: show what the delegate now holds.
     pub(crate) fn on_backed_up_marked(&mut self, result: Result<u32, String>) -> Outgoing {
         if let Err(why) = result {
@@ -632,6 +744,23 @@ impl AppState {
             ));
         }
         vec![harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+    }
+}
+
+/// What the Backup page says when a backup would hold buyers' delivery
+/// addresses: the seller's orders not yet sent (step 2).
+pub(crate) fn addresses_line(addresses: usize) -> Option<String> {
+    match addresses {
+        0 => None,
+        1 => Some(
+            "It also holds the delivery address of 1 order you haven\u{2019}t sent yet: \
+             keep it as private as the buyer would want."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "It also holds the delivery addresses of {n} orders you haven\u{2019}t sent \
+             yet: keep it as private as your buyers would want."
+        )),
     }
 }
 
@@ -731,6 +860,36 @@ mod tests {
         }
     }
 
+    fn kept_order(n: u8) -> harvest_common::payment::AuthorizedOrder {
+        harvest_common::payment::AuthorizedOrder {
+            order: harvest_common::payment::Order {
+                request_id: None,
+                id: harvest_common::payment::OrderId([n; 32]),
+                buyer_fingerprint: String::new(),
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
+                network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
+                required_confirmations: 1,
+                payment_hash: None,
+                trusted_bridges: Vec::new(),
+                bitcoin_address_code_hash: None,
+                anchor: None,
+                order_binding: None,
+                listing_tag: None,
+                buyer_receipt_key: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            scoped_payload: Vec::new(),
+            signature: Vec::new(),
+            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        }
+    }
+
     fn bundle() -> Bundle {
         Bundle {
             version: BUNDLE_VERSION,
@@ -745,6 +904,7 @@ mod tests {
                 conversation: conversation(3),
             }],
             purchases: Vec::new(),
+            seller_orders: Vec::new(),
         }
     }
 
@@ -827,8 +987,7 @@ mod tests {
             last.is_empty(),
             "nothing is marked before the file is saved"
         );
-        let ready = state.backup_file_ready.clone().expect("a file");
-        let (name, text) = (ready.name.clone(), ready.text.clone());
+        let (name, text) = state.ready_backup_file().expect("a file");
         assert!(name.starts_with("harvest-purchases-"));
         let held = decode_file(&text).unwrap();
         assert_eq!(held.conversations.len(), 2);
@@ -1062,6 +1221,92 @@ mod tests {
         assert_eq!(
             state.backup_message.as_deref(),
             Some("1 restored, 0 already here. 1 not restored: busy")
+        );
+    }
+
+    /// The seller's own books go into the file: an order not yet sent with
+    /// the buyer's request, a sent one without (the overseer, 2026-10-09:
+    /// no archive of customers' addresses), and the page counts the
+    /// addresses it holds; a restore sends them back to the delegate a call
+    /// at a time and counts them. Mutated red by exporting every request,
+    /// and by leaving the seller's orders out of the restore.
+    #[test]
+    fn a_sellers_books_are_backed_up_with_only_unsent_addresses() {
+        use harvest_common::delegate::{KeptRequest, SellerKeptOrder};
+        let record = |n: u8, sent: bool| SellerKeptOrder {
+            order: harvest_common::payment::AuthorizedOrder {
+                status: harvest_common::payment::OrderStatus::Paid,
+                ..kept_order(n)
+            },
+            request: Some(KeptRequest {
+                listing_id: harvest_common::listing::ListingId([4; 32]),
+                quantity: 1,
+                shipping: format!("{n} Lane"),
+                note: String::new(),
+                region: None,
+                choices: Vec::new(),
+                conversation: [9; 32],
+            }),
+            despatch: sent.then(|| harvest_common::fulfilment::AuthorizedDespatch {
+                despatch: harvest_common::fulfilment::Despatch {
+                    order_id: harvest_common::payment::OrderId([n; 32]),
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: 1,
+                        hash: freenet_bitcoin_common::BlockHash([1; 32]),
+                    },
+                },
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+            }),
+            paid_height: None,
+            sent_off_store: false,
+        };
+        let mut state = AppState::default();
+        state.seller_books.insert(
+            [3; 32],
+            crate::seller_book::SellerBook {
+                orders: vec![record(1, false), record(2, true)],
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let books = state.seller_books_for_backup();
+        assert_eq!(books.len(), 1);
+        assert!(books[0].orders[0].request.is_some(), "not yet sent");
+        assert!(books[0].orders[1].request.is_none(), "sent: terms only");
+        assert_eq!(state.unsent_addresses_in_backup(), 1);
+        assert!(addresses_line(1).unwrap().contains("delivery address"));
+
+        let mut file = bundle();
+        file.seller_orders = books;
+        let text = encode_file(&file).unwrap();
+        assert_eq!(decode_file(&text).unwrap().seller_orders.len(), 1);
+        let mut state = AppState::default();
+        let first = state.start_restore(&text);
+        let request_id = match &first[..] {
+            [harvest_common::HarvestDelegateRequest::ImportPurchasesBackup {
+                request_id, ..
+            }] => *request_id,
+            other => panic!("{other:?}"),
+        };
+        let next =
+            state.on_purchases_backup_imported(request_id, Ok(vec![BackupItemOutcome::Imported]));
+        match &next[..] {
+            [harvest_common::HarvestDelegateRequest::KeepSellerOrders { orders, .. }] => {
+                assert_eq!(orders.len(), 2)
+            }
+            other => panic!("{other:?}"),
+        }
+        let done = state
+            .on_restored_seller_orders(request_id, &Ok(1))
+            .expect("the restore's");
+        assert!(matches!(
+            &done[..],
+            [harvest_common::HarvestDelegateRequest::ListKeptPurchases]
+        ));
+        assert_eq!(
+            state.backup_message.as_deref(),
+            Some("2 restored, 1 already here.")
         );
     }
 
