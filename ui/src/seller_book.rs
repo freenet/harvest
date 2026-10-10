@@ -17,9 +17,7 @@
 
 use std::collections::HashMap;
 
-use harvest_common::delegate::{
-    SellerKeptOrder, SellerOrdersPage, MAX_SELLER_UNSENT_KEPT, SELLER_ORDERS_PER_CALL,
-};
+use harvest_common::delegate::{SellerKeptOrder, SellerOrdersPage, SELLER_ORDERS_PER_CALL};
 use harvest_common::payment::{AuthorizedOrder, OrderId, OrderStatus};
 
 use crate::state::{AppState, BrowsingStore, SellerOrderRequest};
@@ -32,23 +30,22 @@ pub struct SellerBook {
     pub paid_refused: Vec<OrderId>,
     /// Read at least once.
     pub loaded: bool,
-    /// The last read was refused: the book is not known, and not waited on.
-    pub read_failed: bool,
     /// A read under way: its request id, the pages so far, and when it
     /// started.
     pub reading: Option<(u64, SellerOrdersPage)>,
     pub read_at_ms: u64,
-    /// A keep under way: its request id and when it went, and the notes it
-    /// carries.
+    /// A keep under way: its request id and when it went.
     pub keeping: Option<(u64, u64)>,
-    pub keeping_notes: Vec<([u8; 32], [u8; 32])>,
-    /// Every note this tab has sent this session, by order id and the
-    /// note's digest: one is never sent twice while it may still land.
-    /// What the book keeps can differ from what it was sent (it keeps no
-    /// proof once an order is sent, drops a request once its window closes),
-    /// so comparing the two again would offer the same note for ever. A
-    /// keep refused, or never answered, is forgotten here, so the next
-    /// change of the store offers it again.
+    /// A despatch for an order the store no longer holds, on its way to
+    /// the book alone: the keep's request id and the order. Shown as sent
+    /// meanwhile; undone if the book refuses it.
+    pub off_store_despatch: Option<(u64, Vec<u8>, OrderId)>,
+    /// Every note this tab has sent, by order id and the note's digest:
+    /// one is not sent twice. What the book keeps can differ from what it
+    /// was sent (it keeps no proof once an order is sent), so comparing the
+    /// two again could offer the same note for ever. Cleared when a keep is
+    /// refused or never answered (one keep is in flight at a time), so the
+    /// store's next change offers what did not land.
     pub noted: std::collections::HashSet<([u8; 32], [u8; 32])>,
 }
 
@@ -66,10 +63,11 @@ pub(crate) type Outgoing = Vec<harvest_common::HarvestDelegateRequest>;
 
 /// Whether `note` adds to `held` (the same order): what the delegate's
 /// merge would take from it and keep. A proof adds only to a paid order not
-/// yet sent that has none: a sent one is kept without it.
+/// yet sent that has none: a sent (or reversed) one is kept without it.
 fn adds_to(held: &SellerKeptOrder, note: &SellerKeptOrder) -> bool {
     note.order.status.rank() > held.order.status.rank()
-        || (note.order.status == held.order.status
+        || (note.order.status == OrderStatus::Paid
+            && held.order.status == OrderStatus::Paid
             && held.order.payment_proof.is_none()
             && held.despatch.is_none()
             && note.order.payment_proof.is_some())
@@ -183,16 +181,6 @@ impl AppState {
         })
     }
 
-    /// Whether this tab is reading one of our stores' books for the first
-    /// time: what it holds is not known yet.
-    pub(crate) fn seller_book_unread(&self, store_contract_id: &[u8]) -> bool {
-        self.own_store_key(store_contract_id).is_some_and(|key| {
-            self.seller_books
-                .get(&key)
-                .is_none_or(|b| !b.loaded && !b.read_failed)
-        })
-    }
-
     /// Paid orders not yet sent waiting for room in this store's book: those
     /// the store or the book still holds (a name whose order has gone from
     /// both is nothing the seller can act on).
@@ -261,7 +249,6 @@ impl AppState {
             Ok(page) => page,
             Err(why) => {
                 book.reading = None;
-                book.read_failed = true;
                 dioxus::logger::tracing::warn!("The seller's kept orders could not be read: {why}");
                 return Vec::new();
             }
@@ -279,7 +266,6 @@ impl AppState {
         book.orders = done.orders;
         book.paid_refused = done.paid_refused;
         book.loaded = true;
-        book.read_failed = false;
         // The book read, what the store shows it lacks goes in.
         let ids: Vec<Vec<u8>> = self
             .browsing_stores
@@ -305,16 +291,22 @@ impl AppState {
         };
         if book.keeping.is_some_and(|(id, _)| id == request_id) {
             book.keeping = None;
-            let sent = std::mem::take(&mut book.keeping_notes);
-            if result.is_err() {
-                // Not kept: offered again at the store's next change.
-                for note in sent {
-                    book.noted.remove(&note);
-                }
-            }
         }
         if let Err(why) = &result {
             dioxus::logger::tracing::warn!("The seller's orders were not kept: {why}");
+            // Not kept: offered again at the store's next change.
+            book.noted.clear();
+            // A despatch shown as sent that the book refused is not sent.
+            if let Some((_, store_contract_id, order)) = book
+                .off_store_despatch
+                .take_if(|(id, _, _)| *id == request_id)
+            {
+                if let Some(r) = book.orders.iter_mut().find(|r| r.order.order.id == order) {
+                    r.despatch = None;
+                    r.sent_off_store = false;
+                }
+                self.on_despatch_send_failed(&store_contract_id, &order, why);
+            }
             return Vec::new();
         }
         let ids: Vec<Vec<u8>> = self
@@ -341,12 +333,6 @@ impl AppState {
         let requests = self.seller_kept_requests(store_contract_id);
         let held: HashMap<&OrderId, &SellerKeptOrder> =
             book.orders.iter().map(|r| (&r.order.order.id, r)).collect();
-        let full = book
-            .orders
-            .iter()
-            .filter(|r| r.order.status == OrderStatus::Paid && r.despatch.is_none())
-            .count()
-            >= MAX_SELLER_UNSENT_KEPT;
         store
             .orders
             .iter()
@@ -366,10 +352,6 @@ impl AppState {
                 if o.status == OrderStatus::AwaitingPayment && request.is_none() {
                     return None;
                 }
-                // A full book refused it: it goes again once there is room.
-                if full && book.paid_refused.contains(&o.order.id) {
-                    return None;
-                }
                 let note = SellerKeptOrder {
                     order: o.clone(),
                     request,
@@ -380,13 +362,7 @@ impl AppState {
                 };
                 match held.get(&o.order.id) {
                     Some(held) if !adds_to(held, &note) => None,
-                    // One a full book refused is offered again once it is
-                    // not full (above), however often it was offered.
-                    _ if book.noted.contains(&note_digest(&note))
-                        && !book.paid_refused.contains(&o.order.id) =>
-                    {
-                        None
-                    }
+                    _ if book.noted.contains(&note_digest(&note)) => None,
                     _ => Some(note),
                 }
             })
@@ -410,9 +386,7 @@ impl AppState {
         // A keep never answered: what it carried is offered again.
         if let Some(book) = self.seller_books.get_mut(&key) {
             if book.keeping.take().is_some() {
-                for note in std::mem::take(&mut book.keeping_notes) {
-                    book.noted.remove(&note);
-                }
+                book.noted.clear();
             }
         }
         let mut notes = self.seller_book_notes(store_contract_id);
@@ -423,8 +397,7 @@ impl AppState {
         let request_id = self.next_messaging_request_id();
         if let Some(book) = self.seller_books.get_mut(&key) {
             book.keeping = Some((request_id, now));
-            book.keeping_notes = notes.iter().map(note_digest).collect();
-            book.noted.extend(book.keeping_notes.iter().copied());
+            book.noted.extend(notes.iter().map(note_digest));
         }
         vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
             request_id,
@@ -464,7 +437,7 @@ impl AppState {
             .get(&key)
             .and_then(|b| b.orders.iter().find(|r| r.order.order.id == order.order.id))
             .cloned();
-        // Shown at once; the book's answer replaces it.
+        // Shown at once; the book's answer replaces it, or undoes it.
         if let Some(book) = self.seller_books.get_mut(&key) {
             if let Some(r) = book
                 .orders
@@ -474,17 +447,27 @@ impl AppState {
                 r.despatch = Some(despatch.clone());
                 r.sent_off_store = true;
             }
+            book.off_store_despatch = Some((
+                request_id,
+                store_contract_id.to_vec(),
+                order.order.id.clone(),
+            ));
         }
+        // The book's own record as it listed it, sealed, with the despatch:
+        // the book holds it paid without the proof the store dropped.
+        let (paid_height, seal, request) = held
+            .map(|h| (h.paid_height, h.seal, h.request))
+            .unwrap_or_default();
         vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
             request_id,
             store_key: key,
             orders: vec![SellerKeptOrder {
                 order,
-                request: held.and_then(|h| h.request),
+                request,
                 despatch: Some(despatch),
-                paid_height: None,
+                paid_height,
                 sent_off_store: true,
-                seal: None,
+                seal,
             }],
         }]
     }

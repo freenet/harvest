@@ -66,12 +66,29 @@ impl ContractInterface for Contract {
     ) -> Result<UpdateModification<'static>, ContractError> {
         // Every update past the store's byte bound is refused before anything
         // is read, the held state included.
+        let mut total = 0usize;
         for update in &data {
             match update {
-                UpdateData::State(s) => within_bound(s.as_ref(), "a store state")?,
-                UpdateData::Delta(d) => within_bound(d.as_ref(), "a store delta")?,
+                UpdateData::State(s) => {
+                    within_bound(s.as_ref(), "a store state")?;
+                    total += s.as_ref().len();
+                }
+                UpdateData::Delta(d) => {
+                    within_bound(d.as_ref(), "a store delta")?;
+                    total += d.as_ref().len();
+                }
                 _ => {}
             }
+        }
+        // And all of them together: a node sends one, but nothing else stops
+        // several.
+        if total > harvest_common::store::MAX_STORE_BYTES {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: format!(
+                    "updates of {total} bytes together are past the most a store takes, {}",
+                    harvest_common::store::MAX_STORE_BYTES
+                ),
+            });
         }
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
@@ -140,7 +157,6 @@ impl ContractInterface for Contract {
         let mut updated_state = vec![];
         into_writer(&store_state, &mut updated_state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
-        within_bound(&updated_state, "the merged store state")?;
 
         Ok(UpdateModification::valid(updated_state.into()))
     }
@@ -259,13 +275,27 @@ mod tests {
             assert!(why.contains("past the most a store takes"), "{why}");
         }
         let why = <Contract as ContractInterface>::validate_state(
-            params,
+            params.clone(),
             State::from(oversized),
             RelatedContracts::default(),
         )
         .unwrap_err()
         .to_string();
         assert!(why.contains("past the most a store takes"), "{why}");
+        // Each under the bound, together past it.
+        let mut half = vec![0xa1u8];
+        half.resize(harvest_common::store::MAX_STORE_BYTES / 2 + 1, 0xff);
+        let why = <Contract as ContractInterface>::update_state(
+            params,
+            State::from(vec![]),
+            vec![
+                UpdateData::Delta(StateDelta::from(half.clone())),
+                UpdateData::Delta(StateDelta::from(half)),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("together"), "{why}");
     }
 
     fn seller_key() -> SigningKey {

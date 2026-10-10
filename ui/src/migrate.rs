@@ -859,13 +859,17 @@ pub(crate) fn merge_store_reporting_discard(
     side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
-    // Each side as this generation keeps it BEFORE the merge, so a record
-    // an earlier generation kept (a `Paid` on padded evidence, say) cannot
-    // outrank the other side's in it, and then be stripped after.
+    // Each side's listings and orders as this generation keeps them BEFORE
+    // the merge, so a record an earlier generation kept (a `Paid` on padded
+    // evidence, say) cannot outrank the other side's in it, and then be
+    // stripped after. Not the despatches yet: one side's despatch may name
+    // an order only the other side holds.
     let mut base = name_whole_key_owner(base, seller);
-    base.normalize_carried();
+    base.listings.normalize();
+    base.orders.normalize();
     let mut owned_other = name_whole_key_owner(other.clone(), seller);
-    owned_other.normalize_carried();
+    owned_other.listings.normalize();
+    owned_other.orders.normalize();
     let snapshot = base.clone();
     let mut outcome = fold_or_keep_primary("store", base, |base| {
         base.merge(&snapshot, params, &owned_other)

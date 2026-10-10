@@ -274,9 +274,6 @@ pub struct BackupRestore {
     pub asked_at_ms: u64,
     /// How many of the seller's orders the last chunk carried.
     pub seller_orders_sent: usize,
-    /// The seller's orders the book did not count as kept: already held as
-    /// completely, or waiting for room (the delegate answers a count only).
-    pub seller_not_kept: usize,
 }
 
 /// A finished backup, waiting for the buyer to save it. The file is made
@@ -709,17 +706,6 @@ impl AppState {
                 let done = self.backup_restore.take().unwrap_or_default();
                 let mut message =
                     format!("{} restored, {} already here.", done.restored, done.already);
-                match done.seller_not_kept {
-                    0 => {}
-                    1 => message.push_str(
-                        " 1 of your store\u{2019}s orders was already in this device\u{2019}s \
-                         list, or is waiting for room in it (your store\u{2019}s Home says).",
-                    ),
-                    n => message.push_str(&format!(
-                        " {n} of your store\u{2019}s orders were already in this device\u{2019}s \
-                         list, or are waiting for room in it (your store\u{2019}s Home says)."
-                    )),
-                }
                 if !done.refused.is_empty() {
                     message.push_str(&format!(
                         " {} not restored: {}",
@@ -789,7 +775,10 @@ impl AppState {
             Ok(kept) => {
                 let kept = *kept as usize;
                 restore.restored += kept;
-                restore.seller_not_kept += restore.seller_orders_sent.saturating_sub(kept);
+                // Not kept: already here as completely, or left out (the
+                // delegate answers a count only; a paid order waiting for
+                // room is on the store's Home).
+                restore.already += restore.seller_orders_sent.saturating_sub(kept);
             }
             Err(why) => restore.refused.push(why.clone()),
         }
@@ -1458,11 +1447,7 @@ mod tests {
         );
         assert_eq!(
             state.backup_message.as_deref(),
-            Some(
-                "2 restored, 0 already here. 1 of your store\u{2019}s orders was already in \
-                 this device\u{2019}s list, or is waiting for room in it (your store\u{2019}s \
-                 Home says)."
-            )
+            Some("2 restored, 1 already here.")
         );
     }
 

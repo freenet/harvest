@@ -353,6 +353,19 @@ pub(crate) fn import<S: SecretStore>(store: &mut S, key: &[u8], value: &[u8]) ->
             }
             return SecretImport::AlreadyAuthoritative;
         }
+        // The incoming copy wins; a despatch only the held copy has stays
+        // with it (review round 4 of step 2: it was the only word the order
+        // was sent once the store had dropped it).
+        let bytes = match (held.despatch, incoming.despatch.is_none()) {
+            (Some(despatch), true) => match to_cbor(&KeptPurchase {
+                despatch: Some(despatch),
+                ..incoming
+            }) {
+                Ok(bytes) => bytes,
+                Err(_) => return SecretImport::Retryable("could not encode the purchase".into()),
+            },
+            _ => bytes,
+        };
         return if store.set_secret(key, &bytes) {
             SecretImport::Written
         } else {
@@ -1123,6 +1136,36 @@ mod tests {
             SecretImport::Permanent(_)
         ));
         assert!(empty.is_empty());
+
+        // Review round 4 of step 2 (codex): a copy that wins an import (paid
+        // over unpaid) without a despatch keeps the held one's. Red with
+        // the incoming copy written whole.
+        let mut held_unpaid = holding(1);
+        keep(
+            &mut held_unpaid,
+            PurchaseToKeep {
+                despatch: Some(sent.clone()),
+                ..to_keep(1, 1, OrderStatus::AwaitingPayment, 1)
+            },
+        );
+        let paid_bare = KeptPurchase {
+            despatch: None,
+            backed_up: false,
+            ..purchases(list(&holding_paid(1))).remove(0)
+        };
+        assert!(matches!(
+            import(&mut held_unpaid, &key, &to_cbor(&paid_bare).unwrap()),
+            SecretImport::Written
+        ));
+        let now = purchases(list(&held_unpaid)).remove(0);
+        assert_eq!(now.order.status, OrderStatus::Paid);
+        assert_eq!(now.despatch, Some(sent));
+    }
+
+    fn holding_paid(n: u16) -> MemSecrets {
+        let mut secrets = holding(1);
+        keep(&mut secrets, to_keep(n, 1, OrderStatus::Paid, 1));
+        secrets
     }
 
     /// No complaint is kept about an unpaid order.

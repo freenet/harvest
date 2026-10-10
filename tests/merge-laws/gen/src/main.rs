@@ -3076,6 +3076,10 @@ fn native_laws_total(name: &str, params: &StoreParameters, all: &[(&str, StoreSt
         }
     }
     println!("{name} native: {} states, {n} triples; comm {comm} assoc {assoc} idem {idem} merge-errors {errs}", all.len());
+    assert!(
+        comm + assoc + idem + errs == 0,
+        "{name}: the native merge laws do not hold on this corpus"
+    );
 }
 
 fn gen_review98(root: &Path) {
@@ -3416,9 +3420,12 @@ use harvest_common::store_pause::{AuthorizedStorePause, StorePause};
 /// RECOVERED predecessor state, which nothing in this generation verified.
 ///
 /// Name a whole-key generation's owner on both sides
-/// (`name_whole_key_owner`), merge (a refused merge keeps the base as it
-/// was), then `normalize_carried` and the version-0 info reset, which run on
-/// the kept base either way. This modelled `normalize_carried` as
+/// (`name_whole_key_owner`), hold each side's listings and orders to this
+/// generation's rules before the merge (so a padded `Paid` on one side
+/// cannot outrank the other side's cancellation inside it: review round 3
+/// of step 2), merge (a refused merge keeps the base as it was), then
+/// `normalize_carried` and the version-0 info reset, which run on the
+/// kept base either way. This modelled `normalize_carried` as
 /// `listings.normalize()` alone until step 2's review round 2, which missed
 /// the order rule and both caps.
 fn fold_store(
@@ -3434,7 +3441,11 @@ fn fold_store(
         s
     };
     let mut base = name(base);
-    let other = name(other.clone());
+    base.listings.normalize();
+    base.orders.normalize();
+    let mut other = name(other.clone());
+    other.listings.normalize();
+    other.orders.normalize();
     let snap = base.clone();
     if let Err(e) = base.merge(&snap, params, &other) {
         println!("  fold refused: {e}");
@@ -3844,6 +3855,11 @@ fn gen_paidcap(root: &Path) {
         pre.owner = Some(seller);
         pre.normalize_carried();
         let first = fold_store(p, &seller, pre, local);
+        assert_eq!(
+            cbor(&folded),
+            cbor(&first),
+            "paidcap fold over {ln}: the fold must agree with normalising first"
+        );
         println!(
             "paidcap fold over {ln}: forward verify ok; pre-round-2 model verify: {:?}; \
              normalize-first agrees: {} [p296 {:?} vs {:?}; p297 {:?} vs {:?}]",

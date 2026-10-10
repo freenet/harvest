@@ -489,12 +489,22 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         // Verify the whole delta before merging any of it, and merge into a
         // copy, so a refused delta leaves `self` exactly as it was -- the
         // discipline `OrdersV1::apply_delta` states.
+        // A record held as it is, or that came earlier in this delta,
+        // changes nothing and is not verified again: replayed copies of a
+        // genuine record cost no signature checks (review round 4 of step
+        // 2: 4,000 copies of one listing status cost five calls' budget).
         let owner = crate::store::owner_key(parent_state)?;
+        let mut fresh: Vec<&T> = Vec::with_capacity(incoming.len());
         for record in incoming {
+            if self.records.get(&record.slot()) != Some(record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        for record in &fresh {
             record.verify_for(owner)?;
         }
         let mut next = self.clone();
-        for record in incoming {
+        for record in fresh {
             next.merge_record(record.clone());
         }
         // No bound is applied here. The bound on backings and retirements

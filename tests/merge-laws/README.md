@@ -73,9 +73,13 @@ writing (`native_laws_total`).
   `MAX_ORDERS` states whose four oldest orders, the first any newer order
   cuts, arrived honest, padded, over and under, so the cap and the rule meet.
   And the migration fold's result over a RECOVERED base of 300 orders and 130
-  listings (`fold_store`, which models `merge_store_reporting_discard`,
-  including `normalize_carried`; the driver calls
+  listings (`fold_store`, which models `merge_store_reporting_discard`:
+  each side's listings and orders held to this generation's rules before the
+  merge, `normalize_carried` after; the driver calls
   `merge_with_local(recovered, &local)`, so the unverified side is the base).
+  The generator asserts the fold agrees with normalising first (a padded
+  `Paid` in the base must not hide the local side's cancellation), and that
+  the native merge laws hold on each new corpus.
 - **`store-listcap`** (`listcap`) -- `MAX_LISTINGS` (128) newest by
   `(created_at, id)`: 100 newer listings, 40 created in the same second and
   8 older, spread over states of at most 128 so a union of two crosses the cap

@@ -1243,11 +1243,6 @@ pub(crate) fn test_store_generations() -> (Vec<u8>, Vec<u8>) {
     (earlier, current_store_generation(&key).unwrap())
 }
 
-/// Why an invoice cannot be cancelled while this tab first reads the
-/// seller's own book.
-pub(crate) const SELLER_BOOK_LOADING: &str =
-    "Your orders on this device are still loading. Try again in a moment.";
-
 /// Why a seller's cancel is refused while a payment that would settle the
 /// invoice is in sight (harvest#53).
 pub(crate) const PAYMENT_ON_ITS_WAY: &str =
@@ -10948,14 +10943,6 @@ impl AppState {
             || self.cancellation_sent(store_contract_id, order_id)
         {
             return Err("this invoice is already being cancelled".to_string());
-        }
-        // The seller's own book may hold it paid (step 2: past the store's
-        // byte bound), which only it remembers across a reload: a store
-        // keeps a cancellation for good, and `Paid` could never be published
-        // over it there.
-        if self.seller_book_unread(store_contract_id) {
-            crate::backup_flow::send_all(self.read_seller_book(store_contract_id));
-            return Err(SELLER_BOOK_LOADING.to_string());
         }
         let store_key = self.signing_store_key(store_contract_id)?;
         info!("Cancelling invoice {}", order_id.short());
@@ -28127,8 +28114,8 @@ mod buy_flow_tests {
     /// Review round 2 of step 2 (testing lens), the seller's book's guards:
     /// a page answering another read is ignored; a despatch the book holds
     /// that the store key did not sign is not believed; a paid order the
-    /// book holds paid is not offered again past the store's bound; and a
-    /// full book is not offered again what it refused. Mutated red by
+    /// book holds paid is not offered again past the store's bound; and
+    /// Home counts only waiting orders still held somewhere. Mutated red by
     /// dropping each.
     #[test]
     fn the_sellers_book_guards_what_it_reads_and_offers() {
@@ -28180,78 +28167,29 @@ mod buy_flow_tests {
             "the book holds it paid already"
         );
 
-        // A full book refused it: not offered again while it is full.
-        let book = state.seller_books.get_mut(&owner).unwrap();
-        book.orders = (0..harvest_common::delegate::MAX_SELLER_UNSENT_KEPT)
-            .map(|n| {
-                let mut other = record(None);
-                other.order.order.id = harvest_common::payment::OrderId([n as u8; 32]);
-                other.order.order.created_at += chrono::Duration::seconds(n as i64 + 1);
-                other
-            })
-            .collect();
-        book.paid_refused = vec![paid.order.id.clone()];
-        // Not offered for having been offered already this session.
-        book.noted.clear();
-        assert!(
-            state
-                .seller_book_notes(STORE)
-                .iter()
-                .all(|n| n.order.order.id != paid.order.id),
-            "refused by a full book"
-        );
         // Home counts only names whose order the store or the book holds.
-        state
-            .seller_books
-            .get_mut(&owner)
-            .unwrap()
-            .paid_refused
-            .push(harvest_common::payment::OrderId({
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.orders.clear();
+        book.paid_refused = vec![
+            paid.order.id.clone(),
+            harvest_common::payment::OrderId({
                 let mut gone = [0xEE; 32];
                 gone[0] = 1;
                 gone
-            }));
+            }),
+        ];
         assert_eq!(state.book_refused(STORE), 1, "a gone order's name");
-        state
-            .seller_books
-            .get_mut(&owner)
-            .unwrap()
-            .paid_refused
-            .clear();
-        assert!(
-            state
-                .seller_book_notes(STORE)
-                .iter()
-                .any(|n| n.order.order.id == paid.order.id),
-            "offered once the book did not refuse it"
-        );
-        // Named as refused by a full book, then room again: offered again,
-        // however often it was offered.
-        let book = state.seller_books.get_mut(&owner).unwrap();
-        book.orders.clear();
-        book.keeping = None;
-        book.paid_refused = vec![paid.order.id.clone()];
-        let first = state.sync_seller_book_requests(STORE);
-        assert!(!first.is_empty(), "offered");
-        state.seller_books.get_mut(&owner).unwrap().keeping = None;
-        assert!(
-            state
-                .seller_book_notes(STORE)
-                .iter()
-                .any(|n| n.order.order.id == paid.order.id),
-            "a refused one is offered again while it is named"
-        );
     }
 
     /// Review round 2 of step 2 (codex, skeptical): the book's paid copy
     /// wins over the store's unpaid or cancelled one (a payment past the
     /// store's byte bound, which only the book remembers after a reload);
-    /// an unpaid order only the book holds is not shown; and Cancel waits
-    /// for the book's first read. Mutated red by preferring the store's
-    /// copy, by showing a book-only unpaid order, and by cancelling before
-    /// the book is read.
+    /// an unpaid order only the book holds is not shown; Cancel is refused
+    /// for the book's paid copy; a lost read is asked again. Mutated red by
+    /// preferring the store's copy, by showing a book-only unpaid order, by
+    /// cancelling it, and by never asking again.
     #[test]
-    fn the_books_paid_copy_wins_and_cancel_waits_for_it() {
+    fn the_books_paid_copy_wins_and_cancel_is_refused_for_it() {
         use harvest_common::delegate::SellerKeptOrder;
         let (order, _, _) = a_paid_order_with_fillers(|_| {}, 80);
         let (mut state, _) = buyer_after_acceptance(&order);
@@ -28267,12 +28205,7 @@ mod buy_flow_tests {
         );
         let owner = seller_signing_key().verifying_key().to_bytes();
         state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
-        // The first read under way: Cancel waits.
         let _ = state.read_seller_book(STORE);
-        assert_eq!(
-            state.cancel_invoice(STORE, &order.order.id).unwrap_err(),
-            SELLER_BOOK_LOADING
-        );
         let mut paid = order.clone();
         paid.status = OrderStatus::Paid;
         let unpaid_only_here = {
@@ -28336,39 +28269,110 @@ mod buy_flow_tests {
             .cancel_invoice(STORE, &order.order.id)
             .unwrap_err()
             .contains("already paid"));
-        // Not read at all, Cancel waits and asks for the read; a read that
-        // waited past its time is asked again; a read refused is not waited
-        // on.
-        let book = state.seller_books.remove(&owner).unwrap();
-        assert!(state.seller_book_unread(STORE));
-        assert_eq!(
-            state.cancel_invoice(STORE, &order.order.id).unwrap_err(),
-            SELLER_BOOK_LOADING
-        );
-        let asked = state.seller_books[&owner]
-            .reading
-            .as_ref()
-            .expect("asked")
-            .0;
+        // A read whose answer never came is asked again once its wait is
+        // over.
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.loaded = false;
+        book.reading = Some((
+            1,
+            harvest_common::delegate::SellerOrdersPage {
+                orders: Vec::new(),
+                next: None,
+                paid_refused: Vec::new(),
+            },
+        ));
+        book.read_at_ms = crate::state::now_ms();
         assert!(state.read_seller_book(STORE).is_empty(), "one at a time");
         state.seller_books.get_mut(&owner).unwrap().read_at_ms = 0;
         assert!(
             matches!(
                 &state.read_seller_book(STORE)[..],
                 [harvest_common::HarvestDelegateRequest::ListSellerOrders { request_id, .. }]
-                    if *request_id != asked
+                    if *request_id != 1
             ),
             "asked again once its wait is over"
         );
+    }
+
+    /// Review round 4 of step 2 (codex): Mark sent on an order only the
+    /// book holds goes to the book with the book's own record (its seal and
+    /// paid height, so the book keeps it paid), is shown sent at once, and
+    /// is undone, with a word to the seller, if the book refuses it. Mutated
+    /// red by sending it unsealed, and by leaving it shown sent.
+    #[test]
+    fn a_despatch_the_book_refuses_is_not_shown_sent() {
+        use harvest_common::delegate::SellerKeptOrder;
+        use harvest_common::HarvestDelegateRequest;
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .retain(|o| o.order.id != paid.order.id);
+        let mut book_copy = paid.clone();
+        book_copy.payment_proof = None;
         state.seller_books.insert(
             owner,
             crate::seller_book::SellerBook {
-                read_failed: true,
-                loaded: false,
-                ..book
+                loaded: true,
+                orders: vec![SellerKeptOrder {
+                    order: book_copy.clone(),
+                    request: None,
+                    despatch: None,
+                    paid_height: Some(TIP_HEIGHT - 1),
+                    sent_off_store: false,
+                    seal: Some([5u8; 32]),
+                }],
+                ..Default::default()
             },
         );
-        assert!(!state.seller_book_unread(STORE), "a refused read");
+        let despatch = {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            };
+            let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+                &seller_signing_key(),
+                harvest_common::to_cbor(&despatch).unwrap(),
+            )
+            .unwrap();
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        };
+        let out = state.keep_despatch_off_store(STORE, book_copy, despatch);
+        let request_id = match &out[..] {
+            [HarvestDelegateRequest::KeepSellerOrders {
+                request_id, orders, ..
+            }] => {
+                assert_eq!(orders[0].seal, Some([5u8; 32]), "the book's own seal");
+                assert_eq!(orders[0].paid_height, Some(TIP_HEIGHT - 1));
+                *request_id
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            state.seller_books[&owner].orders[0].despatch.is_some(),
+            "shown sent"
+        );
+        state
+            .despatches_sent
+            .insert((STORE.to_vec(), paid.order.id.clone()));
+        let _ = state.on_seller_orders_kept(request_id, owner, Err("refused".into()));
+        assert!(state.seller_books[&owner].orders[0].despatch.is_none());
+        assert!(!state
+            .despatches_sent
+            .contains(&(STORE.to_vec(), paid.order.id.clone())));
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("Could not mark order")));
     }
 
     /// Step 2, the buyer's half of "history lives in each side's

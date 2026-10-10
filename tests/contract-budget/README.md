@@ -378,7 +378,7 @@ bound, every field at its largest, and the pause. Store case only
 (report-only), budget 2.2 billion fuel a call.
 
 **At the current caps** (256 paid orders, 128 listings; store wasm blake3
-`2ff7e507`; the wall-time runs that chose the caps were on `a4cf4e03`, and
+`36521bce`; the wall-time runs that chose the caps were on `a4cf4e03`, and
 the rows they share reproduce on every build since), as percentages of the
 budget:
 
@@ -401,13 +401,13 @@ budget:
 | | `summarize_state` | 45.6% |
 | | `get_state_delta` (co-host) | 45.9% |
 | | `get_state_delta` (new subscriber) | 39.0% |
-| a new subscriber's whole store (the one above, 7.8 MB) as one delta: the largest honest delta | `update_state` | **324.2%, over** |
+| a new subscriber's whole store (the one above, 7.8 MB) as one delta: the largest honest delta | `update_state` | **324.9%, over** |
 | | `validate_state` (merged) | **338.1%, over** |
-| 256 orders at caps + 58 padded `Paid` (16.7 MB), the most a delta under `MAX_STORE_BYTES` carries | `update_state` | **309.8%, over** |
-| | `validate_state` (merged) | **295.8%, over** |
-| | `summarize_state` | 34.5% |
-| | `get_state_delta` (co-host, new subscriber) | 34.4%, 29.1% |
-| 256 orders at caps + 59 padded `Paid`, past `MAX_STORE_BYTES` (refused on its length) | `update_state` | 3.0% |
+| 256 orders at caps + 43 padded `Paid` (12.4 MB), the most a delta under `MAX_STORE_BYTES` carries | `update_state` | **238.9%, over** |
+| | `validate_state` (merged) | **302.6%, over** |
+| 256 orders at caps + 44 padded `Paid`, past `MAX_STORE_BYTES` (refused on its length) | `update_state` | 2.4% |
+| one-listing delta + 256 copies of a held paid order | `update_state` | 64.6% |
+| one-listing delta + 4,000 copies of a held listing status | `update_state` | 46.4% |
 
 No call in these states ran out of memory. The delta and summary calls are
 within budget in every one; `validate_state` (and the full-state
@@ -418,33 +418,50 @@ a PUT took at most 1.82 s and a one-listing delta at most 2.15 s, and a
 merge under 2 s a call, in 3 of 3 runs (the wall-time runs that chose the
 caps, recorded in the `# Why 256` note on `harvest_common::store::MAX_ORDERS`).
 
-**A hostile delta costs no more than an honest one** (the overseer, step 2).
-Anyone may send a store a delta of `Paid` records padded past the byte
-bound, which the store only throws away. Two things keep that cheap:
+**No delta anyone may send costs more than an honest one** (the overseer,
+step 2). Anyone may send a store a delta of `Paid` records padded past the
+byte bound, which the store only throws away, or of copies of genuine
+records it already holds. Four things keep that cheap:
 
-* `store::paid_within_cap` judges a record past the bound by a floor on its
-  proof's bytes before encoding anything.
-* The contract refuses a delta, an incoming state, a state to validate, or a
-  merged state past `store::MAX_STORE_BYTES` (16 MiB) on its length, before
-  reading anything, the held state included.
+* `store::paid_within_cap` judges a record by a floor on its proof's bytes
+  before encoding anything.
+* The contract refuses a delta, an incoming state, a state to validate, or
+  one call's updates together past `store::MAX_STORE_BYTES` (12 MiB) on
+  their length, before reading anything, the held state included.
+* A record the store holds as it is, or that the delta repeats, is not
+  verified again.
+* An order delta of more records than a store holds is refused whole.
 
-64 padded records (18.5 MB) cost 450.9% before either. Under the bound, the
-worst (58 records) costs 309.8%, less than the largest honest delta's
-324.2%. Past it, the refusal costs 3.0%.
+64 padded records (18.5 MB) cost 450.9% before any of these. The worst under
+the bound (43 records) now costs 238.9%, against the largest honest delta's
+324.9%. 400 copies of a held paid order cost 237.8% and 4,000 of a held
+status 542.2% before the copies were skipped; they now cost 64.6% and
+46.4%.
 
-The bound sits above the largest state the caps allow (7.9 MB). It leaves
-about 16,000 listing-status edits of room, statuses being the one uncapped
-part.
+The bound is 12 MiB, not 16, by wall time on a node: at 16 MiB a padded
+delta took 4.2 to 5.9 s against the honest delta's 3.2 to 4.2 s, because
+the node's own handling of a delta grows with its bytes
+(`store-walltime-hostile.md` in the step-2 lane). It sits above the largest
+state the caps allow (7.9 MB), leaving about 8,000 listing-status edits of
+room; statuses are the one uncapped part (harvest#227).
 
 **The ratchet.** Report-only calls (store, reputation) are held to
-`ratchet.tsv`: a run fails if one rises more than 10% above its recorded
-fuel, is measured with no figure recorded, or passes the ceiling where it
-had one. Report-only means over the budget is a warning; it does not mean
-growing is free. `cargo run --release -- --write-ratchet` records the
-current figures; commit the file with the change that moves them, and say
-why in the PR. Seen failing on step 2's build: with one figure lowered 20%,
-the run exited 1 (`ratchet: store / 256 orders at caps + one-listing delta /
-update_state: 809,135,900 fuel, more than 110% of the 647,308,720 recorded`).
+`ratchet.tsv`. A run fails when one of them:
+
+* rises more than 10% above its recorded fuel;
+* is measured with no figure recorded;
+* passes the ceiling where it had a figure;
+* is recorded but not measured at all (unfiltered runs only): a fixture
+  that stopped being refused, or a case that went, is not held.
+
+Report-only means over the budget is a warning; it does not mean growing is
+free. `cargo run --release -- --write-ratchet` records the current figures.
+It refuses `--only` and `--case`, so a partial run cannot drop rows. Commit
+the file with the change that moves them, and say why in the PR.
+
+Seen failing on step 2's build: with one figure lowered 20%, the run exited
+1 (`ratchet: store / 256 orders at caps + one-listing delta / update_state:
+809,135,900 fuel, more than 110% of the 647,308,720 recorded`).
 
 **Measured at the former caps** (4096 paid orders, 512 listings), kept for
 comparison:

@@ -1039,9 +1039,27 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         let Some(incoming) = delta else {
             return Ok(());
         };
+        // No honest delta carries more orders than a store holds (a whole
+        // store's is `MAX_ORDERS`); a longer one is copies, each of which
+        // would be verified below (review round 4 of step 2: 400 copies of
+        // one paid record cost more than twice a call's budget).
+        if incoming.len() > MAX_ORDERS {
+            return Err(format!(
+                "an order delta of {} records is more than a store holds ({MAX_ORDERS})",
+                incoming.len()
+            ));
+        }
         // Each record as the store keeps it, before anything else: a padded
-        // `Paid` is its unpaid terms from here on (`as_kept`).
-        let incoming: Vec<AuthorizedOrder> = incoming.iter().cloned().map(as_kept).collect();
+        // `Paid` is its unpaid terms from here on (`as_kept`). One the store
+        // already holds as it is, or that came earlier in this delta, changes
+        // nothing and is not verified again.
+        let mut fresh: Vec<AuthorizedOrder> = Vec::with_capacity(incoming.len());
+        for record in incoming.iter().cloned().map(as_kept) {
+            if self.orders.get(&record.order.id) != Some(&record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        let incoming = fresh;
         // Verify the WHOLE delta before merging any of it. Verifying and
         // merging in one pass left a delta of [valid, invalid] with the valid
         // record already folded into `self` when the error returned, so a
@@ -1084,16 +1102,20 @@ impl OrdersV1 {
 /// send, padded with records the store would only throw away, costs no more
 /// to refuse than its length check.
 ///
-/// Sized by measurement (`tests/contract-budget`): the largest state the
-/// caps allow (every order paid at [`MAX_PAID_ORDER_BYTES`], every listing
-/// at [`MAX_LISTING_BYTES`], every backing slot full) encodes in about 7.9
-/// MB, and a new subscriber's whole-store delta of it costs about 324% of a
-/// call's budget to apply; a padded delta at this bound costs less than that
-/// (310% at 16.4 MB). What is left above the capped parts is room for the
-/// one uncapped part, the listing statuses (about 550 bytes each): about
-/// 16,000 status edits past a full store. A store that edits more often
-/// than that stops taking more (harvest#227 tracks status growth).
-pub const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+/// Sized by measurement on a node (`tests/contract-budget`, and the step-2
+/// wall-time runs): the largest state the caps allow (every order paid at
+/// [`MAX_PAID_ORDER_BYTES`], every listing at [`MAX_LISTING_BYTES`], every
+/// backing slot full) encodes in about 7.9 MB, and a new subscriber's
+/// whole-store delta of it took 3.2 to 4.2 s to apply. A padded delta's cost
+/// grows with its bytes, outside the contract too (the node took about 1.2 s
+/// to hand a 17 MB delta to it), and at 16 MiB took 4.2 to 5.9 s; at this
+/// bound it costs no more than the honest one. What is left above the
+/// capped parts is room for the one uncapped part, the listing statuses
+/// (about 550 bytes each): about 8,000 status edits past a full store. A
+/// store that edits more often than that stops taking more, and two copies
+/// of a store that near the bound can each refuse the other's last edit
+/// (harvest#227, which bounds the status history, is the fix).
+pub const MAX_STORE_BYTES: usize = 12 * 1024 * 1024;
 
 /// The most bytes a `Paid` record may take, as it encodes, for the store to
 /// keep it as paid (step 2): see [`as_kept`].
@@ -2346,6 +2368,49 @@ mod order_tests {
         }
         assert!(size(20, 0) <= MAX_PAID_ORDER_BYTES);
         assert!(size(9, 107) <= MAX_PAID_ORDER_BYTES);
+    }
+
+    /// Review round 4 of step 2 (codex, code-first): copies of a record
+    /// the store holds, or repeated within a delta, change nothing and are
+    /// not verified again, so replaying a genuine record costs no signature
+    /// checks; and a delta carrying more orders than a store holds is
+    /// refused whole. The result is the same as the delta with each record
+    /// once. (The cost is pinned in `tests/contract-budget`'s replay rows.)
+    #[test]
+    fn copies_change_nothing_and_a_delta_past_the_cap_is_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let unpaid = |n: i64| {
+            make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("copy-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xaa, n as u8],
+                ),
+                OrderStatus::AwaitingPayment,
+                None,
+            )
+        };
+        let mut held = OrdersV1::default();
+        held.apply_delta(&parent(), &p, &Some(vec![unpaid(1)]))
+            .unwrap();
+        let mut once = held.clone();
+        once.apply_delta(&parent(), &p, &Some(vec![unpaid(2)]))
+            .unwrap();
+        let mut copies = held.clone();
+        copies
+            .apply_delta(
+                &parent(),
+                &p,
+                &Some(vec![unpaid(1), unpaid(2), unpaid(1), unpaid(2), unpaid(2)]),
+            )
+            .unwrap();
+        assert_eq!(copies, once);
+        let why = held
+            .apply_delta(&parent(), &p, &Some(vec![unpaid(1); MAX_ORDERS + 1]))
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
     }
 
     /// Step 2: a `Paid` record on the minimal proof but past

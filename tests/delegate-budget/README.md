@@ -423,7 +423,7 @@ the figures are refreshed below:
 At the caps step 2 ships (`MAX_ORDERS` 256, `MAX_LISTINGS` 128), with the
 seller's book (three stages full: 128 unpaid and 128 paid orders waiting for
 room, 512 paid unsent at 3.9 MiB, 1024 sent at 6.7 MiB), delegate
-`471d5d66…` (step 2, review round 3):
+`e83aaf07…` (step 2, review round 3):
 
 | call | step 2 |
 |---|---:|
@@ -436,7 +436,7 @@ room, 512 paid unsent at 3.9 MiB, 1024 sent at 6.7 MiB), delegate
 | heartbeat wake-up moving 256 paid orders on (128 marked paid, 128 waiting for room) | 1,924,640,993 (64.2%) |
 | heartbeat wake-up with the same 256 and the paid stage full (128 wait, every one named) | 1,996,184,523 (66.5%) |
 | `ImportMigratedSecret`, a predecessor's full sent stage into a book that holds none | 894,341,833 (29.8%) |
-| same, its full paid stage after it | 1,467,777,938 (48.9%) |
+| same, its full paid stage after it | 1,444,903,677 (48.2%) |
 | `ImportMigratedSecret`, a full ledger into a full ledger | 704,032,904 (23.5%; 41.8% before) |
 | `KeepPurchase`, the 1024th | 1,113,917,725 (37.1%) |
 | `ListKeptPurchases (1024)` | 1,099,787,553 (36.7%) |

@@ -981,6 +981,48 @@ pub fn cases() -> Result<Vec<Case>> {
             update: Update::RefusedDelta(past_bound),
         },
     ];
+    // (f) Replayed genuine records (review round 4 of step 2): copies of
+    // records the store holds, beside the one new listing, are not
+    // verified again. 256 copies of a held paid order (the most an order
+    // delta may carry) and 4,000 of a held listing status.
+    let held_order = held
+        .orders
+        .orders
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("the held store has orders"))?;
+    let held_status = held
+        .listing_statuses
+        .records
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("the held store has statuses"))?;
+    for (what, delta) in [
+        (
+            format!("{MAX_ORDERS} copies of a held paid order"),
+            StoreStateV1Delta {
+                orders: Some(vec![held_order.clone(); MAX_ORDERS]),
+                ..one.clone()
+            },
+        ),
+        (
+            "4000 copies of a held listing status".to_string(),
+            StoreStateV1Delta {
+                listing_statuses: Some(vec![held_status.clone(); 4000]),
+                ..one.clone()
+            },
+        ),
+    ] {
+        sized.push(Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + one-listing delta + {what}"),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::Delta(cbor(&delta)),
+        });
+    }
     sized.push(Case {
         kind: Kind::Store,
         name: "a new subscriber's whole store (paid orders at their byte bound) as one delta"

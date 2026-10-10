@@ -3321,8 +3321,9 @@ fn signed_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
 /// this generation's rules BEFORE the fold merges them, so a `Paid` on
 /// padded evidence an earlier generation kept cannot outrank the other
 /// side's cancellation of the same order inside the merge and then be
-/// stripped to unpaid after it, losing the cancellation. Red with the
-/// normalisation after the merge only.
+/// stripped to unpaid after it, losing the cancellation, whichever side
+/// the predecessor is on. Red with either side's normalisation before the
+/// merge dropped.
 #[test]
 fn a_padded_paid_in_the_predecessor_does_not_hide_a_cancellation() {
     use harvest_common::payment::OrderStatus;
@@ -3354,11 +3355,24 @@ fn a_padded_paid_in_the_predecessor_does_not_hide_a_cancellation() {
         .orders
         .orders
         .insert(cancelled.order.id.clone(), cancelled.clone());
-    let folded = store_ops().merge_with_local(older, &local);
-    assert_eq!(
-        folded.orders.orders[&cancelled.order.id].status,
-        OrderStatus::Cancelled
-    );
+    // The predecessor as the base (`merge_with_local`), and as the other
+    // side (`merge_generations(newer, older)`).
+    for (shape, folded) in [
+        (
+            "merge_with_local",
+            store_ops().merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations",
+            store_ops().merge_generations(local.clone(), older),
+        ),
+    ] {
+        assert_eq!(
+            folded.orders.orders[&cancelled.order.id].status,
+            OrderStatus::Cancelled,
+            "{shape}"
+        );
+    }
 }
 
 /// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (256). A

@@ -533,6 +533,10 @@ fn run() -> Result<bool> {
     );
     println!();
 
+    if write_ratchet && (only.is_some() || case_filter.is_some()) {
+        bail!("--write-ratchet records every report-only call, so it runs unfiltered");
+    }
+
     let mut runner = Runner {
         contracts,
         calibrate_reps,
@@ -544,10 +548,16 @@ fn run() -> Result<bool> {
             bail!("--only {only}: no such contract");
         }
     }
-    let selected = cases::all()?.into_iter().filter(|c| {
-        only.as_deref().is_none_or(|o| c.kind.name() == o)
-            && case_filter.as_deref().is_none_or(|f| c.name.contains(f))
-    });
+    let selected: Vec<_> = cases::all()?
+        .into_iter()
+        .filter(|c| {
+            only.as_deref().is_none_or(|o| c.kind.name() == o)
+                && case_filter.as_deref().is_none_or(|f| c.name.contains(f))
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!("no case matches the filter");
+    }
     for case in selected {
         if let Err(e) = runner.run_case(&case) {
             failure = Some(e);
@@ -565,7 +575,13 @@ fn run() -> Result<bool> {
     } else {
         let recorded = std::fs::read_to_string(&ratchet_path)
             .with_context(|| format!("read {}", ratchet_path.display()))?;
-        let broken = ratchet_failures(&runner.measured, &parse_ratchet(&recorded)?);
+        let recorded = parse_ratchet(&recorded)?;
+        let mut broken = ratchet_failures(&runner.measured, &recorded);
+        // Unfiltered, every recorded call must have been measured: one that
+        // no longer runs (a fixture refused, a case gone) is not held.
+        if only.is_none() && case_filter.is_none() {
+            broken.extend(ratchet_unmeasured(&runner.measured, &recorded));
+        }
         for why in &broken {
             eprintln!("::error::ratchet: {why}");
         }
@@ -829,6 +845,24 @@ fn ratchet_failures(
     out
 }
 
+/// Each recorded call this run did not measure.
+fn ratchet_unmeasured(
+    measured: &[Measured],
+    recorded: &BTreeMap<(String, String, String), u64>,
+) -> Vec<String> {
+    recorded
+        .keys()
+        .filter(|(contract, case, call)| {
+            !measured
+                .iter()
+                .any(|m| m.contract == contract && m.case == *case && m.call == call)
+        })
+        .map(|(contract, case, call)| {
+            format!("{contract} / {case} / {call}: recorded, but not measured this run")
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     let outcome = run();
     if let Err(e) = &outcome {
@@ -867,6 +901,9 @@ mod tests {
         assert_eq!(ratchet_failures(&[new], &recorded).len(), 1);
         let written = write_ratchet_file(&[at(Some(7), false), at(Some(9), true)]);
         assert_eq!(parse_ratchet(&written).unwrap().len(), 1);
+        // A recorded call not measured is named.
+        assert_eq!(ratchet_unmeasured(&[], &recorded).len(), 1);
+        assert!(ratchet_unmeasured(&[at(Some(1), false)], &recorded).is_empty());
     }
 
     fn measured(gating: bool, fuel: Option<u64>, trap: Option<&str>) -> Measured {
