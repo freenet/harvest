@@ -182,11 +182,22 @@ pub fn ListingForm(
                         // Listings row holds too; this covers a form reached
                         // another way (Back, then Forward).
                         if let Some(old) = &target.replaces {
-                            if crate::gateway::APP_STATE
-                                .read()
-                                .listing_status_pending(&target.store, old)
+                            let state = crate::gateway::APP_STATE.read();
+                            let refused = if state.listing_status_pending(&target.store, old) {
+                                Some(STILL_SAVING)
+                            } else if state.listing_availability(&target.store, old)
+                                == harvest_common::listing::ListingAvailability::Withdrawn
                             {
-                                photo_error.set(Some(STILL_SAVING.to_string()));
+                                // Taken down, or already replaced by an earlier
+                                // save from this form: saving again would
+                                // publish a replacement taken down too.
+                                Some(NOT_LIVE)
+                            } else {
+                                None
+                            };
+                            drop(state);
+                            if let Some(refused) = refused {
+                                photo_error.set(Some(refused.to_string()));
                                 return;
                             }
                         }
@@ -330,8 +341,11 @@ pub fn ListingForm(
 
 /// Said when an edit is pressed while the listing is still being saved.
 pub(crate) const STILL_SAVING: &str =
-    "This listing is still being saved. Wait until Listings shows \
-     it, then edit it again.";
+    "This listing is still being saved. Try again once Listings shows it.";
+
+/// Said when an edit is pressed for a listing that is no longer on show.
+pub(crate) const NOT_LIVE: &str = "This listing has been taken down or replaced. Open the \
+     listing on show from Listings to change it.";
 
 /// What pressing List it hands on: the listing to publish, and the photos
 /// to upload before it is signed.

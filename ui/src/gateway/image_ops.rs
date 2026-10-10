@@ -138,7 +138,12 @@ impl ImageWaiters {
                 let _ = tx.send(answer.clone());
             }
         }
-        if !bytes.is_empty() && image_instance_id(harvest_image::image_hash(bytes)) == *id {
+        // Hashed only when an upload waits: every store and mailbox state
+        // passes through here too.
+        if !bytes.is_empty()
+            && self.puts.contains_key(id)
+            && image_instance_id(harvest_image::image_hash(bytes)) == *id
+        {
             if let Some(waiting) = self.puts.remove(id) {
                 for tx in waiting {
                     let _ = tx.send(());
