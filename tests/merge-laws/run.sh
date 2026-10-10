@@ -36,6 +36,7 @@ if [ ${#corpora[@]} -eq 0 ]; then
     store-fulfilment store-fulfilment-cap store-fulfilment-bad
     store-r98cap store-r98race store-r98retire
     store-status store-status-bad store-request store-request-cap
+    store-paidcap store-listcap store-pause
     reputation reputation-empty reputation-adv reputation-rr reputation-cap
     mailbox mailbox-empty mailbox-adv mailbox-cap mailbox-cap2 mailbox-cap3
     mailbox-noncanon mailbox-rr

@@ -859,19 +859,23 @@ pub(crate) fn merge_store_reporting_discard(
     side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
-    let base = name_whole_key_owner(base, seller);
-    let owned_other = name_whole_key_owner(other.clone(), seller);
-    let other = &owned_other;
+    // Each side as this generation keeps it BEFORE the merge, so a record
+    // an earlier generation kept (a `Paid` on padded evidence, say) cannot
+    // outrank the other side's in it, and then be stripped after.
+    let mut base = name_whole_key_owner(base, seller);
+    base.normalize_carried();
+    let mut owned_other = name_whole_key_owner(other.clone(), seller);
+    owned_other.normalize_carried();
     let snapshot = base.clone();
-    let mut outcome =
-        fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
-    // The scaffold's merge skips a part's `apply_delta` when the other side
-    // brings nothing new for it, so a base written under an older `verify`
-    // would be carried forward as it was, and the current contract refuses
-    // that: listings unsorted (harvest#26), more listings or orders than
-    // step 2's caps, or a `Paid` on padded evidence (kept as its unpaid
-    // terms since step 2). The predecessor is the BASE when the driver
-    // folds a recovered state into a local one (`merge_with_local`).
+    let mut outcome = fold_or_keep_primary("store", base, |base| {
+        base.merge(&snapshot, params, &owned_other)
+    });
+    // Both sides were held to this generation's rules before the merge
+    // (above), and the merge keeps them; once more after it costs little and
+    // guards what the scaffold's merge skips: a base written under an older
+    // `verify` would otherwise be carried forward as it was (harvest#26),
+    // and the predecessor is the BASE when the driver folds a recovered
+    // state into a local one (`merge_with_local`).
     outcome.state.normalize_carried();
     // Nor does it touch a version-0 info, and a predecessor written before the
     // PR #82 re-review can hold unsigned content there: anything was accepted

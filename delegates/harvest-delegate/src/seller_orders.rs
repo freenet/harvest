@@ -503,17 +503,12 @@ fn checked(
     })
 }
 
-/// A predecessor's record held to this generation's bounds (its status,
-/// its despatch's order, its request's texts and choices) without
+/// A predecessor's record held to this generation's bounds (its despatch's
+/// order, its request's texts and choices) without
 /// re-checking its signatures or its proof ([`Source::Predecessor`]).
 fn shaped(incoming: SellerKeptOrder) -> Result<SellerKeptOrder, String> {
+    // (A cancelled one needs no check here: filing drops it.)
     let id = &incoming.order.order.id;
-    if !matches!(
-        incoming.order.status,
-        OrderStatus::AwaitingPayment | OrderStatus::Paid | OrderStatus::PaymentReversed
-    ) {
-        return Err(format!("order {id} is not unpaid, paid or reversed"));
-    }
     if incoming
         .despatch
         .as_ref()
@@ -2073,9 +2068,10 @@ pub(crate) mod tests {
             && r.paid_height.is_some()
             && r.request.is_some()));
         // Marked paid since, and older: it does not push one out.
+        // First in the stage, as its `created_at` would sort it.
         let mut marked = record(2999, OrderStatus::Paid);
         marked.order.payment_proof = None;
-        book.unpaid.push(marked);
+        book.unpaid.insert(0, marked);
         book.promote();
         assert_eq!(book.unpaid.len(), MAX_SELLER_UNPAID_KEPT);
         assert!(book

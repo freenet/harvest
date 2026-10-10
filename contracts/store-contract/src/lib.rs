@@ -22,6 +22,7 @@ impl ContractInterface for Contract {
         if bytes.is_empty() {
             return Ok(ValidateResult::Valid);
         }
+        within_bound(bytes, "a store state")?;
 
         let store_state = from_reader::<StoreStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
@@ -63,6 +64,15 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
+        // Every update past the store's byte bound is refused before anything
+        // is read, the held state included.
+        for update in &data {
+            match update {
+                UpdateData::State(s) => within_bound(s.as_ref(), "a store state")?,
+                UpdateData::Delta(d) => within_bound(d.as_ref(), "a store delta")?,
+                _ => {}
+            }
+        }
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
@@ -130,6 +140,7 @@ impl ContractInterface for Contract {
         let mut updated_state = vec![];
         into_writer(&store_state, &mut updated_state)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
+        within_bound(&updated_state, "the merged store state")?;
 
         Ok(UpdateModification::valid(updated_state.into()))
     }
@@ -195,6 +206,21 @@ impl ContractInterface for Contract {
     }
 }
 
+/// Refuse `bytes` past [`harvest_common::store::MAX_STORE_BYTES`] on its
+/// length, before anything is read.
+fn within_bound(bytes: &[u8], what: &str) -> Result<(), ContractError> {
+    if bytes.len() > harvest_common::store::MAX_STORE_BYTES {
+        return Err(ContractError::InvalidUpdateWithInfo {
+            reason: format!(
+                "{what} of {} bytes is past the most a store takes, {}",
+                bytes.len(),
+                harvest_common::store::MAX_STORE_BYTES
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +233,40 @@ mod tests {
         AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus,
     };
     use harvest_common::store::OrdersV1;
+
+    /// Step 2 (the overseer's hostile-delta check): a delta, an incoming
+    /// state, or a state to validate past `MAX_STORE_BYTES` is refused on its
+    /// length before any of it is read (these are bytes nothing decodes).
+    /// Red with the bound dropped (the bytes then fail to decode instead).
+    #[test]
+    fn an_update_past_the_store_bound_is_refused_on_its_length() {
+        let params = Parameters::from(
+            harvest_common::to_cbor(&StoreParameters::new(seller_key().verifying_key())).unwrap(),
+        );
+        let mut oversized = vec![0xa1u8];
+        oversized.resize(harvest_common::store::MAX_STORE_BYTES + 1, 0xff);
+        for update in [
+            UpdateData::Delta(StateDelta::from(oversized.clone())),
+            UpdateData::State(State::from(oversized.clone())),
+        ] {
+            let why = <Contract as ContractInterface>::update_state(
+                params.clone(),
+                State::from(vec![]),
+                vec![update],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(why.contains("past the most a store takes"), "{why}");
+        }
+        let why = <Contract as ContractInterface>::validate_state(
+            params,
+            State::from(oversized),
+            RelatedContracts::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("past the most a store takes"), "{why}");
+    }
 
     fn seller_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])

@@ -49,8 +49,59 @@ that would re-key an artifact as a side effect of running the test tooling.
 
 The family names the generator takes (`store`, `claim`, `triad`, `triadcap`,
 `reputation`, `mailbox`, `review`, `rr`, `backing`, `review98`, `index`,
-`copies`, `retire98`, `fulfilment`, `status`, `request`, `presence`) are not the same as the corpus names the runner takes; one
+`copies`, `retire98`, `fulfilment`, `status`, `request`, `presence`, `paidcap`,
+`listcap`, `pause`) are not the same as the corpus names the runner takes; one
 family writes several corpora.
+
+## Step 2's caps and the pause
+
+Step 2 added store rules that no corpus exercised until its review round 2
+said so. Each family below writes one corpus, built through the store's own
+`apply_delta`, and checks the merge laws natively on a subset of it before
+writing (`native_laws_total`).
+
+- **`store-paidcap`** (`paidcap`) -- the item rule `as_kept`: a `Paid` record
+  stays paid only on the canonical minimal proof, within
+  `MAX_PAID_ORDER_BYTES` (8 KiB), and is otherwise kept as its unpaid terms.
+  A state holding a padded `Paid` does not verify, so the raw records ride
+  in hand-built DELTAS (that is where the WASM meets the rule), and the
+  states hold what the store keeps. For the same orders the deltas carry an
+  honest minimal `Paid` (two proofs), the same payment padded with `ScannedTo`
+  claims (non-minimal, still under 8 KiB), a minimal `Paid` just over 8 KiB
+  and one just under it (filler outputs, sized to the byte), the unpaid terms
+  and a cancellation, alone and mixed in one delta in both orders. Two
+  `MAX_ORDERS` states whose four oldest orders, the first any newer order
+  cuts, arrived honest, padded, over and under, so the cap and the rule meet.
+  And the migration fold's result over a RECOVERED base of 300 orders and 130
+  listings (`fold_store`, which models `merge_store_reporting_discard`,
+  including `normalize_carried`; the driver calls
+  `merge_with_local(recovered, &local)`, so the unverified side is the base).
+- **`store-listcap`** (`listcap`) -- `MAX_LISTINGS` (128) newest by
+  `(created_at, id)`: 100 newer listings, 40 created in the same second and
+  8 older, spread over states of at most 128 so a union of two crosses the cap
+  and the cut runs through the tie (the 28 smallest ids of it are kept). One
+  listing either side of `MAX_LISTING_BYTES` (32 KiB); the one over is only
+  ever in a delta, since a state cannot hold it.
+- **`store-pause`** (`pause`) -- `PauseV1`, one store-key-signed slot: the
+  higher revision, then the smaller encoding. Several revisions, equal
+  revisions with opposite `paused`, `u64::MAX`, a pause beside a listing and
+  beside the closed flag, every ordered pair merged, and deltas carrying two
+  pauses for the slot in both orders.
+
+`store-listcap` shows a few inconclusive cases in the bundle run
+(`delta_idempotence`, `delta_permutation_invariance`): fdev applies the delta
+carrying only the over-bound listing to the empty store, and the contract
+refuses it ("an update that claims a store must carry something its owner
+signed"), since the listing is dropped and nothing signed is left. That is the
+right answer, not a gap.
+
+**fdev pairs at most 24 states and samples at most 24 transitions**
+(`max_states_paired`, `max_transitions` in freenet-core's
+`conformance/generator.rs`), strided over the corpus. A corpus of 85 states
+(`store-paidcap`) therefore checks the pairwise and triple state laws on about
+a quarter of its states (those at index `floor(i * n / 24)`). The delta laws
+see every distinct delta. Keep a corpus near 24 states when the state laws
+are the point.
 
 ## The presence contract
 

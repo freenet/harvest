@@ -905,12 +905,92 @@ pub fn cases() -> Result<Vec<Case>> {
         0,
         Some(harvest_common::store::MAX_PAID_ORDER_BYTES),
     )?;
+    for (what, bytes) in [
+        ("held store", held_bytes.len()),
+        ("other store", cbor(&other).len()),
+        ("merged store", cbor(&merged).len()),
+        ("store of paid orders at their byte bound", cbor(&big).len()),
+        ("one-listing delta", cbor(&one).len()),
+        ("padded delta", cbor(&padded).len()),
+        (
+            "a status",
+            cbor(&held.listing_statuses.records.values().next()).len(),
+        ),
+    ] {
+        println!("store      size: {what}: {bytes} bytes");
+    }
     fits_a_node("the store of paid orders at their byte bound", &big)?;
     fits_a_node("the held store fixture", &held)?;
     fits_a_node("the second store fixture", &other)?;
     fits_a_node("the merge of the two store fixtures", &merged)?;
 
-    Ok(vec![
+    // (e) Measuring the hostile delta against the honest one it must not
+    // outcost: padded `Paid` deltas of several sizes, and the largest honest
+    // delta there is, a new subscriber's whole store of paid orders at their
+    // byte bound.
+    let padded_of = |n: u64| -> Result<Vec<u8>> {
+        Ok(cbor(&StoreStateV1Delta {
+            owner: Some(shop.owner()),
+            orders: Some(
+                (0..n)
+                    .map(|i| shop.padded_paid_order("store/padded", i))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            ..Default::default()
+        }))
+    };
+    let whole = {
+        use freenet_scaffold::ComposableState;
+        let empty = StoreStateV1::default();
+        let summary = empty.summarize(&empty, &shop.parameters);
+        cbor(
+            &big.delta(&big, &shop.parameters, &summary)
+                .ok_or_else(|| anyhow!("a whole store has a delta to an empty one"))?,
+        )
+    };
+    println!("store      size: whole-store delta: {} bytes", whole.len());
+    // The most padded records a delta under `MAX_STORE_BYTES` carries: the
+    // worst a hostile delta can do now. One more record is past the bound.
+    let bound = harvest_common::store::MAX_STORE_BYTES;
+    let mut n = 1u64;
+    while padded_of(n + 1)?.len() <= bound {
+        n += 1;
+    }
+    let at_bound = padded_of(n)?;
+    let past_bound = padded_of(n + 1)?;
+    println!(
+        "store      size: {n}-record padded delta: {} bytes (bound {bound})",
+        at_bound.len()
+    );
+    if whole.len() > bound || cbor(&big).len() > bound {
+        bail!("the largest honest store, or its whole-store delta, is past MAX_STORE_BYTES");
+    }
+    let mut sized = vec![
+        Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + {n} padded Paid, the most under the store's byte bound"),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::Delta(at_bound),
+        },
+        Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + {} padded Paid, past the store's byte bound (refused)", n + 1),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::RefusedDelta(past_bound),
+        },
+    ];
+    sized.push(Case {
+        kind: Kind::Store,
+        name: "a new subscriber's whole store (paid orders at their byte bound) as one delta"
+            .into(),
+        parameters: parameters.clone(),
+        held: Vec::new(),
+        update: Update::Delta(whole),
+    });
+
+    let mut cases = vec![
         Case {
             kind: Kind::Store,
             name: format!("{MAX_ORDERS} orders at caps + one-listing delta"),
@@ -935,14 +1015,7 @@ pub fn cases() -> Result<Vec<Case>> {
             held: cbor(&big),
             update: Update::Delta(cbor(&one)),
         },
-        Case {
-            kind: Kind::Store,
-            name: format!(
-                "{MAX_ORDERS} orders at caps + {PADDED_ORDERS} Paid padded to 256 KiB (kept unpaid)"
-            ),
-            parameters,
-            held: held_bytes,
-            update: Update::Delta(cbor(&padded)),
-        },
-    ])
+    ];
+    cases.extend(sized);
+    Ok(cases)
 }

@@ -3317,6 +3317,50 @@ fn signed_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
     }
 }
 
+/// Review round 3 of step 2 (the merge-law generator): each side is held to
+/// this generation's rules BEFORE the fold merges them, so a `Paid` on
+/// padded evidence an earlier generation kept cannot outrank the other
+/// side's cancellation of the same order inside the merge and then be
+/// stripped to unpaid after it, losing the cancellation. Red with the
+/// normalisation after the merge only.
+#[test]
+fn a_padded_paid_in_the_predecessor_does_not_hide_a_cancellation() {
+    use harvest_common::payment::OrderStatus;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    let padded = padded_paid_order(5);
+    older
+        .orders
+        .orders
+        .insert(padded.order.id.clone(), padded.clone());
+    let mut cancelled = signed_order(5);
+    cancelled.status = OrderStatus::Cancelled;
+    let message = (cancelled.order.id.clone(), OrderStatus::Cancelled);
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&message).expect("encode"),
+    };
+    let scoped = harvest_common::to_cbor(&scoped).expect("encode");
+    cancelled.status_signature = Some(seller().sign(&scoped).to_bytes().to_vec());
+    cancelled.status_scoped_payload = Some(scoped);
+    cancelled
+        .verify(&seller_vk())
+        .expect("precondition: the seller's cancellation");
+    let mut local = store_with(&[signed_listing("Plum")]);
+    local
+        .orders
+        .orders
+        .insert(cancelled.order.id.clone(), cancelled.clone());
+    let folded = store_ops().merge_with_local(older, &local);
+    assert_eq!(
+        folded.orders.orders[&cancelled.order.id].status,
+        OrderStatus::Cancelled
+    );
+}
+
 /// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (256). A
 /// predecessor generation that holds 4096 orders is folded, not refused: the
 /// fold keeps the newest `MAX_ORDERS` by `created_at` and carries every one

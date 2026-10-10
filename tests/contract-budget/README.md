@@ -378,10 +378,9 @@ bound, every field at its largest, and the pause. Store case only
 (report-only), budget 2.2 billion fuel a call.
 
 **At the current caps** (256 paid orders, 128 listings; store wasm blake3
-`9c3a7fb7`; the wall-time runs were on `a4cf4e03`, and these figures
-reproduce on every build since, whose store changes check the listing caps
-before the signatures and touch nothing these states reach), as percentages
-of the budget:
+`2ff7e507`; the wall-time runs that chose the caps were on `a4cf4e03`, and
+the rows they share reproduce on every build since), as percentages of the
+budget:
 
 | case | call | of budget |
 |---|---|---:|
@@ -402,11 +401,13 @@ of the budget:
 | | `summarize_state` | 45.6% |
 | | `get_state_delta` (co-host) | 45.9% |
 | | `get_state_delta` (new subscriber) | 39.0% |
-| 256 orders at caps + 64 Paid padded to 256 KiB (kept unpaid) | `update_state` | **450.9%, over** |
-| | `validate_state` | **293.1%, over** |
-| | `summarize_state` | 34.0% |
-| | `get_state_delta` (co-host) | 33.9% |
-| | `get_state_delta` (new subscriber) | 28.6% |
+| a new subscriber's whole store (the one above, 7.8 MB) as one delta: the largest honest delta | `update_state` | **324.2%, over** |
+| | `validate_state` (merged) | **338.1%, over** |
+| 256 orders at caps + 58 padded `Paid` (16.7 MB), the most a delta under `MAX_STORE_BYTES` carries | `update_state` | **309.8%, over** |
+| | `validate_state` (merged) | **295.8%, over** |
+| | `summarize_state` | 34.5% |
+| | `get_state_delta` (co-host, new subscriber) | 34.4%, 29.1% |
+| 256 orders at caps + 59 padded `Paid`, past `MAX_STORE_BYTES` (refused on its length) | `update_state` | 3.0% |
 
 No call in these states ran out of memory. The delta and summary calls are
 within budget in every one; `validate_state` (and the full-state
@@ -416,6 +417,34 @@ clock: with 256 orders at the 8 KiB bound and 128 listings full at 32 KiB,
 a PUT took at most 1.82 s and a one-listing delta at most 2.15 s, and a
 merge under 2 s a call, in 3 of 3 runs (the wall-time runs that chose the
 caps, recorded in the `# Why 256` note on `harvest_common::store::MAX_ORDERS`).
+
+**A hostile delta costs no more than an honest one** (the overseer, step 2).
+Anyone may send a store a delta of `Paid` records padded past the byte
+bound, which the store only throws away. Two things keep that cheap:
+
+* `store::paid_within_cap` judges a record past the bound by a floor on its
+  proof's bytes before encoding anything.
+* The contract refuses a delta, an incoming state, a state to validate, or a
+  merged state past `store::MAX_STORE_BYTES` (16 MiB) on its length, before
+  reading anything, the held state included.
+
+64 padded records (18.5 MB) cost 450.9% before either. Under the bound, the
+worst (58 records) costs 309.8%, less than the largest honest delta's
+324.2%. Past it, the refusal costs 3.0%.
+
+The bound sits above the largest state the caps allow (7.9 MB). It leaves
+about 16,000 listing-status edits of room, statuses being the one uncapped
+part.
+
+**The ratchet.** Report-only calls (store, reputation) are held to
+`ratchet.tsv`: a run fails if one rises more than 10% above its recorded
+fuel, is measured with no figure recorded, or passes the ceiling where it
+had one. Report-only means over the budget is a warning; it does not mean
+growing is free. `cargo run --release -- --write-ratchet` records the
+current figures; commit the file with the change that moves them, and say
+why in the PR. Seen failing on step 2's build: with one figure lowered 20%,
+the run exited 1 (`ratchet: store / 256 orders at caps + one-listing delta /
+update_state: 809,135,900 fuel, more than 110% of the 647,308,720 recorded`).
 
 **Measured at the former caps** (4096 paid orders, 512 listings), kept for
 comparison:

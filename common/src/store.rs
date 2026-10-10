@@ -1078,6 +1078,23 @@ impl OrdersV1 {
     }
 }
 
+/// The most bytes a store's state, or one update to it (a delta, or a whole
+/// state to merge), may take as it encodes (step 2). The contract refuses a
+/// larger one on its length, before reading any of it: a delta anyone may
+/// send, padded with records the store would only throw away, costs no more
+/// to refuse than its length check.
+///
+/// Sized by measurement (`tests/contract-budget`): the largest state the
+/// caps allow (every order paid at [`MAX_PAID_ORDER_BYTES`], every listing
+/// at [`MAX_LISTING_BYTES`], every backing slot full) encodes in about 7.9
+/// MB, and a new subscriber's whole-store delta of it costs about 324% of a
+/// call's budget to apply; a padded delta at this bound costs less than that
+/// (310% at 16.4 MB). What is left above the capped parts is room for the
+/// one uncapped part, the listing statuses (about 550 bytes each): about
+/// 16,000 status edits past a full store. A store that edits more often
+/// than that stops taking more (harvest#227 tracks status growth).
+pub const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+
 /// The most bytes a `Paid` record may take, as it encodes, for the store to
 /// keep it as paid (step 2): see [`as_kept`].
 ///
@@ -1146,8 +1163,31 @@ fn paid_minimally(record: &AuthorizedOrder) -> bool {
 }
 
 /// Whether a record takes at most [`MAX_PAID_ORDER_BYTES`] as it encodes.
+///
+/// A proof's signed bodies and signatures alone are a floor on the record's
+/// size (each of their bytes takes at least one as it encodes), so a record
+/// whose proof is past the bound by that count is judged without encoding it:
+/// a padded record anyone may send costs nothing more to throw away than
+/// reading it did.
 pub fn paid_within_cap(record: &AuthorizedOrder) -> bool {
+    if proof_bytes_at_least(record) > MAX_PAID_ORDER_BYTES {
+        return false;
+    }
     crate::to_cbor(record).is_ok_and(|bytes| bytes.len() <= MAX_PAID_ORDER_BYTES)
+}
+
+/// A floor on the bytes `record`'s payment proof takes as it encodes: the
+/// lengths of its claims' and tip's signed bodies and signatures.
+fn proof_bytes_at_least(record: &AuthorizedOrder) -> usize {
+    match &record.payment_proof {
+        Some(crate::payment::OrderPaymentProof::OnChain(proof)) => proof
+            .claims
+            .iter()
+            .map(|c| c.body_cbor.len() + c.signature.len())
+            .sum::<usize>()
+            .saturating_add(proof.tip.body_cbor.len() + proof.tip.signature.len()),
+        _ => 0,
+    }
 }
 
 /// The key a store's records are verified against: its owner.
@@ -2289,7 +2329,13 @@ mod order_tests {
             );
             crate::payment::verify_payment_proof(&order, record.payment_proof.as_ref().unwrap())
                 .expect("a genuine proof");
-            crate::to_cbor(&record).unwrap().len()
+            let len = crate::to_cbor(&record).unwrap().len();
+            // The floor `paid_within_cap` judges by first never passes the
+            // record's real size, or an honest record would be stripped
+            // without being measured.
+            assert!(super::proof_bytes_at_least(&record) <= len);
+            assert_eq!(paid_within_cap(&record), len <= MAX_PAID_ORDER_BYTES);
+            len
         };
         for inputs in [1usize, 2, 5, 10, 20] {
             eprintln!(

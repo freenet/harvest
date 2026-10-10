@@ -423,7 +423,7 @@ the figures are refreshed below:
 At the caps step 2 ships (`MAX_ORDERS` 256, `MAX_LISTINGS` 128), with the
 seller's book (three stages full: 128 unpaid and 128 paid orders waiting for
 room, 512 paid unsent at 3.9 MiB, 1024 sent at 6.7 MiB), delegate
-`0a3fe891…` (step 2, review round 3):
+`471d5d66…` (step 2, review round 3):
 
 | call | step 2 |
 |---|---:|
