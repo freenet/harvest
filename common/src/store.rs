@@ -7640,7 +7640,9 @@ mod listing_cap_tests {
         };
         let mut merged = held.clone();
         let mut unchecked = Unchecked::default();
-        merged.apply_update(&params, &delta, &mut unchecked).unwrap();
+        merged
+            .apply_update(&params, &delta, &mut unchecked)
+            .unwrap();
         assert_eq!(merged, held, "the cut listing changed nothing");
         assert!(unchecked.check(&merged).is_err());
         assert!(through_the_node(&held, &params, &delta).is_err());

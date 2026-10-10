@@ -3556,10 +3556,17 @@ fn a_predecessor_over_the_status_bound_is_cut_to_its_newest_whichever_side_it_is
     ] {
         let held = &state.listing_statuses.records;
         assert_eq!(held.len(), MAX_LISTING_STATUSES, "{shape}");
-        assert!(held.contains_key(&oldest_kept), "{shape}: the newest are kept");
+        assert!(
+            held.contains_key(&oldest_kept),
+            "{shape}: the newest are kept"
+        );
         assert!(!held.contains_key(&newest_cut), "{shape}: the oldest go");
         assert!(
-            state.listings.listings.iter().any(|l| l.listing.title == "Jam"),
+            state
+                .listings
+                .listings
+                .iter()
+                .any(|l| l.listing.title == "Jam"),
             "{shape}: its listing is carried"
         );
         state
