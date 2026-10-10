@@ -189,50 +189,54 @@ pub(crate) struct ListingTarget {
 }
 
 impl ListingTarget {
-    /// Publish `listing` (a new one, or in place of [`Self::replaces`]).
-    /// `on_screen`: the form is still showing, so go back to Listings in
-    /// its place; otherwise the seller is elsewhere, and is told instead.
-    pub(crate) fn save(&self, listing: Listing, quantity: Option<u32>, on_screen: bool) {
-        let named = listing.title.clone();
-        let saved = {
-            let mut state = APP_STATE.write();
-            let result = match &self.replaces {
-                Some(old) => state
-                    .replace_listing(
-                        self.store.clone(),
-                        self.fingerprint.clone(),
-                        old.clone(),
-                        listing,
-                        quantity,
-                    )
-                    .map_err(|e| format!("Could not save the listing: {e}")),
-                None => state
-                    .publish_new_listing(
-                        self.store.clone(),
-                        self.fingerprint.clone(),
-                        listing,
-                        quantity,
-                    )
-                    .map_err(|e| format!("Cannot add the listing: {e}")),
-            };
-            match result {
-                Ok(_) => true,
-                Err(e) => {
-                    state.notifications.push(e);
-                    false
-                }
-            }
-        };
-        if on_screen {
-            // In place of the form, so Back does not reopen it.
-            super::router::replace(super::seller_pages::seller_page(
-                &self.store,
-                super::router::SellerView::Listings,
-            ));
-        } else if saved {
-            APP_STATE.write().notifications.push(format!(
-                "Photos uploaded; \u{201c}{named}\u{201d} is saved."
-            ));
+    /// Publish `listing`: a new one, or in place of [`Self::replaces`]. An
+    /// error is said as a sentence for the seller; nothing is pushed to the
+    /// notices here, since where it is said depends on whether the form is
+    /// still on screen.
+    pub(crate) fn apply(
+        &self,
+        state: &mut crate::state::AppState,
+        listing: Listing,
+        quantity: Option<u32>,
+    ) -> Result<(), String> {
+        match &self.replaces {
+            Some(old) => state
+                .replace_listing(
+                    self.store.clone(),
+                    self.fingerprint.clone(),
+                    old.clone(),
+                    listing,
+                    quantity,
+                )
+                .map_err(|e| format!("Could not save the listing: {e}")),
+            None => state
+                .publish_new_listing(
+                    self.store.clone(),
+                    self.fingerprint.clone(),
+                    listing,
+                    quantity,
+                )
+                .map_err(|e| format!("Cannot add the listing: {e}")),
+        }
+    }
+
+    /// Where the seller goes once the listing is handed on.
+    pub(crate) fn listings_page(&self) -> super::router::Page {
+        super::seller_pages::seller_page(&self.store, super::router::SellerView::Listings)
+    }
+
+    /// Said when the photos for `title` did not upload and the seller has
+    /// left the form, so its own error line is not there to say it.
+    pub(crate) fn upload_failed_notice(&self, title: &str, problem: &str) -> String {
+        match self.replaces {
+            Some(_) => format!(
+                "The photos for your edit of \u{201c}{title}\u{201d} did not upload, so the \
+                 listing is unchanged. {problem}"
+            ),
+            None => format!(
+                "The photos for \u{201c}{title}\u{201d} did not upload, so it was not listed. \
+                 {problem}"
+            ),
         }
     }
 }
@@ -263,6 +267,7 @@ pub(crate) fn ListingFormPage(
     let back = rsx! {
         super::seller_pages::BackTo { label: "Listings".to_string(), page: listings_page.clone() }
     };
+    let add_key = format!("add-{}", listings_page.fragment());
     let on_cancel = {
         let page = listings_page.clone();
         move |_| super::router::go(page.clone())
@@ -272,7 +277,11 @@ pub(crate) fn ListingFormPage(
             {back}
             p { class: "text-muted text-italic", "That listing isn\u{2019}t here, or hasn\u{2019}t loaded yet." }
         },
+        // Keyed: a jump straight from one listing's Edit page to another's
+        // (or from one store's Add page to another's) must get a new form,
+        // not carry the first one's fields over.
         Some(Some((listing, availability))) => rsx! {
+            Fragment { key: "{listing.id}",
             {back}
             h2 { class: "page-h", "Edit {listing.title}" }
             ListingForm {
@@ -289,8 +298,10 @@ pub(crate) fn ListingFormPage(
                     replaces: Some(listing.id.clone()),
                 },
             }
+            }
         },
         None => rsx! {
+            Fragment { key: "{add_key}",
             {back}
             h2 { class: "page-h", "Add a listing" }
             ListingForm {
@@ -302,6 +313,7 @@ pub(crate) fn ListingFormPage(
                     fingerprint: fingerprint.clone(),
                     replaces: None,
                 },
+            }
             }
         },
     }

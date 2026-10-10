@@ -833,6 +833,10 @@ pub struct AppState {
     pub publishing_listings:
         HashMap<harvest_common::listing::ListingId, crate::listing_status_flow::Publishing>,
 
+    /// Listings from the form whose photos are uploading, so the page can
+    /// say so and hold their rows. See `AppState::begin_listing_upload`.
+    pub listing_uploads: Vec<crate::listing_status_flow::ListingUpload>,
+
     /// Store-details edits on their way, one per edit (harvest#166). See
     /// [`AppState::progress_notices`].
     pub publishing_details: Vec<DetailsPublishing>,
@@ -10432,6 +10436,11 @@ impl AppState {
             notices.push((PUBLISHING_DETAILS.to_string(), String::new()));
         }
         notices.extend(self.catch_up_lines());
+        notices.extend(
+            self.listing_upload_lines()
+                .into_iter()
+                .map(|line| (line, String::new())),
+        );
         notices
     }
 

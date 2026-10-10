@@ -95,6 +95,25 @@ fn a_thumbnail_over_its_byte_limit_is_refused() {
 }
 
 #[test]
+fn a_full_photo_over_its_limits_is_refused() {
+    let mut big = CANVAS_JPEG.to_vec();
+    let at = scan_data_start(&big);
+    big.splice(at..at, std::iter::repeat_n(0u8, MAX_IMAGE_BYTES));
+    assert!(harvest_image::sniff(&big).is_ok());
+    assert!(prepare(&big, FIREFOX_JPEG, [0; 3]).is_err());
+    let edge = harvest_common::listing_image::MAX_IMAGE_EDGE;
+    let wide = with_dimensions(CANVAS_JPEG, edge + 1, 100);
+    assert!(prepare(&wide, FIREFOX_JPEG, [0; 3]).is_err());
+    let at_edge = with_dimensions(CANVAS_JPEG, edge, 100);
+    assert!(prepare(&at_edge, FIREFOX_JPEG, [0; 3]).is_ok());
+    let past_thumb = with_dimensions(CANVAS_JPEG, MAX_THUMB_EDGE + 1, 100);
+    assert!(
+        prepare(&past_thumb, FIREFOX_JPEG, [0; 3]).is_ok(),
+        "a full photo is not held to the thumbnail's edge"
+    );
+}
+
+#[test]
 fn a_thumbnail_over_its_edge_is_refused() {
     let wide = with_dimensions(FIREFOX_JPEG, 401, 120);
     assert!(prepare(CANVAS_JPEG, &wide, [0; 3]).is_err());

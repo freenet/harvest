@@ -110,6 +110,24 @@ pub(crate) fn availability_after_edit(
     }
 }
 
+/// How long a listing whose photos are uploading holds its row at "Saving".
+/// The upload ends on its own well inside this (a PUT gives up after 60 s,
+/// then at most two 30 s lookups); the bound is for a drop path never taken.
+pub(crate) const UPLOADING_WINDOW_MS: i64 = 10 * 60_000;
+
+/// A listing from the form whose photos are uploading: it is signed and
+/// published only once they are all up (`photo_editor::publish_after_uploads`),
+/// and the upload outlives the form, so the seller may be on any page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListingUpload {
+    pub token: u64,
+    pub store_contract_id: Vec<u8>,
+    /// The listing this edit replaces; `None` for a new listing.
+    pub replaces: Option<ListingId>,
+    pub title: String,
+    pub started_ms: i64,
+}
+
 /// A new listing on its way to the network (harvest#161).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Publishing {
@@ -176,7 +194,61 @@ impl AppState {
                     && old == listing
                     && now_ms - since < REPLACING_WINDOW_MS
             });
-        signing || publishing || replacing
+        // An edit whose photos are still uploading: its replacement is not
+        // queued yet, so `replacing` cannot see it, and a second edit, or a
+        // quick action the late save would undo, must wait just the same.
+        let uploading = self.listing_uploads.iter().any(|u| {
+            u.store_contract_id == store_contract_id
+                && u.replaces.as_ref() == Some(listing)
+                && now_ms - u.started_ms < UPLOADING_WINDOW_MS
+        });
+        signing || publishing || replacing || uploading
+    }
+
+    /// The form's photos for a listing started uploading. Returns the token
+    /// that ends it ([`Self::end_listing_upload`]).
+    pub(crate) fn begin_listing_upload(
+        &mut self,
+        store_contract_id: Vec<u8>,
+        replaces: Option<ListingId>,
+        title: String,
+    ) -> u64 {
+        let token = self
+            .listing_uploads
+            .iter()
+            .map(|u| u.token)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.listing_uploads.push(ListingUpload {
+            token,
+            store_contract_id,
+            replaces,
+            title,
+            started_ms: now_ms(),
+        });
+        token
+    }
+
+    /// The upload with `token` finished, or failed.
+    pub(crate) fn end_listing_upload(&mut self, token: u64) {
+        self.listing_uploads.retain(|u| u.token != token);
+    }
+
+    /// One line per listing whose photos are still uploading, for the
+    /// progress notices every page shows.
+    pub(crate) fn listing_upload_lines(&self) -> Vec<String> {
+        let now = now_ms();
+        self.listing_uploads
+            .iter()
+            .filter(|u| now - u.started_ms < UPLOADING_WINDOW_MS)
+            .map(|u| {
+                format!(
+                    "Uploading the photos for \u{201c}{}\u{201d}\u{2026} It is saved once they are up.",
+                    u.title
+                )
+            })
+            .collect()
     }
 
     /// Ask the store key to sign a new availability for one listing of one of
@@ -711,6 +783,83 @@ mod tests {
             .expect("queued");
         assert!(queued_statuses(&state).is_empty());
         assert_eq!(state.pending_signatures.len(), 1);
+    }
+
+    /// An edit whose photos are uploading holds its listing's row (no second
+    /// edit, and no quick action the late save would undo) until the upload
+    /// ends, and is said on every page meanwhile. A new listing's upload
+    /// holds no row. Bounded, in case an end is ever missed.
+    #[test]
+    fn an_edit_whose_photos_are_uploading_holds_its_row() {
+        let mut state = seller_state();
+        let id = ListingId([3u8; 32]);
+        let edit = state.begin_listing_upload(STORE.to_vec(), Some(id.clone()), "Mug".into());
+        let new = state.begin_listing_upload(STORE.to_vec(), None, "Bowl".into());
+        assert_ne!(edit, new);
+        assert!(state.listing_status_pending(&STORE, &id));
+        assert!(!state.listing_status_pending(&STORE, &ListingId([4u8; 32])));
+        assert!(
+            !state.listing_status_pending(&[1u8; 32], &id),
+            "another store"
+        );
+        let lines = state.progress_notices();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("\u{201c}Mug\u{201d}"), "{lines:?}");
+        let started = state.listing_uploads[0].started_ms;
+        assert!(!state.listing_status_pending_at(&STORE, &id, started + UPLOADING_WINDOW_MS));
+        state.end_listing_upload(edit);
+        assert!(!state.listing_status_pending(&STORE, &id));
+        state.end_listing_upload(new);
+        assert!(state.progress_notices().is_empty());
+    }
+
+    /// The form's listing goes where its target says: a new listing is
+    /// published with its notice, an edit replaces the original (taken down
+    /// once the replacement lands), and a refusal is returned for the
+    /// caller to say, not pushed here.
+    #[test]
+    fn a_listing_target_publishes_or_replaces() {
+        use crate::components::seller_listings::ListingTarget;
+        let new = ListingTarget {
+            store: STORE.to_vec(),
+            fingerprint: FINGERPRINT.into(),
+            replaces: None,
+        };
+        let mut state = seller_state();
+        let mug = listing("Mug");
+        new.apply(&mut state, mug.clone(), None).expect("queued");
+        assert!(state.publishing_listings.contains_key(&mug.id));
+        assert!(state.withdraw_after_publish.is_empty());
+
+        let old = ListingId([3u8; 32]);
+        let edit = ListingTarget {
+            replaces: Some(old.clone()),
+            ..new.clone()
+        };
+        let mut state = seller_state();
+        edit.apply(&mut state, mug.clone(), None).expect("queued");
+        assert_eq!(
+            state.withdraw_after_publish.get(&mug.id).map(|w| &w.1),
+            Some(&old)
+        );
+        assert!(!state.publishing_listings.contains_key(&mug.id));
+
+        let elsewhere = ListingTarget {
+            store: vec![1u8; 32],
+            ..new.clone()
+        };
+        let mut state = seller_state();
+        let refused = elsewhere.apply(&mut state, mug, None);
+        assert!(refused.unwrap_err().starts_with("Cannot add the listing:"));
+        assert!(state.notifications.is_empty(), "the caller says it");
+        assert!(state.pending_signatures.is_empty());
+
+        assert!(edit
+            .upload_failed_notice("Mug", "x")
+            .contains("the listing is unchanged"));
+        assert!(new
+            .upload_failed_notice("Mug", "x")
+            .contains("it was not listed"));
     }
 
     /// A seller whose registry still names the store's newest earlier

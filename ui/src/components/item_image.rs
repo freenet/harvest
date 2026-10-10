@@ -1,7 +1,8 @@
 //! An item's picture, where one exists.
 //!
 //! No picture is shown today: listings can name their photos
-//! (`Listing::images`, #215), but nothing fetches the image contracts yet.
+//! (`Listing::images`, #215) and the seller's form uploads them (#224), but
+//! nothing shows them to buyers yet.
 //! Every layout that shows an item is built to look finished without one
 //! (no grey box, no empty frame) and to take one without changing shape:
 //! a card puts it above its words, a row puts a small square before its

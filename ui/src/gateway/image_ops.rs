@@ -36,7 +36,12 @@ mod image_gen {
 
 /// The image contract instance for a photo whose bytes hash to `hash`.
 pub fn image_contract(hash: [u8; 32]) -> (ContractContainer, ContractInstanceId) {
-    let code = Arc::new(ContractCode::from(IMAGE_CONTRACT_WASM.to_vec()));
+    // Built (copied and hashed) once: the listings page asks for every
+    // photo of every listing, and the WASM is about 170 KiB.
+    static CODE: std::sync::OnceLock<Arc<ContractCode<'static>>> = std::sync::OnceLock::new();
+    let code = CODE
+        .get_or_init(|| Arc::new(ContractCode::from(IMAGE_CONTRACT_WASM.to_vec())))
+        .clone();
     let wrapped = WrappedContract::new(code, Parameters::from(hash.to_vec()));
     let id = *wrapped.key().id();
     (
@@ -111,10 +116,13 @@ impl ImageWaiters {
         self.images.contains(id)
     }
 
-    /// A `GetResponse` carrying `bytes` for `id`. (Update notifications for
-    /// an image are dropped by the handler before reaching here: a photo's
-    /// state never changes, so one carries nothing a waiter needs.) A state for an image just PUT also proves the node holds it, so
-    /// it settles a waiting PUT too. Returns whether `id` is an image.
+    /// A `GetResponse` carrying `bytes` for `id`. A state for an image just
+    /// PUT also proves the node holds it, so it settles a waiting PUT too.
+    /// Returns whether `id` is an image.
+    ///
+    /// Update notifications for an image are dropped by the handler before
+    /// reaching here: a photo's state never changes, so one carries nothing
+    /// a waiter needs.
     pub fn state(&mut self, id: &ContractInstanceId, bytes: &[u8]) -> bool {
         if let Some(waiting) = self.gets.remove(id) {
             // An empty state is no image (the contract refuses one), so it
@@ -318,7 +326,12 @@ mod tests {
     /// browser-only match arm no host test can drive.
     #[test]
     fn the_handler_offers_answers_to_photos_first() {
-        let src = include_str!("response_handler.rs");
+        // Comment lines dropped, so a call commented out does not count.
+        let src: String = include_str!("response_handler.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let get_arm = &src[src.find("ContractResponse::GetResponse {").unwrap()..];
         let photo = get_arm
             .find("image_ops::deliver_state")
@@ -345,7 +358,9 @@ mod tests {
             .find("image_ops::is_image")
             .expect("photo notifications are recognised");
         let ret = update[photo..].find("return;").unwrap() + photo;
-        let regets = update.find("get_contract").unwrap_or(usize::MAX);
+        let regets = update
+            .find("get_contract")
+            .expect("other notifications are re-read");
         assert!(ret < regets, "and dropped before anything is re-read");
     }
 

@@ -39,12 +39,6 @@ pub const BACKGROUND: &str = "#f3ede2";
 pub const UNUSABLE: &str =
     "This photo could not be used. Try another photo, or a JPEG or PNG copy of it.";
 
-/// One encoded image, as the browser produced it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Encoded {
-    pub bytes: Vec<u8>,
-}
-
 /// A photo ready to upload: the bytes of each image contract and the
 /// reference each one gets in the listing.
 #[derive(Clone, Debug, PartialEq, Eq)]

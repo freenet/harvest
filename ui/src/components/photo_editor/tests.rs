@@ -98,13 +98,9 @@ fn uploads_are_the_added_photos_and_the_covers_thumbnail() {
 #[test]
 fn every_uploaded_hash_is_one_the_listing_names_and_every_new_one_named_is_uploaded() {
     let drafts = vec![added(2), published(1, false), added(3)];
-    let mut drafts = drafts;
-    drafts[1].thumb = None;
-    let images = listing_images(&drafts).unwrap();
-    let named: Vec<[u8; 32]> = images
-        .iter()
-        .flat_map(|i| std::iter::once(i.full.hash.0).chain(i.thumb.iter().map(|t| t.hash.0)))
-        .collect();
+    // What the listings page looks up, so the two cannot drift apart.
+    let named =
+        crate::components::seller_listings::photo_hashes(&jam(listing_images(&drafts).unwrap()));
     let uploaded: Vec<[u8; 32]> = uploads(&drafts).into_iter().map(|(h, _)| h).collect();
     for h in &uploaded {
         assert!(named.contains(h), "uploaded but not named");
@@ -119,10 +115,10 @@ fn every_uploaded_hash_is_one_the_listing_names_and_every_new_one_named_is_uploa
     }
 }
 
-#[test]
-fn a_listings_photos_come_back_as_drafts_in_order() {
-    let listing = harvest_common::listing::Listing {
-        images: listing_images(&[added(1), added(2)]).unwrap(),
+/// A listing carrying `images`.
+fn jam(images: Vec<ListingImage>) -> harvest_common::listing::Listing {
+    harvest_common::listing::Listing {
+        images,
         id: harvest_common::listing::ListingId([0; 32]),
         title: "Jam".into(),
         description: String::new(),
@@ -131,7 +127,12 @@ fn a_listings_photos_come_back_as_drafts_in_order() {
         created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         checkout: None,
         choices: Vec::new(),
-    };
+    }
+}
+
+#[test]
+fn a_listings_photos_come_back_as_drafts_in_order() {
+    let listing = jam(listing_images(&[added(1), added(2)]).unwrap());
     let drafts = drafts_from_listing(Some(&listing));
     assert_eq!(drafts.len(), 2);
     assert!(drafts.iter().all(|d| d.full_bytes.is_none()));
@@ -163,12 +164,16 @@ fn adding_a_photo_already_on_the_form() {
 fn adding_a_published_photo_again_restores_its_bytes_in_place() {
     let mut drafts = vec![published(1, false), published(2, true)];
     drafts.swap(0, 1);
+    drafts[1].alt = "Jar, front".into();
+    drafts[1].colour = [9, 9, 9];
     assert!(uploads(&drafts).is_empty());
     let mut again = added(1);
     again.key = 77;
     assert_eq!(add_photo(&mut drafts, again), Added::Restored);
     assert_eq!(drafts.len(), 2, "no second copy");
     assert_eq!(drafts[1].key, 1, "it keeps its place and key");
+    assert_eq!(drafts[1].alt, "Jar, front", "and its description");
+    assert_eq!(drafts[1].colour, [9, 9, 9], "and its colour");
     let up: Vec<[u8; 32]> = uploads(&drafts).into_iter().map(|(h, _)| h).collect();
     assert_eq!(up, vec![[1; 32]], "and is uploaded when the form saves");
     // A published photo added again can now be the cover: it has its
@@ -216,44 +221,110 @@ fn the_listing_is_published_only_after_every_upload() {
     use futures::executor::block_on;
     use std::cell::RefCell;
     let calls = RefCell::new(Vec::new());
-    let published = RefCell::new(false);
+    let published = RefCell::new(0u32);
     let ok = block_on(publish_after_uploads(
         vec![([1; 32], vec![1]), ([2; 32], vec![2])],
         |h, _| {
             calls.borrow_mut().push(h);
-            async { Ok(()) }
-        },
-        || *published.borrow_mut() = true,
-    ));
-    assert_eq!(ok, Ok(()));
-    assert_eq!(calls.borrow().len(), 2);
-    assert!(*published.borrow());
-
-    let published = RefCell::new(false);
-    let failed = block_on(publish_after_uploads(
-        vec![([1; 32], vec![1]), ([2; 32], vec![2])],
-        |h, _| async move {
-            if h == [2; 32] {
-                Err("refused".to_string())
-            } else {
+            // Each upload, when it runs, finds nothing published yet.
+            let published = &published;
+            async move {
+                assert_eq!(*published.borrow(), 0, "published before an upload ran");
                 Ok(())
             }
         },
-        || *published.borrow_mut() = true,
+        || *published.borrow_mut() += 1,
+    ));
+    assert_eq!(ok, Ok(()));
+    assert_eq!(calls.borrow().len(), 2);
+    assert_eq!(*published.borrow(), 1, "published once");
+
+    let calls = RefCell::new(Vec::new());
+    let published = RefCell::new(0u32);
+    let failed = block_on(publish_after_uploads(
+        vec![([1; 32], vec![1]), ([2; 32], vec![2])],
+        |h, _| {
+            calls.borrow_mut().push(h);
+            async move {
+                if h == [2; 32] {
+                    Err("refused".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        || *published.borrow_mut() += 1,
     ));
     assert_eq!(failed, Err("refused".to_string()));
-    assert!(
-        !*published.borrow(),
+    assert_eq!(calls.borrow().len(), 2, "every upload was tried");
+    assert_eq!(
+        *published.borrow(),
+        0,
         "nothing is published after a failed upload"
     );
 
     // Nothing to upload: published at once.
-    let published = RefCell::new(false);
+    let published = RefCell::new(0u32);
     block_on(publish_after_uploads(
         Vec::new(),
         |_, _| async { Ok(()) },
-        || *published.borrow_mut() = true,
+        || *published.borrow_mut() += 1,
     ))
     .unwrap();
-    assert!(*published.borrow());
+    assert_eq!(*published.borrow(), 1);
+}
+
+/// What List it hands on. An edit that changes no term (a photo the network
+/// lost, added again) keeps the ORIGINAL listing, and its id, yet still
+/// uploads that photo: the uploads are worked out apart from the
+/// count-only check.
+#[test]
+fn a_restored_photo_keeps_the_listing_and_is_still_uploaded() {
+    use crate::components::listing_form::{plan_submission, Submission};
+    let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let original =
+        jam(listing_images(&[published(1, true), published(2, false)]).unwrap()).with_derived_id();
+    let mut drafts = drafts_from_listing(Some(&original));
+    let mut again = added(2);
+    again.thumb = None;
+    again.thumb_bytes = None;
+    assert_eq!(add_photo(&mut drafts, again), Added::Restored);
+    let Submission { listing, pending } = plan_submission(
+        Some(&original),
+        &original.title,
+        &original.description,
+        original.checkout.clone(),
+        original.choices.clone(),
+        &drafts,
+        now,
+    )
+    .unwrap();
+    assert_eq!(listing.id, original.id, "no term changed");
+    assert_eq!(listing.created_at, original.created_at);
+    let up: Vec<[u8; 32]> = pending.into_iter().map(|(h, _)| h).collect();
+    assert_eq!(up, vec![[2; 32]], "the restored photo still goes up");
+}
+
+/// A photo-only change is a new listing, stamped now, with the new photo
+/// uploaded; a new listing is identified from its own terms.
+#[test]
+fn a_photo_change_is_a_new_listing() {
+    use crate::components::listing_form::{plan_submission, Submission};
+    let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let original = jam(listing_images(&[published(1, true)]).unwrap()).with_derived_id();
+    let mut drafts = drafts_from_listing(Some(&original));
+    assert_eq!(add_photo(&mut drafts, added(3)), Added::New);
+    let Submission { listing, pending } =
+        plan_submission(Some(&original), " Jam ", "", None, Vec::new(), &drafts, now).unwrap();
+    assert_ne!(listing.id, original.id);
+    assert_eq!(listing.title, "Jam", "trimmed");
+    assert_eq!(listing.created_at, now);
+    assert_eq!(listing.id, listing.clone().with_derived_id().id);
+    assert_eq!(listing.images.len(), 2);
+    let up: Vec<[u8; 32]> = pending.into_iter().map(|(h, _)| h).collect();
+    assert_eq!(up, vec![[3; 32]]);
+
+    // Photos the store would refuse stop it before anything is planned.
+    let bad = vec![published(2, false), published(1, true)];
+    assert!(plan_submission(None, "Jam", "", None, Vec::new(), &bad, now).is_err());
 }

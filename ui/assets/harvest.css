@@ -2266,7 +2266,7 @@ h4 {
   margin: 0;
   padding: 0.5rem;
   font-size: 0.8rem;
-  color: var(--text, #2c2416);
+  color: var(--text-primary);
   background: rgba(255, 255, 255, 0.75);
 }
 /* Over the picture when there is one (a published cover whose thumbnail is
