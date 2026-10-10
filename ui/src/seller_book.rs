@@ -28,19 +28,27 @@ use crate::state::{AppState, BrowsingStore, SellerOrderRequest};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SellerBook {
     pub orders: Vec<SellerKeptOrder>,
-    /// Paid orders not yet sent the book could not keep, being full.
+    /// Paid orders not yet sent waiting for room in the book, being full.
     pub paid_refused: Vec<OrderId>,
     /// Read at least once.
     pub loaded: bool,
-    /// A read under way: its request id, and the pages so far.
+    /// The last read was refused: the book is not known, and not waited on.
+    pub read_failed: bool,
+    /// A read under way: its request id, the pages so far, and when it
+    /// started.
     pub reading: Option<(u64, SellerOrdersPage)>,
-    /// A keep under way: its request id and when it went.
+    pub read_at_ms: u64,
+    /// A keep under way: its request id and when it went, and the notes it
+    /// carries.
     pub keeping: Option<(u64, u64)>,
+    pub keeping_notes: Vec<([u8; 32], [u8; 32])>,
     /// Every note this tab has sent this session, by order id and the
-    /// note's digest: one is never sent twice. What the book keeps can
-    /// differ from what it was sent (it keeps no proof once an order is
-    /// sent, drops a request once its window closes, or refuses a note), so
-    /// comparing the two again would offer the same note for ever.
+    /// note's digest: one is never sent twice while it may still land.
+    /// What the book keeps can differ from what it was sent (it keeps no
+    /// proof once an order is sent, drops a request once its window closes),
+    /// so comparing the two again would offer the same note for ever. A
+    /// keep refused, or never answered, is forgotten here, so the next
+    /// change of the store offers it again.
     pub noted: std::collections::HashSet<([u8; 32], [u8; 32])>,
 }
 
@@ -178,15 +186,28 @@ impl AppState {
     /// Whether this tab is reading one of our stores' books for the first
     /// time: what it holds is not known yet.
     pub(crate) fn seller_book_unread(&self, store_contract_id: &[u8]) -> bool {
-        self.own_store_key(store_contract_id)
-            .and_then(|key| self.seller_books.get(&key))
-            .is_some_and(|b| !b.loaded && b.reading.is_some())
+        self.own_store_key(store_contract_id).is_some_and(|key| {
+            self.seller_books
+                .get(&key)
+                .is_none_or(|b| !b.loaded && !b.read_failed)
+        })
     }
 
-    /// Paid orders not yet sent that this store's book could not keep.
+    /// Paid orders not yet sent waiting for room in this store's book: those
+    /// the store or the book still holds (a name whose order has gone from
+    /// both is nothing the seller can act on).
     pub(crate) fn book_refused(&self, store_contract_id: &[u8]) -> usize {
-        self.seller_book(store_contract_id)
-            .map_or(0, |b| b.paid_refused.len())
+        let Some(book) = self.seller_book(store_contract_id) else {
+            return 0;
+        };
+        let store = self.browsing_stores.get(store_contract_id);
+        book.paid_refused
+            .iter()
+            .filter(|id| {
+                store.is_some_and(|s| s.orders.iter().any(|o| o.order.id == **id))
+                    || book.orders.iter().any(|r| r.order.order.id == **id)
+            })
+            .count()
     }
 
     /// Read one of our stores' books, unless a read is under way.
@@ -194,15 +215,18 @@ impl AppState {
         let Some(key) = self.own_store_key(store_contract_id) else {
             return Vec::new();
         };
-        if self
-            .seller_books
-            .get(&key)
-            .is_some_and(|b| b.reading.is_some())
-        {
+        let now = crate::state::now_ms();
+        // One under way waits for its answer, up to the wait a keep gets: an
+        // answer lost must not hold the book unread for the session.
+        if self.seller_books.get(&key).is_some_and(|b| {
+            b.reading.is_some() && now.saturating_sub(b.read_at_ms) < KEEP_ANSWER_WAIT_MS
+        }) {
             return Vec::new();
         }
         let request_id = self.next_messaging_request_id();
-        self.seller_books.entry(key).or_default().reading = Some((
+        let book = self.seller_books.entry(key).or_default();
+        book.read_at_ms = now;
+        book.reading = Some((
             request_id,
             SellerOrdersPage {
                 orders: Vec::new(),
@@ -237,6 +261,7 @@ impl AppState {
             Ok(page) => page,
             Err(why) => {
                 book.reading = None;
+                book.read_failed = true;
                 dioxus::logger::tracing::warn!("The seller's kept orders could not be read: {why}");
                 return Vec::new();
             }
@@ -254,6 +279,7 @@ impl AppState {
         book.orders = done.orders;
         book.paid_refused = done.paid_refused;
         book.loaded = true;
+        book.read_failed = false;
         // The book read, what the store shows it lacks goes in.
         let ids: Vec<Vec<u8>> = self
             .browsing_stores
@@ -279,6 +305,13 @@ impl AppState {
         };
         if book.keeping.is_some_and(|(id, _)| id == request_id) {
             book.keeping = None;
+            let sent = std::mem::take(&mut book.keeping_notes);
+            if result.is_err() {
+                // Not kept: offered again at the store's next change.
+                for note in sent {
+                    book.noted.remove(&note);
+                }
+            }
         }
         if let Err(why) = &result {
             dioxus::logger::tracing::warn!("The seller's orders were not kept: {why}");
@@ -343,10 +376,17 @@ impl AppState {
                     despatch: store.despatches.get(&o.order.id).cloned(),
                     paid_height: None,
                     sent_off_store: false,
+                    seal: None,
                 };
                 match held.get(&o.order.id) {
                     Some(held) if !adds_to(held, &note) => None,
-                    _ if book.noted.contains(&note_digest(&note)) => None,
+                    // One a full book refused is offered again once it is
+                    // not full (above), however often it was offered.
+                    _ if book.noted.contains(&note_digest(&note))
+                        && !book.paid_refused.contains(&o.order.id) =>
+                    {
+                        None
+                    }
                     _ => Some(note),
                 }
             })
@@ -360,12 +400,20 @@ impl AppState {
         };
         let now = crate::state::now_ms();
         let busy = self.seller_books.get(&key).is_some_and(|b| {
-            b.reading.is_some()
+            (b.reading.is_some() && now.saturating_sub(b.read_at_ms) < KEEP_ANSWER_WAIT_MS)
                 || b.keeping
                     .is_some_and(|(_, at)| now.saturating_sub(at) < KEEP_ANSWER_WAIT_MS)
         });
         if busy {
             return Vec::new();
+        }
+        // A keep never answered: what it carried is offered again.
+        if let Some(book) = self.seller_books.get_mut(&key) {
+            if book.keeping.take().is_some() {
+                for note in std::mem::take(&mut book.keeping_notes) {
+                    book.noted.remove(&note);
+                }
+            }
         }
         let mut notes = self.seller_book_notes(store_contract_id);
         if notes.is_empty() {
@@ -375,7 +423,8 @@ impl AppState {
         let request_id = self.next_messaging_request_id();
         if let Some(book) = self.seller_books.get_mut(&key) {
             book.keeping = Some((request_id, now));
-            book.noted.extend(notes.iter().map(note_digest));
+            book.keeping_notes = notes.iter().map(note_digest).collect();
+            book.noted.extend(book.keeping_notes.iter().copied());
         }
         vec![harvest_common::HarvestDelegateRequest::KeepSellerOrders {
             request_id,
@@ -435,6 +484,7 @@ impl AppState {
                 despatch: Some(despatch),
                 paid_height: None,
                 sent_off_store: true,
+                seal: None,
             }],
         }]
     }
@@ -503,6 +553,7 @@ impl AppState {
                 despatch: None,
                 paid_height: None,
                 sent_off_store: false,
+                seal: None,
             }],
         }]
     }

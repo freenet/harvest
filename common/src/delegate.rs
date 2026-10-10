@@ -949,6 +949,15 @@ pub struct SellerKeptOrder {
     /// order, and drops a despatch whose order it does not hold.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub sent_off_store: bool,
+    /// The book's word that it held this order at this status and paid
+    /// height: a keyed hash, under a key only a holder of the store key can
+    /// derive, set on each paid or reversed record a listing returns and
+    /// never stored. A backup restored on another device that holds the same
+    /// store key keeps such a record as the book had it, though the book
+    /// keeps no proof for it (one sent, or paid past the store's byte
+    /// bound); one without it is checked as the tab's note is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<[u8; 32]>,
 }
 
 /// One page of a seller's book
@@ -958,8 +967,8 @@ pub struct SellerOrdersPage {
     pub orders: Vec<SellerKeptOrder>,
     /// Where the next page starts; `None` when this was the last.
     pub next: Option<crate::payment::OrderId>,
-    /// Paid orders not yet sent that the book could not keep, being full
-    /// (on the first page only).
+    /// Paid orders not yet sent waiting for room in the book, the newest
+    /// [`MAX_SELLER_UNSENT_KEPT`] (on the first page only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paid_refused: Vec<crate::payment::OrderId>,
 }
@@ -967,10 +976,14 @@ pub struct SellerOrdersPage {
 /// The most bytes of each text in a [`KeptRequest`].
 pub const MAX_KEPT_REQUEST_TEXT: usize = 2048;
 /// The most unpaid orders a seller's book keeps per store: the oldest go.
+/// One that goes and is paid later comes back only through the seller's
+/// tab, while the store still shows it. Also the most paid orders that wait
+/// there for room in the paid stage.
 pub const MAX_SELLER_UNPAID_KEPT: usize = 128;
-/// The most paid orders not yet sent a seller's book keeps per store. One
-/// past it is never evicted for, nor evicts: it is named in
-/// [`SellerOrdersPage::paid_refused`] and the seller is told.
+/// The most paid orders not yet sent a seller's book keeps per store in its
+/// paid stage. One past it is never evicted for, nor evicts: it waits, with
+/// its ship-to (up to [`MAX_SELLER_UNPAID_KEPT`] so; past that its id only),
+/// is named in [`SellerOrdersPage::paid_refused`], and the seller is told.
 pub const MAX_SELLER_UNSENT_KEPT: usize = 512;
 /// The most sent orders a seller's book keeps per store, the newest.
 pub const MAX_SELLER_SENT_KEPT: usize = 1024;
@@ -2463,6 +2476,7 @@ mod tests {
             despatch: None,
             paid_height: None,
             sent_off_store: false,
+            seal: None,
         }
     }
 

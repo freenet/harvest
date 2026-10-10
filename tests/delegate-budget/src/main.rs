@@ -2145,6 +2145,7 @@ fn fill_book(
         despatch: None,
         paid_height: Some(100),
         sent_off_store: false,
+        seal: None,
     };
     let mut paid_unsent: Vec<SellerKeptOrder> = Vec::new();
     let mut extra = 0u32;
@@ -2168,9 +2169,15 @@ fn fill_book(
         resign(order)
     };
     // The unpaid stage full: what decide and a store notification read and
-    // write.
+    // write. Its unpaid orders, and as many paid ones waiting for room in a
+    // full paid stage (kept without their proof, with their paid height).
     for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
         unpaid_stage.push(record(unpaid(100_000 + k)?, 10_000 + u64::from(k)));
+    }
+    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
+        let mut order = resign(fx.paid(fx.order(400_000 + k, [0x5B; 32])))?;
+        order.payment_proof = None;
+        unpaid_stage.push(record(order, 30_000 + u64::from(k)));
     }
     let mut done = Vec::new();
     for k in 0..MAX_SELLER_SENT_KEPT as u32 {
@@ -2307,8 +2314,9 @@ fn book_calls(
     println!("  (seller's book: {pages} pages)");
     // A wake-up's sweep of the full book at its most: every unpaid order
     // marked paid by store notifications, beside the most paid orders that
-    // wait there for room (`MAX_SELLER_UNPAID_KEPT` of each), and room in
-    // the paid stage for all of them, so the wake-up moves them all on.
+    // wait there for room (`MAX_SELLER_UNPAID_KEPT` of each, as `fill_book`
+    // made them), and room in the paid stage for all of them, so the
+    // wake-up moves them all on.
     use harvest_common::delegate::{MAX_SELLER_UNPAID_KEPT, MAX_SELLER_UNSENT_KEPT};
     use harvest_common::payment::OrderStatus;
     let key = bs58::encode(at.verifying_key).into_string();
@@ -2318,20 +2326,13 @@ fn book_calls(
     for record in unpaid.iter_mut() {
         record.order.status = OrderStatus::Paid;
     }
-    let waiting: Vec<_> = paid_unsent
-        .iter()
-        .skip(SELLER_ORDERS_PER_CALL)
-        .take(MAX_SELLER_UNPAID_KEPT)
-        .cloned()
-        .collect();
-    unpaid.extend(waiting);
     let moving = unpaid.len();
     let room = MAX_SELLER_UNSENT_KEPT
         .checked_sub(moving)
         .ok_or_else(|| anyhow!("more paid orders waiting than the paid stage holds"))?;
     let open: Vec<_> = paid_unsent
         .iter()
-        .skip(SELLER_ORDERS_PER_CALL + MAX_SELLER_UNPAID_KEPT)
+        .skip(SELLER_ORDERS_PER_CALL)
         .take(room)
         .cloned()
         .collect();

@@ -264,9 +264,7 @@ pub fn BuyForm(
                         // The seller's book keeps each at most this many
                         // bytes; `maxlength` counts characters, which run
                         // to more bytes outside plain ASCII.
-                        if shipping().len() > harvest_common::delegate::MAX_KEPT_REQUEST_TEXT
-                            || note().len() > harvest_common::delegate::MAX_KEPT_REQUEST_TEXT
-                        {
+                        if too_long_to_keep(&shipping(), &note()) {
                             problem.set(Some(TOO_LONG.to_string()));
                             return;
                         }
@@ -1670,8 +1668,33 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 /// of the order keeps.
 const TOO_LONG: &str = "That is too long for the seller to keep. Shorten the address or the note.";
 
+/// Whether the address or the note is longer than the seller's own copy of
+/// the order keeps: [`harvest_common::delegate::MAX_KEPT_REQUEST_TEXT`]
+/// bytes, which `maxlength` (counting characters) does not hold to.
+fn too_long_to_keep(shipping: &str, note: &str) -> bool {
+    let max = harvest_common::delegate::MAX_KEPT_REQUEST_TEXT;
+    shipping.len() > max || note.len() > max
+}
+
 #[cfg(test)]
 mod tests {
+    /// Review round 2 of step 2: the form holds the address and the note to
+    /// the bytes the seller's book keeps, not the characters `maxlength`
+    /// counts. Red with a character count.
+    #[test]
+    fn text_past_the_books_byte_bound_is_too_long() {
+        let max = harvest_common::delegate::MAX_KEPT_REQUEST_TEXT;
+        assert!(!super::too_long_to_keep(&"a".repeat(max), &"n".repeat(max)));
+        assert!(super::too_long_to_keep(&"a".repeat(max + 1), ""));
+        assert!(super::too_long_to_keep("", &"n".repeat(max + 1)));
+        let chars = "\u{e9}".repeat(max / 2 + 1);
+        assert!(chars.chars().count() <= max);
+        assert!(
+            super::too_long_to_keep(&chars, ""),
+            "fewer characters, more bytes"
+        );
+    }
+
     use super::*;
 
     /// **The complaint step's "Message the seller" goes to the purchase's

@@ -3179,6 +3179,7 @@ pub(crate) fn decide<S: SecretStore>(
                     despatch: None,
                     paid_height: None,
                     sent_off_store: false,
+                    seal: None,
                 });
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
@@ -5112,6 +5113,30 @@ mod tests {
         with_status(&mut f, &decided.orders[0].order.id, OrderStatus::Paid);
         store_change(&mut f);
         assert_eq!(book(&f)[0].order.status, OrderStatus::Paid);
+    }
+
+    /// Review round 2 of step 2 (skeptical): a seller's book that cannot
+    /// take the order (this device already keeps the most books it keeps)
+    /// does not stop instant checkout: the order is signed, and its request
+    /// stays in the mailbox for the tab. Mutated red by refusing the whole
+    /// run when the book refuses.
+    #[test]
+    fn a_book_that_cannot_take_the_order_does_not_stop_instant_checkout() {
+        let mut f = fixture();
+        for b in 0..harvest_common::delegate::MAX_SELLER_BOOKS as u8 {
+            let other = SigningKey::from_bytes(&[0x60 + b; 32]);
+            crate::store_keys::keep(&mut f.secrets, &other);
+            f.secrets.set_secret(
+                &crate::seller_orders::open_key(&other.verifying_key().to_bytes()),
+                &to_cbor(&Vec::<u8>::new()).unwrap(),
+            );
+        }
+        let decided = run(&mut f, &[Buyer::new(41).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.orders.len(), 1, "signed all the same");
+        let store_key = store_sk().verifying_key().to_bytes();
+        assert!(!f
+            .secrets
+            .has_secret(&crate::seller_orders::unpaid_key(&store_key)));
     }
 
     /// A listing the store's cap has cut (step 2) has no stock to take off:

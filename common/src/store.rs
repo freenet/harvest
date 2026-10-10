@@ -1654,14 +1654,13 @@ impl StoreStateV1 {
 
     /// The whole state as this generation keeps it, for a state an earlier
     /// generation wrote that a migration fold carries forward: the listings
-    /// sorted and capped, the orders as kept and capped, and what hangs on
-    /// them (a cut backing's slot, a despatch for a cut order) cut with
-    /// them. Each is what `apply_delta` does to what it touches; the fold's
-    /// merge skips the parts the other side brings nothing new for.
+    /// sorted and capped, the orders as kept and capped, and a despatch for
+    /// a cut order cut with it. Each is what `apply_delta` does to what it
+    /// touches; the fold's merge skips the parts the other side brings
+    /// nothing new for. (Step 2 changed no other cap.)
     pub fn normalize_carried(&mut self) {
         self.listings.normalize();
         self.orders.normalize();
-        self.normalize_backings();
         self.normalize_fulfilment();
     }
 }
@@ -6654,6 +6653,31 @@ mod listing_cap_tests {
         };
         let kept = held(vec![big.clone(), just.clone()]);
         assert_eq!(kept.listings, vec![just], "the one at the bound stays");
+    }
+
+    /// Review round 2 of step 2 (code-first): a state over either cap is
+    /// refused for the cap before a single signature is checked. Mutated red
+    /// by checking the signatures first.
+    #[test]
+    fn a_state_over_the_caps_is_refused_before_its_signatures_are_checked() {
+        let parent = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        let params = StoreParameters::new(store_key().verifying_key());
+        let mut over: Vec<_> = (0..(MAX_LISTINGS as u32 + 1))
+            .map(|n| listing(n, i64::from(n), 0, false))
+            .collect();
+        over.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        let why = ListingsV1 { listings: over }
+            .verify(&parent, &params)
+            .unwrap_err();
+        assert!(why.contains("the most it keeps"), "{why}");
+        let big = ListingsV1 {
+            listings: vec![listing(1, 0, MAX_LISTING_BYTES, false)],
+        };
+        let why = big.verify(&parent, &params).unwrap_err();
+        assert!(why.contains("bytes"), "{why}");
     }
 
     /// The cut is a pure function of the listings held, so merging in any

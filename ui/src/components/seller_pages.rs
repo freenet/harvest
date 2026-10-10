@@ -2019,6 +2019,23 @@ fn PauseSection(store_contract_id: Vec<u8>) -> Element {
 
 #[cfg(test)]
 mod tests {
+    /// Home's note on a full book (step 2, review round 3): how many wait,
+    /// and that past the first ones only the store keeps their delivery
+    /// details. Nothing when none wait.
+    #[test]
+    fn homes_note_on_a_full_book_says_how_many_wait() {
+        assert_eq!(super::book_full_note(0), None);
+        let note = super::book_full_note(3).expect("a note");
+        assert!(note.contains("3 more are waiting for room"), "{note}");
+        assert!(
+            note.contains(&format!(
+                "first {}",
+                harvest_common::delegate::MAX_SELLER_UNPAID_KEPT
+            )),
+            "{note}"
+        );
+    }
+
     use super::name_from_address;
 
     use crate::state::{test_store_key, AppState, BrowsingStore};

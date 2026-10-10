@@ -274,6 +274,9 @@ pub struct BackupRestore {
     pub asked_at_ms: u64,
     /// How many of the seller's orders the last chunk carried.
     pub seller_orders_sent: usize,
+    /// The seller's orders the book did not count as kept: already held as
+    /// completely, or waiting for room (the delegate answers a count only).
+    pub seller_not_kept: usize,
 }
 
 /// A finished backup, waiting for the buyer to save it. The file is made
@@ -441,7 +444,18 @@ impl AppState {
     /// The buyer saved the file (or copied its text): mark exactly what it
     /// holds, and start the next one, so the button is ready again.
     pub(crate) fn backup_saved(&mut self) -> Outgoing {
-        let Some(ready) = self.backup_file_ready.take() else {
+        let made = self.backup_file_ready.as_ref().map(|r| r.bundle.made_at_ms);
+        made.map_or_else(Vec::new, |made| self.backup_saved_of(made))
+    }
+
+    /// [`Self::backup_saved`] for the backup made at `made` only: a copy
+    /// confirmed after the next backup was made marks nothing it did not
+    /// hold.
+    pub(crate) fn backup_saved_of(&mut self, made: u64) -> Outgoing {
+        let Some(ready) = self
+            .backup_file_ready
+            .take_if(|r| r.bundle.made_at_ms == made)
+        else {
             return Vec::new();
         };
         let orders: usize = self
@@ -695,6 +709,17 @@ impl AppState {
                 let done = self.backup_restore.take().unwrap_or_default();
                 let mut message =
                     format!("{} restored, {} already here.", done.restored, done.already);
+                match done.seller_not_kept {
+                    0 => {}
+                    1 => message.push_str(
+                        " 1 of your store\u{2019}s orders was already in this device\u{2019}s \
+                         list, or is waiting for room in it (your store\u{2019}s Home says).",
+                    ),
+                    n => message.push_str(&format!(
+                        " {n} of your store\u{2019}s orders were already in this device\u{2019}s \
+                         list, or are waiting for room in it (your store\u{2019}s Home says)."
+                    )),
+                }
                 if !done.refused.is_empty() {
                     message.push_str(&format!(
                         " {} not restored: {}",
@@ -764,7 +789,7 @@ impl AppState {
             Ok(kept) => {
                 let kept = *kept as usize;
                 restore.restored += kept;
-                restore.already += restore.seller_orders_sent.saturating_sub(kept);
+                restore.seller_not_kept += restore.seller_orders_sent.saturating_sub(kept);
             }
             Err(why) => restore.refused.push(why.clone()),
         }
@@ -1035,7 +1060,11 @@ mod tests {
         let held = decode_file(&text).unwrap();
         assert_eq!(held.conversations.len(), 2);
         assert_eq!(held.stores.len(), 2);
-        let marks = state.backup_saved();
+        // A copy confirmed for another backup marks nothing.
+        let made = state.backup_file_ready.as_ref().unwrap().bundle.made_at_ms;
+        assert!(state.backup_saved_of(made + 1).is_empty());
+        assert!(state.backup_file_ready.is_some(), "still offered");
+        let marks = state.backup_saved_of(made);
         assert!(state.backup_file_ready.is_none(), "offered once");
         assert!(state.backup_saved().is_empty(), "nothing to save twice");
         match &marks[..] {
@@ -1303,6 +1332,7 @@ mod tests {
             }),
             paid_height: None,
             sent_off_store: false,
+            seal: None,
         };
         let mut state = AppState::default();
         state.seller_books.insert(
@@ -1315,6 +1345,39 @@ mod tests {
         );
         let books = state.seller_books_for_backup();
         assert_eq!(books.len(), 1);
+        // Saved: the message counts the store's orders the file holds.
+        let mut saving = state.clone();
+        saving.backup_file_ready = Some(ReadyBackup {
+            name: "harvest-purchases-x.txt".into(),
+            bundle: bundle(),
+            purchases: 1,
+            conversations: 0,
+            marks: Vec::new(),
+        });
+        let _ = saving.backup_saved();
+        assert!(
+            saving
+                .backup_message
+                .as_deref()
+                .is_some_and(|m| m.contains("and 2 of your store\u{2019}s orders")),
+            "{:?}",
+            saving.backup_message
+        );
+        // A store of ours whose book is not read yet: said, as left out.
+        let mut unread = AppState::default();
+        unread.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::delegate::StoreRegistration {
+                store_contract_id: vec![1; 32],
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some([3; 32]),
+            }],
+        );
+        assert_eq!(unread.seller_books_unread(), 1);
+        unread.seller_books = state.seller_books.clone();
+        assert_eq!(unread.seller_books_unread(), 0);
         assert!(books[0].orders[0].request.is_some(), "not yet sent");
         assert!(books[0].orders[1].request.is_none(), "sent: terms only");
         assert_eq!(state.unsent_addresses_in_backup(), 1);
@@ -1355,16 +1418,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // One of our stores, so its book is read again after the restore.
+        let ours = vec![9u8; 32];
+        state.my_stores.insert(
+            "fp".into(),
+            vec![harvest_common::delegate::StoreRegistration {
+                store_contract_id: ours.clone(),
+                reputation_contract_id: vec![2; 32],
+                mailbox_contract_id: vec![3; 32],
+                store_contract_key: None,
+                store_verifying_key: Some([3; 32]),
+            }],
+        );
+        state.browsing_stores.insert(
+            ours.clone(),
+            crate::state::BrowsingStore {
+                owner: Some([3; 32]),
+                ..Default::default()
+            },
+        );
+        state
+            .seller_books
+            .insert([3; 32], crate::seller_book::SellerBook::default());
         let done = state
             .on_restored_seller_orders(request_id, &Ok(1))
             .expect("the restore's");
-        assert!(matches!(
-            &done[..],
-            [harvest_common::HarvestDelegateRequest::ListKeptPurchases]
-        ));
+        assert!(
+            matches!(
+                &done[..],
+                [
+                    harvest_common::HarvestDelegateRequest::ListKeptPurchases,
+                    harvest_common::HarvestDelegateRequest::ListSellerOrders {
+                        store_key: [3, ..],
+                        ..
+                    }
+                ]
+            ),
+            "{done:?}"
+        );
         assert_eq!(
             state.backup_message.as_deref(),
-            Some("2 restored, 1 already here.")
+            Some(
+                "2 restored, 0 already here. 1 of your store\u{2019}s orders was already in \
+                 this device\u{2019}s list, or is waiting for room in it (your store\u{2019}s \
+                 Home says)."
+            )
         );
     }
 
@@ -1386,6 +1484,7 @@ mod tests {
                     despatch: None,
                     paid_height: None,
                     sent_off_store: false,
+                    seal: None,
                 })
                 .collect(),
         }];

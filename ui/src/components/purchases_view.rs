@@ -571,8 +571,13 @@ pub fn BackupPage() -> Element {
         let Some((name, text)) = APP_STATE.read().ready_backup_file() else {
             return;
         };
-        let saved = || {
-            let out = APP_STATE.write().backup_saved();
+        let made = APP_STATE
+            .read()
+            .backup_file_ready
+            .as_ref()
+            .map_or(0, |r| r.bundle.made_at_ms);
+        let saved = move || {
+            let out = APP_STATE.write().backup_saved_of(made);
             crate::backup_flow::send_all(out);
         };
         // Marked only once the text is on the clipboard: a copy the browser

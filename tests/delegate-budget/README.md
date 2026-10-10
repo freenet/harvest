@@ -297,8 +297,8 @@ an older budget that was 30% too generous (see Calibration); that ceiling
 is gone.
 
 The step-2 calls over that guideline are the seller's book's wake-up at
-its caps (table below): moving 256 paid orders on (66.8%), and the same 256
-with the paid stage full (72.3%). They are accepted because each is the most
+its caps (table below): moving 256 paid orders on (64.2%), and the same 256
+with the paid stage full (66.5%). They are accepted because each is the most
 one wake-up can ever do (`unpaid` holds at most 128 unpaid orders and 128
 paid ones waiting for room) and is out of reach of ordinary traffic. The
 first needs 128 orders paid between two wake-ups (5 minutes apart), more
@@ -421,22 +421,23 @@ the figures are refreshed below:
 | `ImportPurchasesBackup`, 16 paid purchases not held | (new) | 182,442,695 (6.1%) |
 
 At the caps step 2 ships (`MAX_ORDERS` 256, `MAX_LISTINGS` 128), with the
-seller's book (three stages full: 128 unpaid, 512 paid unsent at 3.9 MiB,
-1024 sent at 6.7 MiB), delegate `ee8125ce…` (step 2, review round 2):
+seller's book (three stages full: 128 unpaid and 128 paid orders waiting for
+room, 512 paid unsent at 3.9 MiB, 1024 sent at 6.7 MiB), delegate
+`0a3fe891…` (step 2, review round 3):
 
 | call | step 2 |
 |---|---:|
-| instant decide against a store of 256 paid orders | 1,462,267,011 (48.7%) |
-| same, the seller's book full | 1,501,304,359 (50.0%) |
-| same, with 127 more listings of 32 KiB (every field at its largest) | 1,543,386,716 (51.4%) |
-| same, with 10,000 listing statuses | 1,573,692,618 (52.5%) |
-| `KeepSellerOrders`, 48 sent, a full book | 1,618,063,982 (53.9%) |
-| `ListSellerOrders`, a page, a full book | 622,087,056 (20.7%), 27 pages |
-| heartbeat wake-up moving 256 paid orders on (128 marked paid, 128 waiting for room) | 2,004,312,127 (66.8%) |
-| heartbeat wake-up with the same 256 and the paid stage full (128 wait, every one named) | 2,170,003,425 (72.3%) |
-| `ImportMigratedSecret`, a predecessor's full sent stage into a book that holds none | 893,746,049 (29.8%) |
-| same, its full paid stage after it | 1,601,382,610 (53.4%) |
-| `ImportMigratedSecret`, a full ledger into a full ledger | 704,031,349 (23.5%; 41.8% before) |
+| instant decide against a store of 256 paid orders | 1,462,264,798 (48.7%) |
+| same, the seller's book full | 1,540,351,916 (51.3%) |
+| same, with 127 more listings of 32 KiB (every field at its largest) | 1,543,385,549 (51.4%) |
+| same, with 10,000 listing statuses | 1,573,706,706 (52.5%) |
+| `KeepSellerOrders`, 48 sent, a full book | 1,689,370,614 (56.3%) |
+| `ListSellerOrders`, a page, a full book (each paid record sealed) | 667,094,175 (22.2%), 31 pages |
+| heartbeat wake-up moving 256 paid orders on (128 marked paid, 128 waiting for room) | 1,924,640,993 (64.2%) |
+| heartbeat wake-up with the same 256 and the paid stage full (128 wait, every one named) | 1,996,184,523 (66.5%) |
+| `ImportMigratedSecret`, a predecessor's full sent stage into a book that holds none | 894,341,833 (29.8%) |
+| same, its full paid stage after it | 1,467,777,938 (48.9%) |
+| `ImportMigratedSecret`, a full ledger into a full ledger | 704,032,904 (23.5%; 41.8% before) |
 | `KeepPurchase`, the 1024th | 1,113,917,725 (37.1%) |
 | `ListKeptPurchases (1024)` | 1,099,787,553 (36.7%) |
 | `SetPaymentXpub`, a new key, two full stores' 512 scripts (pending, then made active) | 1,220,971,781 (40.7%), 2 calls |

@@ -10937,13 +10937,6 @@ impl AppState {
                 "only an unpaid invoice can be cancelled, and this one is {settled}"
             ));
         }
-        // The seller's own book may hold it paid (step 2: past the store's
-        // byte bound), which only it remembers across a reload: a store
-        // keeps a cancellation for good, and `Paid` could never be published
-        // over it there.
-        if self.seller_book_unread(store_contract_id) {
-            return Err(SELLER_BOOK_LOADING.to_string());
-        }
         // A payment already on its way is not stopped by a cancellation --
         // `Paid` outranks `Cancelled` -- so cancelling now would only put a
         // record in public that says the opposite of what is about to happen
@@ -10955,6 +10948,14 @@ impl AppState {
             || self.cancellation_sent(store_contract_id, order_id)
         {
             return Err("this invoice is already being cancelled".to_string());
+        }
+        // The seller's own book may hold it paid (step 2: past the store's
+        // byte bound), which only it remembers across a reload: a store
+        // keeps a cancellation for good, and `Paid` could never be published
+        // over it there.
+        if self.seller_book_unread(store_contract_id) {
+            crate::backup_flow::send_all(self.read_seller_book(store_contract_id));
+            return Err(SELLER_BOOK_LOADING.to_string());
         }
         let store_key = self.signing_store_key(store_contract_id)?;
         info!("Cancelling invoice {}", order_id.short());
@@ -26124,6 +26125,34 @@ mod buy_flow_tests {
         assert_eq!(hidden.shipping, crate::fulfilment::ADDRESS_HIDDEN);
         assert_eq!(hidden.note, "");
         assert_eq!(hidden.quantity, 2, "what to send stays");
+        // Nor does the seller's tab give its own book an address the app
+        // hides (step 2, review round 2: the book drops it once the window
+        // closes, and the tab put it back). Red with the filter dropped.
+        let owner = state.browsing_stores[STORE].owner.expect("owned");
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let notes = state.seller_book_notes(STORE);
+        let note = notes
+            .iter()
+            .find(|n| n.order.order.id == order.order.id)
+            .expect("the paid order is offered to the book");
+        assert_eq!(note.request, None, "without the hidden address");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        assert!(
+            state
+                .seller_book_notes(STORE)
+                .iter()
+                .any(|n| n.order.order.id == order.order.id && n.request.is_some()),
+            "inside the window it goes with the request"
+        );
         state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
         let SellerRequest::Found(shown) = state.seller_order_request(STORE, &order) else {
             panic!("found");
@@ -27941,6 +27970,7 @@ mod buy_flow_tests {
             despatch: None,
             paid_height: None,
             sent_off_store: false,
+            seal: None,
         }];
         assert!(
             state
@@ -28035,6 +28065,7 @@ mod buy_flow_tests {
                     despatch: Some(despatch),
                     paid_height: Some(TIP_HEIGHT - 1),
                     sent_off_store: false,
+                    seal: None,
                 }],
                 ..Default::default()
             },
@@ -28068,10 +28099,27 @@ mod buy_flow_tests {
             }
             other => panic!("{other:?}"),
         };
-        // Refused: not read again, and not offered again.
+        // Refused: not read again, and offered again at the store's next
+        // change (round 3: a refusal used to drop it for the session).
         assert!(state
-            .on_seller_orders_kept(request_id, owner, Err("full".into()))
+            .on_seller_orders_kept(request_id, owner, Err("busy".into()))
             .is_empty());
+        let again = state.sync_seller_book_requests(STORE);
+        let request_id = match &again[..] {
+            [HarvestDelegateRequest::KeepSellerOrders { request_id, .. }] => *request_id,
+            other => panic!("offered again: {other:?}"),
+        };
+        // Never answered: offered again once its wait is over.
+        state.seller_books.get_mut(&owner).unwrap().keeping = Some((request_id, 0));
+        let request_id = match &state.sync_seller_book_requests(STORE)[..] {
+            [HarvestDelegateRequest::KeepSellerOrders { request_id, .. }] => *request_id,
+            other => panic!("offered again after no answer: {other:?}"),
+        };
+        // Kept: read again, and not offered again however the book answers.
+        assert!(!state
+            .on_seller_orders_kept(request_id, owner, Ok(1))
+            .is_empty());
+        state.seller_books.get_mut(&owner).unwrap().reading = None;
         assert!(state.sync_seller_book_requests(STORE).is_empty());
         assert!(state.seller_book_notes(STORE).is_empty());
     }
@@ -28121,6 +28169,7 @@ mod buy_flow_tests {
             despatch,
             paid_height: None,
             sent_off_store: false,
+            seal: None,
         };
         state.seller_books.get_mut(&owner).unwrap().orders = vec![record(Some(forged))];
         assert_eq!(state.book_despatch(&paid), None, "not the store key's");
@@ -28151,6 +28200,18 @@ mod buy_flow_tests {
                 .all(|n| n.order.order.id != paid.order.id),
             "refused by a full book"
         );
+        // Home counts only names whose order the store or the book holds.
+        state
+            .seller_books
+            .get_mut(&owner)
+            .unwrap()
+            .paid_refused
+            .push(harvest_common::payment::OrderId({
+                let mut gone = [0xEE; 32];
+                gone[0] = 1;
+                gone
+            }));
+        assert_eq!(state.book_refused(STORE), 1, "a gone order's name");
         state
             .seller_books
             .get_mut(&owner)
@@ -28163,6 +28224,22 @@ mod buy_flow_tests {
                 .iter()
                 .any(|n| n.order.order.id == paid.order.id),
             "offered once the book did not refuse it"
+        );
+        // Named as refused by a full book, then room again: offered again,
+        // however often it was offered.
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.orders.clear();
+        book.keeping = None;
+        book.paid_refused = vec![paid.order.id.clone()];
+        let first = state.sync_seller_book_requests(STORE);
+        assert!(!first.is_empty(), "offered");
+        state.seller_books.get_mut(&owner).unwrap().keeping = None;
+        assert!(
+            state
+                .seller_book_notes(STORE)
+                .iter()
+                .any(|n| n.order.order.id == paid.order.id),
+            "a refused one is offered again while it is named"
         );
     }
 
@@ -28212,6 +28289,7 @@ mod buy_flow_tests {
                 despatch: None,
                 paid_height: Some(TIP_HEIGHT - 1),
                 sent_off_store: false,
+                seal: None,
             },
             SellerKeptOrder {
                 order: unpaid_only_here.clone(),
@@ -28219,6 +28297,7 @@ mod buy_flow_tests {
                 despatch: None,
                 paid_height: None,
                 sent_off_store: false,
+                seal: None,
             },
         ];
         for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
@@ -28244,6 +28323,52 @@ mod buy_flow_tests {
                 "an unpaid order only the book holds"
             );
         }
+        // Read: Cancel is refused for the book's paid copy.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .iter_mut()
+            .filter(|o| o.order.id == order.order.id)
+            .for_each(|o| o.status = OrderStatus::AwaitingPayment);
+        assert!(state
+            .cancel_invoice(STORE, &order.order.id)
+            .unwrap_err()
+            .contains("already paid"));
+        // Not read at all, Cancel waits and asks for the read; a read that
+        // waited past its time is asked again; a read refused is not waited
+        // on.
+        let book = state.seller_books.remove(&owner).unwrap();
+        assert!(state.seller_book_unread(STORE));
+        assert_eq!(
+            state.cancel_invoice(STORE, &order.order.id).unwrap_err(),
+            SELLER_BOOK_LOADING
+        );
+        let asked = state.seller_books[&owner]
+            .reading
+            .as_ref()
+            .expect("asked")
+            .0;
+        assert!(state.read_seller_book(STORE).is_empty(), "one at a time");
+        state.seller_books.get_mut(&owner).unwrap().read_at_ms = 0;
+        assert!(
+            matches!(
+                &state.read_seller_book(STORE)[..],
+                [harvest_common::HarvestDelegateRequest::ListSellerOrders { request_id, .. }]
+                    if *request_id != asked
+            ),
+            "asked again once its wait is over"
+        );
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                read_failed: true,
+                loaded: false,
+                ..book
+            },
+        );
+        assert!(!state.seller_book_unread(STORE), "a refused read");
     }
 
     /// Step 2, the buyer's half of "history lives in each side's
@@ -32680,6 +32805,16 @@ mod buy_flow_tests {
                 store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
             }],
         );
+        // The seller's own book read (step 2): Cancel waits for it.
+        if let Some(owner) = state.browsing_stores[STORE].owner {
+            state.seller_books.insert(
+                owner,
+                crate::seller_book::SellerBook {
+                    loaded: true,
+                    ..Default::default()
+                },
+            );
+        }
         (state, order)
     }
 
@@ -32866,6 +33001,19 @@ mod buy_flow_tests {
         assert!(state.pending_signatures.is_empty());
     }
 
+    /// The seller's own book read, as a seller's tab reads it once its
+    /// store's state arrives (step 2): Cancel waits for it.
+    fn the_book_is_read(state: &mut AppState) {
+        let owner = state.browsing_stores[STORE].owner.expect("owned");
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                ..Default::default()
+            },
+        );
+    }
+
     /// A confirmed in-window row at `order`'s address, as
     /// `apply_address_state` builds them (the chain fixture leaves the rows
     /// empty).
@@ -32910,6 +33058,7 @@ mod buy_flow_tests {
         let _ = claims;
         give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
         show_a_payment_row(&mut state, &order, 546);
+        the_book_is_read(&mut state);
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("dust does not refuse a cancel");
@@ -32932,6 +33081,7 @@ mod buy_flow_tests {
             }],
         );
         give_the_node_the_chain(&mut state, &order, claims, tip);
+        the_book_is_read(&mut state);
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("queued");
