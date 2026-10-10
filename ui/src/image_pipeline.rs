@@ -8,7 +8,7 @@
 //! applies, and is named by the hash of the STRIPPED bytes, so what the
 //! listing signs is exactly what is uploaded.
 //!
-//! Only [`encode_file`] needs a browser. Everything it hands on is checked by
+//! Only `encode_file` (wasm only) needs a browser. Everything it hands on is checked by
 //! [`prepare`], which is plain Rust and tested on the host.
 
 use harvest_common::listing_image::{ImageBlob, MAX_IMAGE_BYTES, MAX_THUMB_BYTES, MAX_THUMB_EDGE};
