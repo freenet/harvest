@@ -112,102 +112,44 @@ pub fn BuyForm(
         unpaid_in_conversation(&state.buyer_purchases(&store_contract_id), current)
             >= harvest_common::delegate::MAX_UNPAID_INSTANT_PER_BUYER
     };
-    let ready = total.is_some() && !shipping().trim().is_empty() && !too_many_unpaid && !closed;
 
+    // Sent, with no order id to follow (never expected: every Buy now names
+    // its order): the wait is said here.
     if let Some(sent) = sent() {
-        let thread = APP_STATE.read().conversation_thread(&store_contract_id);
-        let answer = latest_answer(&thread, &sent.answers_before, sent.expected.as_ref());
         let _ = now_ms();
-        return match instant_wait(sent.at_ms, unix_millis(), answer.is_some()) {
-            InstantWait::Answered => match answer {
-                Some(Answer::Declined(reason)) => rsx! {
-                    p { class: "text-warning", "The seller\u{2019}s store couldn\u{2019}t take this order: {reason}" }
-                    p { class: "text-muted small", "You haven\u{2019}t been charged anything." }
-                },
-                _ => {
-                    // The order's own card, here under the listing where the
-                    // buyer pressed Buy now, rather than a pointer to a list
-                    // further down the page (the 2026-09-27 friction report).
-                    let purchase = sent.expected.as_ref().and_then(|expected| {
-                        APP_STATE
-                            .read()
-                            .buyer_purchases(&store_contract_id)
-                            .into_iter()
-                            .find(|p| &p.order_id == expected)
-                    });
-                    let bitcoin = APP_STATE.read().bitcoin.clone();
-                    // Said only while there is something to pay.
-                    let payable = purchase.as_ref().is_some_and(|p| {
-                        (p.blockers.is_empty() || p.ready_to_keep())
-                            && p.commitment
-                                .as_ref()
-                                .is_some_and(|c| c.order.amount_sats == sent.asked_sats)
-                    });
-                    rsx! {
-                        // Only a counted listing holds stock (the delegate's
-                        // `Sale::holds`), and only for the hour: a payment
-                        // after that still counts, but the item may have gone.
-                        if counted && payable {
-                            p { class: "text-muted",
-                                "Pay soon: this item is kept for you for about an hour. If it sells out "
-                                "before your payment is confirmed, the seller either sends it anyway or refunds you."
-                            }
-                        }
-                        match purchase {
-                            Some(purchase) => rsx! {
-                                InlinePurchase { order_id: purchase.order_id.clone() }
-                                PurchaseCard {
-                                    store_contract_id: store_contract_id.clone(),
-                                    purchase,
-                                    bitcoin,
-                                    just_bought: true,
-                                    asked_sats: Some(sent.asked_sats),
-                                }
-                            },
-                            None => rsx! {
-                                p { strong { "Order placed." } }
-                                p { class: "text-muted", "Getting the payment details ready\u{2026}" }
-                            },
-                        }
-                    }
+        return match instant_wait(sent.at_ms, unix_millis(), false) {
+            InstantWait::NotResponding => rsx! {
+                p { class: "text-muted",
+                    "The seller\u{2019}s store hasn\u{2019}t answered yet. You haven\u{2019}t been charged \
+                     anything. If it answers later, your order appears under Purchases."
                 }
             },
-            InstantWait::Waiting => rsx! {
+            _ => rsx! {
                 p { strong { "Order placed." } }
                 p { class: "text-muted",
                     "Getting the payment details for {listing_title} from the seller\u{2019}s store. "
                     "This usually takes a few seconds."
                 }
             },
-            InstantWait::NotResponding => rsx! {
-                p { class: "text-muted",
-                    "The seller\u{2019}s store hasn\u{2019}t answered yet. You haven\u{2019}t been charged "
-                    "anything. If it answers later, your order appears under \u{201c}Your purchases\u{201d} below."
-                }
-            },
         };
     }
+    let network = crate::gateway::bitcoin_config::default_network();
+    let unit_sats = listing.checkout.as_ref().map(|c| c.unit_sats).unwrap_or(0);
+    let store_name = APP_STATE.read().store_name_of(&store_contract_id).label();
+    // The bill: the items, delivery where it is priced, and the total.
+    let bill = parsed_quantity.zip(total).map(|(q, total)| {
+        let items = unit_sats.saturating_mul(u64::from(q));
+        let delivery = total.saturating_sub(items);
+        (q, items, delivery, total)
+    });
 
     rsx! {
-        div { style: "margin-top: 0.75rem;",
-            if !by_region.is_empty() {
-                div { class: "form-group",
-                    label { class: "form-label", "Deliver to" }
-                    select {
-                        class: "form-select field-fit",
-                        value: "{region}",
-                        onchange: move |event| region.set(event.value()),
-                        option { value: "", "Choose a region" }
-                        for name in by_region.iter() {
-                            option { key: "{name}", value: "{name}", "{name}" }
-                        }
-                    }
-                }
-            }
+        div { class: "buy-form",
             for (i, group) in listing.choices.iter().enumerate() {
                 div { key: "{group.name}", class: "form-group",
-                    label { class: "form-label", "{group.name}" }
+                    label { class: "form-label", r#for: "pick-{i}", "{group.name}" }
                     select {
+                        id: "pick-{i}",
                         class: "form-select field-fit",
                         value: "{picks()[i]}",
                         onchange: move |event| picks.with_mut(|p| p[i] = event.value()),
@@ -219,8 +161,9 @@ pub fn BuyForm(
                 }
             }
             div { class: "form-group",
-                label { class: "form-label", "How many" }
+                label { class: "form-label", r#for: "buy-quantity", "How many" }
                 select {
+                    id: "buy-quantity",
                     class: "form-select field-fit",
                     value: "{quantity}",
                     onchange: move |event| quantity.set(event.value()),
@@ -229,37 +172,60 @@ pub fn BuyForm(
                     }
                 }
             }
+            if !by_region.is_empty() {
+                div { class: "form-group",
+                    label { class: "form-label", r#for: "buy-region", "Deliver to" }
+                    select {
+                        id: "buy-region",
+                        class: "form-select field-fit",
+                        value: "{region}",
+                        onchange: move |event| region.set(event.value()),
+                        option { value: "", "Choose a region" }
+                        for name in by_region.iter() {
+                            option { key: "{name}", value: "{name}", "{name}" }
+                        }
+                    }
+                }
+            }
             div { class: "form-group",
-                label { class: "form-label", "Where to send it" }
+                label { class: "form-label", r#for: "buy-ship-to", "Where to send it" }
                 textarea {
+                    id: "buy-ship-to",
                     class: "form-textarea",
                     value: "{shipping}",
                     placeholder: "Name and postal address, or whatever this seller needs.",
                     oninput: move |event| shipping.set(event.value()),
                 }
                 p { class: "text-muted small",
-                    "Only this seller can read it. It is locked to them before it leaves your "
-                    "browser, and it is never published."
+                    "Only {store_name} can read this. It is locked to them before it leaves your browser."
                 }
             }
             div { class: "form-group",
-                label { class: "form-label", "Note for the seller (optional)" }
+                label { class: "form-label", r#for: "buy-note", "Note for the seller (optional)" }
                 // One line, growing as the buyer types (Ian, 2026-09-29):
                 // most notes are a line.
                 textarea {
+                    id: "buy-note",
                     class: "form-textarea grow-textarea",
                     rows: 1,
                     value: "{note}",
-                    placeholder: "Delivery date, gift message...",
+                    placeholder: "Delivery date, gift message\u{2026}",
                     oninput: move |event| {
                         note.set(event.value());
                         super::grow_focused_textarea();
                     },
                 }
             }
-            if let Some(total) = total {
-                p { class: "listing-price",
-                    "Total: {super::store_view::sats_text(total)} ({super::bitcoin_view::format_sats(total)})"
+            if let Some((q, items, delivery, total)) = bill {
+                div { class: "bill",
+                    span { "{listing_title} \u{00d7} {q}" }
+                    span { "{super::pay_card::money(items, network)}" }
+                    if delivery > 0 {
+                        span { if region().is_empty() { "Delivery" } else { "Delivery, {region}" } }
+                        span { "{super::pay_card::money(delivery, network)}" }
+                    }
+                    strong { "Total" }
+                    strong { "{super::pay_card::money(total, network)}" }
                 }
             }
             if too_many_unpaid {
@@ -274,13 +240,26 @@ pub fn BuyForm(
                 p { class: "text-warning", "{message}" }
             }
             button {
-                class: "btn btn-primary",
-                disabled: !ready,
+                class: "btn btn-primary btn-wide",
+                // Pressable until something only the store can change stops
+                // it: a missing field is said under the form when pressed,
+                // rather than a grey button with no reason (critique C5).
+                disabled: too_many_unpaid || closed,
                 onclick: {
                     let listing = listing.clone();
                     let store_contract_id = store_contract_id.clone();
+                    let by_region = by_region.clone();
                     move |_| {
+                        if let Some(missing) = missing_choice(&listing, &picks(), !by_region.is_empty() && region().is_empty()) {
+                            problem.set(Some(missing));
+                            return;
+                        }
+                        if shipping().trim().is_empty() {
+                            problem.set(Some("Add where to send it.".to_string()));
+                            return;
+                        }
                         let (Some(quantity_wanted), Some(total)) = (parsed_quantity, total) else {
+                            problem.set(Some("This can\u{2019}t be bought with those choices.".to_string()));
                             return;
                         };
                         if too_many_unpaid {
@@ -310,15 +289,39 @@ pub fn BuyForm(
                         ) {
                             Ok(tag) => {
                                 problem.set(None);
-                                sent.set(Some(Sent {
+                                let pending = Sent {
                                     at_ms: unix_millis(),
                                     asked_sats: total,
                                     answers_before,
                                     expected: answering
                                         .answered_request(&tag)
                                         .map(|request| request.order_id()),
-                                }));
-                                wake_after_wait(now_ms);
+                                };
+                                match pending.expected.clone() {
+                                    // Its own page, where the pay steps come
+                                    // once the store answers (P3 to P4).
+                                    Some(order) => {
+                                        PENDING_BUYS.write().insert(
+                                            order.clone(),
+                                            PendingBuy {
+                                                store: store_contract_id.clone(),
+                                                title: listing.title.clone(),
+                                                listing: listing.id.clone(),
+                                                quantity: quantity_wanted,
+                                                holds_stock: counted,
+                                                sent: pending,
+                                            },
+                                        );
+                                        super::router::go(super::router::Page::Order {
+                                            at: super::router::OrderAt::Store(store_contract_id.clone()),
+                                            order,
+                                        });
+                                    }
+                                    None => {
+                                        sent.set(Some(pending));
+                                        wake_after_wait(now_ms);
+                                    }
+                                }
                             }
                             Err(e) => problem.set(Some(e)),
                         }
@@ -327,51 +330,82 @@ pub fn BuyForm(
                 "Buy now"
             }
             p { class: "text-muted small",
-                "Nothing is charged when you press Buy now. The seller\u{2019}s store sends the "
-                "payment details, and you pay from your own wallet."
+                "Nothing is charged yet. Next you get a payment address and pay from your own wallet."
+                if counted {
+                    " The item is held for you for about an hour."
+                }
             }
         }
     }
 }
 
-/// The orders Buy now forms are showing in place, one entry per mounted
-/// card, which the store page's "Your purchases" list then leaves out rather
-/// than showing twice. Several forms (one per listing) can each show one.
-static SHOWN_IN_BUY_FORM: GlobalSignal<Vec<harvest_common::payment::OrderId>> =
-    GlobalSignal::new(Vec::new);
-
-/// Marks `order_id` as shown by a Buy now form for as long as this is
-/// mounted beside its card.
-#[component]
-fn InlinePurchase(order_id: harvest_common::payment::OrderId) -> Element {
-    let mine = order_id.clone();
-    use_hook(move || {
-        // Deferred to a task: a signal is not written while a component
-        // renders. The task belongs to this component, so it never runs
-        // after the drop below.
-        spawn(async move {
-            SHOWN_IN_BUY_FORM.write().push(order_id);
-        });
-    });
-    use_drop(move || {
-        let mut shown = SHOWN_IN_BUY_FORM.write();
-        if let Some(at) = shown.iter().position(|id| *id == mine) {
-            shown.remove(at);
-        }
-    });
-    rsx! {}
+/// What the buyer still has to choose before Buy now can go out, said in
+/// their words: a choice group left on "Choose one", or the delivery region.
+fn missing_choice(listing: &Listing, picks: &[String], region_missing: bool) -> Option<String> {
+    // By position, with a pick missing altogether counted as not chosen: a
+    // listing edited after the form opened may have more groups than picks.
+    if let Some(group) = listing
+        .choices
+        .iter()
+        .enumerate()
+        .find(|(i, _)| picks.get(*i).is_none_or(|pick| pick.is_empty()))
+        .map(|(_, group)| group)
+    {
+        return Some(format!("Choose a {}.", group.name.to_lowercase()));
+    }
+    region_missing.then(|| "Choose where to deliver it.".to_string())
 }
 
-/// The purchases "Your purchases" lists: all but those a Buy now form on the
-/// page is already showing (`shown_above`).
-fn purchases_to_list<'a>(
-    purchases: &'a [BuyerPurchase],
-    shown_above: &[harvest_common::payment::OrderId],
-) -> Vec<&'a BuyerPurchase> {
-    purchases
-        .iter()
-        .filter(|p| !shown_above.contains(&p.order_id))
-        .collect()
+/// A Buy now this tab sent, waiting for (or answered by) the seller's
+/// store: what its order's page shows until the order itself is here.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct PendingBuy {
+    pub store: Vec<u8>,
+    pub title: String,
+    pub listing: ListingId,
+    pub quantity: u32,
+    /// The listing counts its stock, so the item is held for the hour.
+    pub holds_stock: bool,
+    pub(crate) sent: Sent,
+}
+
+/// The Buy nows this tab sent, by the order each will be answered with
+/// (`OrderId::for_request`). Its presence is also what tells the order's
+/// page that the buyer's own press created it, so the pay steps follow with
+/// no second press (see [`KeepBeforePaying`]).
+pub(crate) static PENDING_BUYS: GlobalSignal<
+    std::collections::HashMap<harvest_common::payment::OrderId, PendingBuy>,
+> = GlobalSignal::new(std::collections::HashMap::new);
+
+/// Where a Buy now this tab sent stands, before its order is here: still
+/// waiting, the store declined it (and why), or no answer in time.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum PendingAnswer {
+    Waiting,
+    Accepted,
+    Declined(String),
+    NotResponding,
+}
+
+/// [`PendingAnswer`] for `pending`, read from the conversation now.
+pub(crate) fn pending_answer(
+    state: &crate::state::AppState,
+    pending: &PendingBuy,
+) -> PendingAnswer {
+    let thread = state.conversation_thread(&pending.store);
+    let answer = latest_answer(
+        &thread,
+        &pending.sent.answers_before,
+        pending.sent.expected.as_ref(),
+    );
+    match instant_wait(pending.sent.at_ms, unix_millis(), answer.is_some()) {
+        InstantWait::Answered => match answer {
+            Some(Answer::Declined(reason)) => PendingAnswer::Declined(reason),
+            _ => PendingAnswer::Accepted,
+        },
+        InstantWait::Waiting => PendingAnswer::Waiting,
+        InstantWait::NotResponding => PendingAnswer::NotResponding,
+    }
 }
 
 /// [`open_unpaid_orders`] in the conversation tagged `current` alone: the
@@ -412,17 +446,17 @@ fn open_unpaid_orders(purchases: &[BuyerPurchase]) -> usize {
 /// An instant request that was sent: when, and how many seller answers the
 /// thread held at that moment.
 #[derive(Clone, PartialEq, Debug)]
-struct Sent {
-    at_ms: u64,
+pub(crate) struct Sent {
+    pub(crate) at_ms: u64,
     /// The total the form showed when Buy now was pressed: what the order
     /// must ask, checked on its card even if the request itself is not in
     /// this device's thread (round 2 of harvest#187).
-    asked_sats: u64,
-    answers_before: Vec<[u8; 32]>,
+    pub(crate) asked_sats: u64,
+    pub(crate) answers_before: Vec<[u8; 32]>,
     /// The order the store would issue for this request
     /// (`OrderId::for_request`), so an acceptance of another request is
     /// never read as this one's.
-    expected: Option<harvest_common::payment::OrderId>,
+    pub(crate) expected: Option<harvest_common::payment::OrderId>,
 }
 
 /// How long a buyer waits for the seller's store before being told it is
@@ -580,55 +614,25 @@ fn request(
     Ok(tag)
 }
 
-/// What this buyer has been accepted for at one store, and whether each is
-/// safe to pay.
+/// What a buyer can do about paying one purchase now, on its order's page
+/// (P4): the pay steps, the press that keeps this node's own copy first, or
+/// why there is nothing to pay. Every check that decides whether a payment
+/// address may be shown stays here and in `bitcoin_view::OrderCard`, as it
+/// was on the old purchase card.
 #[component]
-pub fn Purchases(store_contract_id: Vec<u8>) -> Element {
-    // The order a Buy now form on this page is already showing, in place,
-    // right under the listing: not listed a second time here.
-    let shown_above = SHOWN_IN_BUY_FORM();
-    let app_state = APP_STATE.read();
-    let purchases = app_state.buyer_purchases(&store_contract_id);
-    let listed: Vec<BuyerPurchase> = purchases_to_list(&purchases, &shown_above)
-        .into_iter()
-        .cloned()
-        .collect();
-    if listed.is_empty() {
-        return rsx! {};
-    }
-    let bitcoin = app_state.bitcoin.clone();
-    drop(app_state);
-
-    rsx! {
-        div { style: "margin-top: 24px;",
-            h4 { "Your purchases" }
-            for purchase in listed.iter() {
-                PurchaseCard {
-                    key: "{purchase.order_id}",
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
-                    bitcoin: bitcoin.clone(),
-                }
-            }
-        }
-    }
-}
-
-#[component]
-pub(crate) fn PurchaseCard(
+pub(crate) fn PayPanel(
     store_contract_id: Vec<u8>,
     purchase: BuyerPurchase,
     bitcoin: crate::state::BitcoinState,
-    /// Set only by the Buy now form, for the one order its own press just
-    /// created: that press is the buyer's, so the order is kept with nothing
-    /// more to press (see [`KeepBeforePaying`]).
+    /// The buyer's own Buy now press created this order (this tab sent it):
+    /// the order is kept with nothing more to press (see
+    /// [`KeepBeforePaying`]).
     #[props(default)]
     just_bought: bool,
-    /// The total the Buy now form showed, when this card is under it.
+    /// The total the Buy now form showed, when this tab sent it.
     #[props(default)]
     asked_sats: Option<u64>,
 ) -> Element {
-    let short = purchase.order_id.short();
     // The order must ask what the form showed. `AmountNotAsked` checks the
     // same against the request in the thread; this covers a thread that
     // does not hold it.
@@ -642,143 +646,75 @@ pub(crate) fn PurchaseCard(
                     order_sats: c.order.amount_sats,
                 })
         });
-    let cancellable = purchase.cancellable();
-    let item = APP_STATE
-        .read()
-        .purchase_item(&store_contract_id, &purchase);
-    let what = match item {
-        Some((Some(title), quantity)) => {
-            format!("{title} \u{00d7} {quantity} \u{00b7} order {short}")
-        }
-        Some((None, quantity)) => {
-            format!("{quantity} \u{00d7} an item no longer listed \u{00b7} order {short}")
-        }
-        None => format!("Order {short}"),
-    };
-    rsx! {
-        div { class: "card", style: "margin-top: 0.5rem;",
-            if let Some(headline) = purchase_headline(&purchase).filter(|_| not_asked.is_none()) {
-                p { strong { "{headline}" } }
+    if purchase.unconfirmed_paid() {
+        // A `Paid` record the fallback checks refuse: a bridge this app does
+        // not recognise, or an order no complaint could be made about. Not
+        // shown as paid (review round 3, P2-C).
+        return rsx! {
+            p { class: "text-warning",
+                "The seller's record says this order is paid, but it is not a purchase this \
+                 app can confirm as yours."
             }
-            p { class: "text-muted small", "{what}" }
-            if cancellable {
-                CancelPurchase {
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
-                }
+        };
+    }
+    if let Some(blocker) = not_asked {
+        return rsx! {
+            p { class: "text-warning", "{blocker.describe()}" }
+            p { class: "text-muted small",
+                "No payment details are shown while that is true. Buy it again to get an order you can pay."
             }
-            // A paid order of this buyer's is shown as paid, and offered the
-            // complaint, whatever the payment checks now say: those are about
-            // whether to PAY, and the seller can trip them after payment by
-            // closing the store or retiring its backing (review round 1 of
-            // #143, P1-1).
-            if let Some(paid) = purchase.paid.as_ref() {
-                SettledPurchase { order: paid.clone(), bitcoin: bitcoin.clone() }
-                FileComplaint {
-                    target: ComplaintTarget::AtStore {
-                        store_contract_id: store_contract_id.clone(),
-                        purchase: Box::new(purchase.clone()),
-                    },
-                }
-            } else if let Some(settled) = purchase.settled() {
-                SettledPurchase { order: settled.clone(), bitcoin: bitcoin.clone() }
-            } else if purchase.unconfirmed_paid() {
-                // A `Paid` record the fallback checks refuse: a bridge this app
-                // does not recognise, or an order no complaint could be made
-                // about. Not shown as paid (review round 3, P2-C).
-                p { class: "text-warning",
-                    "The seller's record says this order is paid, but it is not a purchase this \
-                     app can confirm as yours."
-                }
-            } else if let Some(blocker) = not_asked {
+        };
+    }
+    if purchase.ready_to_keep() {
+        // Everything checks out but this node does not keep its own copy
+        // yet. The payment details appear once the delegate says it holds it
+        // (`docs/complaint-threat-model.md` section 3.1).
+        return rsx! {
+            KeepBeforePaying {
+                store_contract_id: store_contract_id.clone(),
+                purchase: purchase.clone(),
+                just_bought,
+            }
+        };
+    }
+    match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
+        // Everything checks out, so the payment details are shown, through
+        // the same `OrderCard` the seller's own panel uses, which carries the
+        // per-invoice bridge check with it, laid out as the buyer's pay
+        // steps.
+        (true, Some(commitment)) => rsx! {
+            super::bitcoin_view::OrderCard {
+                order: commitment.clone(),
+                live: super::bitcoin_view::live_address_for_order(&bitcoin, &commitment.order),
+                buyer: true,
+                plain: true,
+            }
+        },
+        // Deliberately no payment address while anything is outstanding. A
+        // greyed-out button next to a visible address is an invitation to
+        // pay it by hand.
+        _ => rsx! {
+            for blocker in purchase.blockers.iter() {
                 p { class: "text-warning", "{blocker.describe()}" }
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "No payment details are shown while that is true. Buy it again to get an order you can pay."
-                }
-            } else if purchase.ready_to_keep() {
-                // Everything checks out but this node does not keep its own
-                // copy yet. The payment details appear once the delegate says
-                // it holds it (`docs/complaint-threat-model.md` section 3.1).
-                // No address here, for the reason the blocker arm below gives.
-                KeepBeforePaying {
-                    store_contract_id: store_contract_id.clone(),
-                    purchase: purchase.clone(),
-                    just_bought,
-                }
-            } else {
-            match (purchase.blockers.is_empty(), purchase.commitment.as_ref()) {
-                // Everything checks out, so the payment details are shown --
-                // through the same `OrderCard` the seller's own panel uses,
-                // which carries the per-invoice bridge check with it, laid
-                // out as the buyer's pay steps.
-                (true, Some(commitment)) => rsx! {
-                    super::bitcoin_view::OrderCard {
-                        order: commitment.clone(),
-                        live: super::bitcoin_view::live_address_for_order(&bitcoin, &commitment.order),
-                        buyer: true,
-                    }
-                },
-                // Deliberately no payment address while anything is
-                // outstanding. A greyed-out button next to a visible address
-                // is an invitation to pay it by hand.
-                _ => rsx! {
-                    for blocker in purchase.blockers.iter() {
-                        p { class: "text-warning", "{blocker.describe()}" }
-                    }
-                    p { class: "text-muted", style: "font-size: 0.85rem;",
-                        // The worst remedy among the blockers, because the
-                        // buyer has to do the hardest of them: one thing that
-                        // waiting will not fix means waiting is not the
-                        // answer.
-                        match purchase.blockers.iter().map(remedy).max_by_key(|r| match r {
-                            Remedy::Wait => 0,
-                            Remedy::AskTheSeller => 1,
-                            // Above asking the seller: a new request gets a
-                            // new order, which puts right whatever else the
-                            // seller got wrong in this one.
-                            Remedy::AskAgain | Remedy::BuyAgain => 2,
-                            Remedy::WalkAway => 3,
-                        }) {
-                            Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
-                            Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. Buy it again to get an order you can pay, or ask the seller.",
-                            Some(Remedy::AskAgain) => "No payment details are shown while that is true. Send your request to buy again from this device: a request from this version of Harvest carries your key, and the seller can answer it with an order you can pay.",
-                            Some(Remedy::BuyAgain) => "No payment details are shown while that is true. Buy it again to get an order you can pay.",
-                            _ => "No payment details are shown while that is true. Look again in a moment.",
-                        }
-                    }
-                },
             }
+            p { class: "text-muted small",
+                // The worst remedy among the blockers, because the buyer has
+                // to do the hardest of them.
+                match purchase.blockers.iter().map(remedy).max_by_key(|r| match r {
+                    Remedy::Wait => 0,
+                    Remedy::AskTheSeller => 1,
+                    Remedy::AskAgain | Remedy::BuyAgain => 2,
+                    Remedy::WalkAway => 3,
+                }) {
+                    Some(Remedy::WalkAway) => "No payment details are shown while that is true, and this is not something either of you can put right.",
+                    Some(Remedy::AskTheSeller) => "No payment details are shown while that is true. Buy it again to get an order you can pay, or ask the seller.",
+                    Some(Remedy::AskAgain) => "No payment details are shown while that is true. Send your request to buy again from this device: a request from this version of Harvest carries your key, and the seller can answer it with an order you can pay.",
+                    Some(Remedy::BuyAgain) => "No payment details are shown while that is true. Buy it again to get an order you can pay.",
+                    _ => "No payment details are shown while that is true. Look again in a moment.",
+                }
             }
-        }
+        },
     }
-}
-
-/// The one line a buyer reads first about a purchase: placed and waiting
-/// for their payment, or paid (Ian, 2026-09-26). `None` for anything else
-/// (settled otherwise, or a record the app cannot confirm), whose card says
-/// what happened in its own words.
-fn purchase_headline(purchase: &BuyerPurchase) -> Option<&'static str> {
-    use harvest_common::payment::OrderStatus;
-    if purchase.paid.is_some() {
-        return Some("Paid.");
-    }
-    if purchase.settled().is_some() || purchase.unconfirmed_paid() {
-        return None;
-    }
-    // Not "waiting for your payment" above a line saying not to pay it:
-    // only a blocker that waiting clears leaves the order waiting.
-    if purchase
-        .blockers
-        .iter()
-        .any(|b| !matches!(remedy(b), Remedy::Wait))
-    {
-        return None;
-    }
-    purchase
-        .commitment
-        .as_ref()
-        .filter(|c| c.status == OrderStatus::AwaitingPayment)
-        .map(|_| "Order placed, waiting for your payment.")
 }
 
 /// Before any payment details: this node keeps its own copy of the
@@ -915,7 +851,7 @@ fn AskToKeep(
 /// permanent, and the confirmation says what a buyer might not expect: a
 /// payment already sent still counts.
 #[component]
-fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
+pub(crate) fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Element {
     let order_id = purchase.order_id.clone();
     let mut confirming = use_signal(|| false);
     let mut problem = use_signal(|| Option::<String>::None);
@@ -974,7 +910,7 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
             }
         } else {
             button {
-                class: "btn btn-sm btn-outline",
+                class: "link-btn quiet-link",
                 onclick: move |_| {
                     problem.set(None);
                     confirming.set(true);
@@ -985,114 +921,201 @@ fn CancelPurchase(store_contract_id: Vec<u8>, purchase: BuyerPurchase) -> Elemen
     }
 }
 
-/// The buyer's control to complain about one of their PAID purchases
-/// (harvest#53 Phase C).
-///
-/// A category, never free text: the complaint lands on a public, permanent
-/// record nobody can moderate. Two steps, because it cannot be withdrawn.
-/// Shown only when a complaint could be made; otherwise the reason, or the
-/// complaint already on record.
+/// Whether a complaint about one paid purchase can be made now, and if not,
+/// what stands instead: the complaint already on record, one on its way, or
+/// why none can be made. The order page offers "Report a problem" only when
+/// it is [`ComplaintOffer::Open`] (critique 06-6).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ComplaintOffer {
+    /// On the seller's record, with the category the buyer chose.
+    OnRecord(&'static str),
+    /// Sent, being kept on this node.
+    Sent,
+    /// None can be made right now, and why.
+    Refused(String),
+    Open,
+}
+
+/// [`ComplaintOffer`] for `target`. The refusal is worked out only when
+/// nothing is on record or sent: it ends in a full verification of the
+/// complaint (memoised, review round 3 P2-D).
+pub(crate) fn complaint_offer(
+    state: &crate::state::AppState,
+    target: &ComplaintTarget,
+) -> ComplaintOffer {
+    if let Some(complaint) = target.on_record(state) {
+        return ComplaintOffer::OnRecord(super::reputation_view::category_label(
+            &complaint.category,
+        ));
+    }
+    if state.complaint_sent(&target.order_id()) {
+        return ComplaintOffer::Sent;
+    }
+    match target.refusal(state) {
+        Some(why) => ComplaintOffer::Refused(why),
+        None => ComplaintOffer::Open,
+    }
+}
+
+/// What the order page says about a complaint that is not open to make
+/// ([`complaint_offer`]), or `None` when one can be made.
+pub(crate) fn complaint_line(offer: &ComplaintOffer, short: &str) -> Option<String> {
+    match offer {
+        ComplaintOffer::OnRecord(category) => Some(format!(
+            "You reported a problem with order {short}: \u{201c}{category}\u{201d}. It is on the \
+             seller\u{2019}s public record."
+        )),
+        ComplaintOffer::Sent => Some(format!(
+            "Your complaint about order {short} is being kept on your node. It goes to the \
+             seller\u{2019}s record once it is kept, and shows there once the network has it."
+        )),
+        ComplaintOffer::Refused(_) | ComplaintOffer::Open => None,
+    }
+}
+
+/// P5's form: the decided line, "Message the seller" ahead of the choices,
+/// the three choices, and a confirm step. A category, never free text: the
+/// complaint lands on a public, permanent record nobody can moderate. Two
+/// steps, because it cannot be withdrawn.
 #[component]
-fn FileComplaint(target: ComplaintTarget) -> Element {
+pub(crate) fn ReportForm(target: ComplaintTarget, back: super::router::Page) -> Element {
     use harvest_common::feedback::FeedbackCategory;
     let order_id = target.order_id();
     let mut chosen = use_signal(|| Option::<FeedbackCategory>::None);
     let mut problem = use_signal(|| Option::<String>::None);
-    // The refusal is read only when there is no complaint on record: it ends
-    // in a full verification of the complaint (memoised, review round 3
-    // P2-D), which a card with nothing to offer does not need.
-    let (on_record, sent, refusal) = {
+    let (offer, message_to, store_page) = {
         let state = APP_STATE.read();
-        let on_record = target.on_record(&state);
-        let sent = state.complaint_sent(&order_id);
-        let refusal = (on_record.is_none() && !sent)
-            .then(|| target.refusal(&state))
-            .flatten();
-        (on_record, sent, refusal)
+        (
+            complaint_offer(&state, &target),
+            target.conversation(&state),
+            target.store_page(&state),
+        )
     };
     let short = order_id.short();
-    if let Some(complaint) = on_record {
+    if let Some(line) = complaint_line(&offer, &short) {
         return rsx! {
-            p { class: "text-muted",
-                "Your complaint about order {short} ({super::reputation_view::category_label(&complaint.category)}) \
-                 is on the seller's public record."
-            }
+            p { "{line}" }
+            button { class: "link-btn", onclick: move |_| super::router::go(back.clone()), "Back to the order" }
         };
     }
-    if sent {
+    if let ComplaintOffer::Refused(why) = offer {
         return rsx! {
-            p { class: "text-muted",
-                "Complaint about order {short} is being kept on your node. It goes to the \
-                 seller's record once it is kept, and shows there once the network has it."
-            }
-        };
-    }
-    if let Some(why) = refusal {
-        return rsx! {
-            p { class: "text-muted", style: "font-size: 0.85rem;",
-                "No complaint can be made about order {short} right now: {why}."
-            }
+            p { class: "text-muted", "No complaint can be made about order {short} right now: {why}." }
+            button { class: "link-btn", onclick: move |_| super::router::go(back.clone()), "Back to the order" }
         };
     }
     rsx! {
+        div { class: "panel panel-strong",
+            p { strong { "{COMPLAINT_LINE}" } }
+            match (message_to.clone(), store_page.clone()) {
+                (Some((store, tag)), _) => rsx! {
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| super::router::go(super::router::Page::Conversation {
+                            store: store.clone(),
+                            tag: Some(tag),
+                        }),
+                        "Message the seller"
+                    }
+                },
+                // This order's conversation is not on this device. A
+                // conversation is the store's, not the order's (page
+                // structure P8), so "Message the seller" opens the one a new
+                // message continues, which says what it needs (msg1 critique
+                // MSG-11; critique of round 4).
+                (None, Some(id)) => rsx! {
+                    p { class: "text-muted small",
+                        "The conversation this order was made in isn\u{2019}t on this device. A \
+                         message goes to your other conversation with the seller, so mention \
+                         order {short}."
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        onclick: move |_| super::router::go(super::router::Page::Conversation {
+                            store: id.clone(),
+                            tag: None,
+                        }),
+                        "Message the seller"
+                    }
+                },
+                (None, None) => rsx! {
+                    p { class: "text-muted small",
+                        "This order\u{2019}s messages aren\u{2019}t on this device, and its store isn\u{2019}t loaded."
+                    }
+                },
+            }
+        }
         if let Some(why) = problem() {
             p { class: "text-warning", "{why}" }
         }
         match chosen() {
             Some(category) => rsx! {
-                p { class: "text-warning",
-                    "Complain that order {short} was \"{super::reputation_view::category_label(&category)}\"? \
-                     This goes on the seller's public record permanently, cannot be withdrawn, \
-                     and is one per order."
-                }
-                button {
-                    class: "btn btn-sm btn-primary",
-                    onclick: {
-                        let target = target.clone();
-                        move |_| {
-                            chosen.set(None);
-                            let result = target.file(&mut APP_STATE.write(), category.clone());
-                            problem.set(result.err());
+                div { class: "panel",
+                    p { class: "text-warning",
+                        "Report order {short} as {super::reputation_view::category_label(&category)}? \
+                         It goes on the seller\u{2019}s public record for good, showing that choice, \
+                         the order\u{2019}s reference and the month, with no names or messages. You \
+                         can\u{2019}t withdraw it, and there\u{2019}s one per order."
+                    }
+                    div { class: "form-actions",
+                        button {
+                            class: "btn btn-primary",
+                            onclick: {
+                                let target = target.clone();
+                                move |_| {
+                                    chosen.set(None);
+                                    let result = target.file(&mut APP_STATE.write(), category.clone());
+                                    problem.set(result.err());
+                                }
+                            },
+                            "Report it"
                         }
-                    },
-                    "Yes, complain"
-                }
-                button {
-                    class: "btn btn-sm btn-outline",
-                    onclick: move |_| chosen.set(None),
-                    "Go back"
+                        button {
+                            class: "btn btn-outline",
+                            onclick: move |_| chosen.set(None),
+                            "Go back"
+                        }
+                    }
                 }
             },
             None => rsx! {
-                p { class: "text-muted", style: "font-size: 0.85rem;",
-                    "Something wrong with order {short}? You can put one complaint on the \
-                     seller's public record:"
-                }
-                for category in FeedbackCategory::ALL {
-                    {
-                        let label = super::reputation_view::category_label(&category);
-                        rsx! {
-                            button {
-                                class: "btn btn-sm btn-outline",
-                                onclick: move |_| {
-                                    problem.set(None);
-                                    chosen.set(Some(category.clone()));
-                                },
-                                "{label}"
+                h3 { class: "complaint-question", "What went wrong?" }
+                div { class: "form-actions",
+                    for category in FeedbackCategory::ALL {
+                        {
+                            let label = super::reputation_view::category_label(&category);
+                            rsx! {
+                                button {
+                                    class: "btn btn-outline",
+                                    onclick: move |_| {
+                                        problem.set(None);
+                                        chosen.set(Some(category.clone()));
+                                    },
+                                    "{label}"
+                                }
                             }
                         }
                     }
                 }
+                p { class: "text-muted small",
+                    "Harvest can\u{2019}t refund you: the payment went straight to the seller. The \
+                     record warns future buyers."
+                }
+                button { class: "link-btn", onclick: move |_| super::router::go(back.clone()), "Not now" }
             },
         }
     }
 }
 
+/// Said on the complaint step before any category (Ian, 2026-09-30).
+pub(crate) const COMPLAINT_LINE: &str =
+    "Complaints are permanent and can't be withdrawn. Message the seller first.";
+
 /// What a complaint control is about: a purchase on a loaded store's page,
 /// or a purchase this node keeps, judged from the kept record alone (review
 /// round 5 of #143, R5-B).
-#[derive(Clone, PartialEq)]
-enum ComplaintTarget {
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum ComplaintTarget {
     AtStore {
         store_contract_id: Vec<u8>,
         purchase: Box<BuyerPurchase>,
@@ -1104,14 +1127,14 @@ enum ComplaintTarget {
 }
 
 impl ComplaintTarget {
-    fn order_id(&self) -> harvest_common::payment::OrderId {
+    pub(crate) fn order_id(&self) -> harvest_common::payment::OrderId {
         match self {
             Self::AtStore { purchase, .. } => purchase.order_id.clone(),
             Self::Kept { order_id, .. } => order_id.clone(),
         }
     }
 
-    fn on_record(
+    pub(crate) fn on_record(
         &self,
         state: &crate::state::AppState,
     ) -> Option<harvest_common::reputation::Complaint> {
@@ -1127,7 +1150,7 @@ impl ComplaintTarget {
         }
     }
 
-    fn refusal(&self, state: &crate::state::AppState) -> Option<String> {
+    pub(crate) fn refusal(&self, state: &crate::state::AppState) -> Option<String> {
         match self {
             Self::AtStore {
                 store_contract_id,
@@ -1140,7 +1163,67 @@ impl ComplaintTarget {
         }
     }
 
-    fn file(
+    /// The store page to send the buyer to when no conversation is held here
+    /// (msg1 critique MSG-11): the purchase's store, or for a kept purchase
+    /// a loaded store under its key.
+    pub(crate) fn store_page(&self, state: &crate::state::AppState) -> Option<Vec<u8>> {
+        match self {
+            Self::AtStore {
+                store_contract_id, ..
+            } => Some(store_contract_id.clone()),
+            Self::Kept { store_key, .. } => state
+                .browsing_stores
+                .iter()
+                .filter(|(_, store)| store.owner == Some(*store_key))
+                .map(|(id, _)| id.clone())
+                .min(),
+        }
+    }
+
+    /// Where the buyer can message the seller about this purchase: its store
+    /// (loaded on this page) and the conversation it is filed under, when this
+    /// node still holds that conversation. For a kept purchase, the loaded
+    /// store whose key it is kept under, if any; otherwise nowhere to offer.
+    pub(crate) fn conversation(
+        &self,
+        state: &crate::state::AppState,
+    ) -> Option<(Vec<u8>, [u8; 32])> {
+        let (store_contract_id, tag) = match self {
+            Self::AtStore {
+                store_contract_id,
+                purchase,
+            } => (store_contract_id.clone(), purchase.conversation),
+            Self::Kept {
+                store_key,
+                order_id,
+            } => {
+                let kept = state
+                    .kept_purchases
+                    .iter()
+                    .find(|k| k.store_key == *store_key && k.order.order.id == *order_id)?;
+                // The loaded store under this key that holds the kept
+                // conversation, not merely the first under the key: a store
+                // migrated to a new generation has more than one entry.
+                let (id, _) = state.browsing_stores.iter().find(|(_, store)| {
+                    store.owner == Some(*store_key)
+                        && store
+                            .conversations
+                            .iter()
+                            .any(|conversation| conversation.buyer_public_key == kept.conversation)
+                })?;
+                (id.clone(), kept.conversation)
+            }
+        };
+        state
+            .browsing_stores
+            .get(&store_contract_id)?
+            .conversations
+            .iter()
+            .any(|conversation| conversation.buyer_public_key == tag)
+            .then_some((store_contract_id, tag))
+    }
+
+    pub(crate) fn file(
         &self,
         state: &mut crate::state::AppState,
         category: harvest_common::feedback::FeedbackCategory,
@@ -1181,106 +1264,17 @@ pub(crate) fn kept_purchases_to_list(
     kept
 }
 
-/// Every purchase this node keeps, from the kept records alone, with no
-/// store loaded (review round 5 of #143, R5-B). A store re-keyed while its
-/// seller stays away, or one nobody hosts, still leaves the buyer the paid
-/// copy and the complaint control here. Shown on My purchases, below the
-/// loaded stores' purchase cards; `shown` names the kept purchases those
-/// cards already carry (`AppState::kept_purchases_shown_at`).
-///
-/// No payment address, ever: the purchase card is the one component that
-/// shows a buyer one (`docs/complaint-threat-model.md` section 3.1). An
-/// unpaid kept order is listed so the buyer knows it is held, and is paid
-/// from its purchase card once its store is loaded.
-#[component]
-pub fn KeptPurchases(shown: Vec<([u8; 32], harvest_common::payment::OrderId)>) -> Element {
-    let app_state = APP_STATE.read();
-    let kept = kept_purchases_to_list(&app_state.kept_purchases, &shown);
-    if kept.is_empty() {
-        return rsx! {};
-    }
-    let bitcoin = app_state.bitcoin.clone();
-    drop(app_state);
-    let seen_paid: Vec<bool> = {
-        let state = APP_STATE.read();
-        kept.iter().map(|k| state.kept_seen_paid(k)).collect()
-    };
-    let heading = if shown.is_empty() {
-        "Your purchases"
-    } else {
-        "Other purchases your node keeps"
-    };
-    rsx! {
-        div { class: "card", style: "margin-top: 1rem;",
-            h3 { "{heading}" }
-            p { class: "text-muted", style: "font-size: 0.85rem;",
-                "Every order your node keeps its own copy of. A complaint about a paid one "
-                "is made from that copy, so it does not need the seller's store to be "
-                "online or unchanged."
-            }
-            for (purchase, seen_paid) in kept.into_iter().zip(seen_paid) {
-                KeptPurchaseRow {
-                    // A kept purchase is one per order id on this node, but
-                    // its identity is the pair.
-                    key: "{hex::encode(purchase.store_key)}-{purchase.order.order.id}",
-                    purchase,
-                    seen_paid,
-                    bitcoin: bitcoin.clone(),
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn KeptPurchaseRow(
-    purchase: harvest_common::delegate::KeptPurchase,
-    /// Claims this node holds prove the unpaid copy paid, and its upgrade
-    /// is on its way.
-    seen_paid: bool,
-    bitcoin: crate::state::BitcoinState,
-) -> Element {
-    use harvest_common::payment::OrderStatus;
-    let short = purchase.order.order.id.short();
-    let paid = purchase.order.status == OrderStatus::Paid;
-    let amount = super::bitcoin_view::format_sats(purchase.order.order.amount_sats);
-    rsx! {
-        div { style: "margin-top: 0.5rem; border-top: 1px solid var(--border, #ddd); padding-top: 0.5rem;",
-            p { class: "text-muted", style: "font-size: 0.8rem;", "Order {short}" }
-            if paid {
-                SettledPurchase { order: purchase.order.clone(), bitcoin }
-                FileComplaint {
-                    target: ComplaintTarget::Kept {
-                        store_key: purchase.store_key,
-                        order_id: purchase.order.order.id.clone(),
-                    },
-                }
-            } else if seen_paid {
-                p { class: "text-muted",
-                    "{amount} \u{00b7} Payment seen. Your node is keeping its proof of payment, \
-                     and a complaint can be made once it has."
-                }
-            } else {
-                // No "pay it here" (review round 6): a buyer who paid while
-                // the payment went unobserved (model 7.4) would read it as a
-                // prompt to pay again.
-                p { class: "text-muted",
-                    "{amount} \u{00b7} No payment seen yet. Your node keeps this order and \
-                     follows what the bridge reports for its address. If you have not paid, \
-                     the seller's store page is where to."
-                }
-            }
-        }
-    }
-}
-
 /// A purchase that has moved past payment, as its buyer sees it: where it
 /// stands against the reader-side windows (harvest#53), and no payment
 /// address, since there is nothing left to pay.
 #[component]
-fn SettledPurchase(
+pub(crate) fn SettledPurchase(
     order: harvest_common::payment::AuthorizedOrder,
     bitcoin: crate::state::BitcoinState,
+    /// The page's pill already says "Paid": the sentence does not start by
+    /// saying it again (critique C11).
+    #[props(default)]
+    after_pill: bool,
 ) -> Element {
     let tip_height = bitcoin
         .tips
@@ -1301,11 +1295,13 @@ fn SettledPurchase(
             crate::fulfilment::Reader::Buyer,
         )
         .unwrap_or_else(|| "This order is no longer awaiting payment.".to_string());
-    let amount = super::bitcoin_view::format_sats(order.order.amount_sats);
+    let note = match note.strip_prefix("Paid. ") {
+        Some(rest) if after_pill => rest.to_string(),
+        _ => note,
+    };
+    // The amount is in the page's own title and bill.
     rsx! {
-        p { class: if stage.needs_attention() { "text-warning" } else { "" },
-            "{amount} \u{00b7} {note}"
-        }
+        p { class: if stage.needs_attention() { "text-warning" } else { "" }, "{note}" }
     }
 }
 
@@ -1389,41 +1385,46 @@ pub fn AcceptRequest(
                     "for you: if you count this listing, lower the count yourself once it is paid."
                 }
             }
-            div { class: "form-group",
-                label { class: "form-label",
-                    "Amount for {quantity} x {listing_title} (satoshis)"
-                }
-                // Fixed for a Buy now answer: the buyer's app pays only the
-                // total they agreed to (`PaymentBlocker::AmountNotAsked`), so
-                // any other amount would publish an order nobody can pay.
-                input {
-                    class: "form-input field-num",
-                    // Text with a numeric keyboard, as every other number
-                    // field: a number input's spinner eats the width.
-                    r#type: "text",
-                    inputmode: "numeric",
-                    readonly: instant.is_some(),
-                    value: "{amount}",
-                    oninput: move |event| amount.set(event.value()),
-                }
-                if instant.is_some() {
-                    p { class: "text-muted small",
-                        "The total the buyer agreed to when they pressed Buy now. Their app pays no "
-                        "other amount."
+            // A Buy now answer's amount is the total the buyer agreed to, and
+            // one confirmation is what every Buy now order asks: nothing to
+            // type (critique C-2). An older request is priced by hand.
+            if let Some(answer) = instant {
+                p {
+                    "Total: "
+                    strong {
+                        "{super::pay_card::money(answer.total_sats, crate::gateway::bitcoin_config::default_network())}"
                     }
                 }
-            }
-            div { class: "form-group",
-                label { class: "form-label", "Confirmations required" }
-                input {
-                    class: "form-input field-count",
-                    r#type: "text",
-                    inputmode: "numeric",
-                    value: "{confirmations}",
-                    oninput: move |event| confirmations.set(event.value()),
+                p { class: "text-muted small",
+                    "The total the buyer agreed to when they pressed Buy now. Their app pays no other amount."
                 }
-                if let Err(why) = confirmations_read {
-                    p { class: "text-warning", "{why}" }
+            } else {
+                div { class: "form-group",
+                    label { class: "form-label",
+                        "Amount for {quantity} x {listing_title} (satoshis)"
+                    }
+                    input {
+                        class: "form-input field-num",
+                        // Text with a numeric keyboard, as every other number
+                        // field: a number input's spinner eats the width.
+                        r#type: "text",
+                        inputmode: "numeric",
+                        value: "{amount}",
+                        oninput: move |event| amount.set(event.value()),
+                    }
+                }
+                div { class: "form-group",
+                    label { class: "form-label", "Confirmations required" }
+                    input {
+                        class: "form-input field-count",
+                        r#type: "text",
+                        inputmode: "numeric",
+                        value: "{confirmations}",
+                        oninput: move |event| confirmations.set(event.value()),
+                    }
+                    if let Err(why) = confirmations_read {
+                        p { class: "text-warning", "{why}" }
+                    }
                 }
             }
             if let Some(message) = problem() {
@@ -1652,20 +1653,68 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
 mod tests {
     use super::*;
 
-    /// No "waiting for your payment" above a line saying not to pay it
-    /// (round 3 of harvest#187). Red without the check.
+    /// **The complaint step's "Message the seller" goes to the purchase's
+    /// own conversation**, and only where this node holds it: at a loaded
+    /// store, and for a kept purchase, at the store under its key that holds
+    /// the kept conversation (not merely the first under that key). Red with
+    /// `conversation` returning None, and with the kept lookup picking the
+    /// first store under the key.
     #[test]
-    fn a_purchase_not_to_pay_has_no_waiting_headline() {
-        let order = harvest_common::payment::AuthorizedOrder {
+    fn the_complaint_step_messages_the_purchases_own_conversation() {
+        let key = [4u8; 32];
+        let held = crate::messaging::BuyerConversation::open(&[9u8; 32]).expect("open");
+        let tag = held.buyer_public_key;
+        let mut state = crate::state::AppState::default();
+        // An older generation of the store under the same key, without the
+        // conversation, and the current one with it.
+        let old_generation = crate::state::BrowsingStore {
+            owner: Some(key),
+            ..Default::default()
+        };
+        let current = crate::state::BrowsingStore {
+            owner: Some(key),
+            conversations: vec![held],
+            ..Default::default()
+        };
+        // Several, so a lookup taking the first store under the key (in
+        // hash order) almost never lands on the right one by luck.
+        for generation in 10u8..20 {
+            state
+                .browsing_stores
+                .insert(vec![generation; 32], old_generation.clone());
+        }
+        state.browsing_stores.insert(vec![2u8; 32], current);
+        let purchase = |conversation: [u8; 32]| BuyerPurchase {
+            order_id: harvest_common::payment::OrderId([7; 32]),
+            conversation,
+            commitment: None,
+            blockers: Vec::new(),
+            paid: None,
+        };
+        let at_store = |conversation| ComplaintTarget::AtStore {
+            store_contract_id: vec![2u8; 32],
+            purchase: Box::new(purchase(conversation)),
+        };
+        assert_eq!(
+            at_store(tag).conversation(&state),
+            Some((vec![2u8; 32], tag))
+        );
+        assert_eq!(
+            at_store([3u8; 32]).conversation(&state),
+            None,
+            "not held here"
+        );
+
+        let kept_order = harvest_common::payment::AuthorizedOrder {
             order: harvest_common::payment::Order {
                 request_id: None,
-                id: harvest_common::payment::OrderId([0u8; 32]),
+                id: harvest_common::payment::OrderId([7; 32]),
                 buyer_fingerprint: String::new(),
-                seller_fingerprint: "me".into(),
-                amount_sats: 2,
+                seller_fingerprint: String::new(),
+                amount_sats: 1,
                 network: freenet_bitcoin_common::BitcoinNetwork::Signet,
-                payment_script_pubkey: vec![0x00, 0x14, 1],
-                payment_address: "tb1qtest".into(),
+                payment_script_pubkey: Vec::new(),
+                payment_address: String::new(),
                 required_confirmations: 1,
                 payment_hash: None,
                 trusted_bridges: Vec::new(),
@@ -1674,55 +1723,29 @@ mod tests {
                 order_binding: None,
                 listing_tag: None,
                 buyer_receipt_key: None,
-                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-            }
-            .with_derived_id(),
+                created_at: chrono::Utc::now(),
+            },
             scoped_payload: Vec::new(),
             signature: Vec::new(),
-            status: harvest_common::payment::OrderStatus::AwaitingPayment,
+            status: harvest_common::payment::OrderStatus::Paid,
             payment_proof: None,
             status_scoped_payload: None,
             status_signature: None,
         };
-        let mut purchase = BuyerPurchase {
-            order_id: order.order.id.clone(),
-            conversation: [0; 32],
-            commitment: Some(order),
-            blockers: Vec::new(),
-            paid: None,
+        state
+            .kept_purchases
+            .push(harvest_common::delegate::KeptPurchase {
+                store_key: key,
+                conversation: tag,
+                receipt_seed: [0; 32],
+                order: kept_order,
+                complaint: None,
+            });
+        let kept = ComplaintTarget::Kept {
+            store_key: key,
+            order_id: harvest_common::payment::OrderId([7; 32]),
         };
-        assert_eq!(
-            purchase_headline(&purchase),
-            Some("Order placed, waiting for your payment.")
-        );
-        purchase.blockers = vec![PaymentBlocker::AmountNotAsked {
-            asked_sats: 1,
-            order_sats: 2,
-        }];
-        assert_eq!(purchase_headline(&purchase), None);
-    }
-
-    /// "Your purchases" leaves out every order a Buy now form is showing, and
-    /// only those: two forms open on two listings each hide their own
-    /// (codex and review round 1 of harvest#187). Red with a single slot.
-    #[test]
-    fn purchases_shown_under_a_form_are_not_listed_again() {
-        let purchase = |seed: u8| BuyerPurchase {
-            order_id: harvest_common::payment::OrderId([seed; 32]),
-            conversation: [0; 32],
-            commitment: None,
-            blockers: Vec::new(),
-            paid: None,
-        };
-        let all = vec![purchase(1), purchase(2), purchase(3)];
-        let ids = |list: Vec<&BuyerPurchase>| -> Vec<u8> {
-            list.iter().map(|p| p.order_id.0[0]).collect()
-        };
-        assert_eq!(ids(purchases_to_list(&all, &[])), vec![1, 2, 3]);
-        let two_forms = [all[0].order_id.clone(), all[2].order_id.clone()];
-        assert_eq!(ids(purchases_to_list(&all, &two_forms)), vec![2]);
-        let elsewhere = [harvest_common::payment::OrderId([9; 32])];
-        assert_eq!(ids(purchases_to_list(&all, &elsewhere)), vec![1, 2, 3]);
+        assert_eq!(kept.conversation(&state), Some((vec![2u8; 32], tag)));
     }
 
     /// A seller answers an instant request by hand only when no order for it
@@ -1921,29 +1944,6 @@ mod tests {
         );
     }
 
-    /// Placed and waiting, then paid; nothing for a settled order, whose card
-    /// says what happened. Mutated red by swapping the two lines.
-    #[test]
-    fn a_purchase_reads_placed_then_paid() {
-        use harvest_common::payment::OrderStatus;
-        let waiting = purchase(Some(order(OrderStatus::AwaitingPayment, true)), vec![]);
-        assert_eq!(
-            purchase_headline(&waiting),
-            Some("Order placed, waiting for your payment.")
-        );
-        let mut paid = purchase(
-            Some(order(OrderStatus::Paid, true)),
-            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Paid)],
-        );
-        paid.paid = Some(order(OrderStatus::Paid, true));
-        assert_eq!(purchase_headline(&paid), Some("Paid."));
-        let cancelled = purchase(
-            Some(order(OrderStatus::Cancelled, true)),
-            vec![PaymentBlocker::NotAwaitingPayment(OrderStatus::Cancelled)],
-        );
-        assert_eq!(purchase_headline(&cancelled), None);
-    }
-
     /// The newest answer after the ones already there when the order went
     /// out: nothing yet, then a decline with its reason, or an acceptance.
     /// An answer that was already in the thread is not mistaken for this
@@ -2034,5 +2034,51 @@ mod tests {
         );
         let at_send = seller_answers(std::slice::from_ref(&old_decline));
         assert_eq!(latest_answer(&[old_decline], &at_send, Some(&ours)), None);
+    }
+
+    /// What Buy now says is missing: the first group left on "Choose one"
+    /// (or with no pick at all, after the listing gained a group), then the
+    /// region. Red with `zip`, which stops at the shorter list.
+    #[test]
+    fn buy_now_says_which_choice_is_missing() {
+        let mut listing = Listing {
+            checkout: None,
+            choices: vec![
+                harvest_common::listing::ChoiceGroup {
+                    name: "Size".into(),
+                    options: vec!["S".into(), "M".into()],
+                },
+                harvest_common::listing::ChoiceGroup {
+                    name: "Colour".into(),
+                    options: vec!["Blue".into()],
+                },
+            ],
+            id: ListingId([1; 32]),
+            title: "Mug".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            images: Vec::new(),
+        };
+        assert_eq!(
+            missing_choice(&listing, &["".into(), "Blue".into()], false).as_deref(),
+            Some("Choose a size.")
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into()], false).as_deref(),
+            Some("Choose a colour."),
+            "a group with no pick at all"
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into(), "Blue".into()], true).as_deref(),
+            Some("Choose where to deliver it.")
+        );
+        assert_eq!(
+            missing_choice(&listing, &["M".into(), "Blue".into()], false),
+            None
+        );
+        listing.choices.clear();
+        assert_eq!(missing_choice(&listing, &[], false), None);
     }
 }

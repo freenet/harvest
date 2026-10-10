@@ -6,6 +6,8 @@ use harvest_common::listing::{
 };
 use harvest_common::listing_image::ListingImage;
 
+use super::seller_listings::ListingTarget;
+
 use super::photo_editor::{
     drafts_from_listing, listing_images, publish_after_uploads, uploads, PhotoEditor,
 };
@@ -46,17 +48,15 @@ const KIND: ListingKind = ListingKind::Sale;
 /// what every listing was before counts existed.
 #[component]
 pub fn ListingForm(
-    on_submit: EventHandler<(Listing, Option<u32>)>,
+    /// Where the finished listing goes. Plain data rather than a callback:
+    /// see [`ListingTarget`].
+    target: ListingTarget,
     initial: Option<Listing>,
     initial_quantity: Option<u32>,
     /// The listing being edited is sold out: a count puts it back on sale,
     /// and blank leaves it sold out.
     #[props(default)]
     sold_out: bool,
-    /// Set while photos are being prepared or uploaded, so the page can stop
-    /// anything that would unmount this form (and drop its upload) meanwhile.
-    #[props(default)]
-    busy_out: Option<Signal<bool>>,
     on_cancel: EventHandler<()>,
 ) -> Element {
     let editing = initial.clone();
@@ -81,59 +81,49 @@ pub fn ListingForm(
             .unwrap_or_default()
     });
     let built_terms = terms().build();
-    let terms_error = built_terms.as_ref().err().cloned();
+    // Said once the seller has pressed List it, not over an empty form
+    // (critique C15).
+    let mut tried = use_signal(|| false);
+    let terms_error = built_terms.as_ref().err().cloned().filter(|_| tried());
     let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
     let preparing = use_signal(|| 0usize);
     let mut uploading = use_signal(|| false);
-    // Set at the moment work starts (above and in `PhotoEditor`); this
-    // effect is what clears it when the work ends.
-    use_effect(move || {
-        let busy = uploading() || preparing() > 0;
-        if let Some(mut out) = busy_out {
-            if *out.peek() != busy {
-                out.set(busy);
-            }
-        }
-    });
-    // A form that publishes unmounts with `uploading` still set (the
-    // parent closes it inside `finish`), so the page's flag is cleared here.
-    use_drop(move || {
-        if let Some(mut out) = busy_out {
-            out.set(false);
-        }
-    });
     let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
-        div { class: "card",
-            h3 { if initial.is_some() { "Edit listing" } else { "New listing" } }
+        div { class: "listing-form",
             // Everything the seller can change is frozen while the photos
-            // upload: the listing being published was built when Publish
+            // upload: the listing being published was built when List it
             // was pressed, and a change now would be silently lost.
             fieldset { class: "form-fieldset", disabled: uploading(),
-
             div { class: "form-group",
-                label { class: "form-label", "Title" }
+                label { class: "form-label", r#for: "listing-title", "What is it?" }
                 input {
+                    id: "listing-title",
                     class: "form-input field-title",
                     r#type: "text",
-                    placeholder: "What are you offering?",
+                    placeholder: "e.g. Stoneware mug, 300 ml",
                     value: "{title}",
                     oninput: move |e| title.set(e.value()),
                 }
-            }
-
-            div { class: "form-group",
-                label { class: "form-label", "Description" }
-                textarea {
-                    class: "form-textarea",
-                    placeholder: "Describe your item or service...",
-                    value: "{description}",
-                    oninput: move |e| description.set(e.value()),
+                if tried() && title().trim().is_empty() {
+                    p { class: "text-warning", "Say what it is." }
                 }
             }
 
-            PhotoEditor { photos, busy: preparing, disabled: uploading(), page_busy: busy_out }
+            div { class: "form-group",
+                label { class: "form-label", r#for: "listing-description", "Description" }
+                textarea {
+                    id: "listing-description",
+                    class: "form-textarea",
+                    placeholder: "e.g. what it is made of, its size, how it is packed",
+                    value: "{description}",
+                    oninput: move |e| description.set(e.value()),
+                }
+                p { class: "text-muted small", "You can use **bold** and lists that start with -." }
+            }
+
+            PhotoEditor { photos, busy: preparing, disabled: uploading() }
 
             TermsEditor { terms }
             if let Some(problem) = terms_error.clone() {
@@ -141,7 +131,7 @@ pub fn ListingForm(
             }
 
             div { class: "form-group",
-                label { class: "form-label", r#for: "listing-quantity", "How many you have (optional)" }
+                label { class: "form-label", r#for: "listing-quantity", "How many do you have? (optional)" }
                 input {
                     id: "listing-quantity",
                     class: "form-input field-count",
@@ -165,12 +155,14 @@ pub fn ListingForm(
             div { class: "form-actions",
             button {
                 class: "btn btn-primary",
-                disabled: title().trim().is_empty()
-                    || quantity_error
-                    || terms_error.is_some()
-                    || uploading()
-                    || preparing() > 0,
+                // Validation problems are said after a press (main, C15);
+                // only work in flight disables the button.
+                disabled: uploading() || preparing() > 0,
                 onclick: move |_| {
+                        tried.set(true);
+                        if terms().build().is_err() || parse_quantity(&quantity()).is_err() {
+                            return;
+                        }
                         // Re-checked here, not only in `disabled`: two clicks
                         // can land before the button re-renders (#80), and the
                         // first clears the title.
@@ -213,19 +205,27 @@ pub fn ListingForm(
                         // must still be uploaded.
                         let pending = uploads(&photos());
                         let mut photos = photos;
+                        let target = target.clone();
                         let mut finish = move |listing: Listing| {
-                            title.set(String::new());
-                            description.set(String::new());
-                            quantity.set(String::new());
-                            terms.set(TermsForm::default());
-                            #[cfg(target_arch = "wasm32")]
-                            for d in photos.peek().iter() {
-                                if let Some(url) = &d.preview {
-                                    crate::image_pipeline::revoke_preview(url);
+                            // The seller may have left the page while the
+                            // photos uploaded. The form's signals went with it
+                            // then (all are this component's, so one answers
+                            // for all), and only the listing is saved.
+                            let on_screen = uploading.try_peek().is_ok();
+                            if on_screen {
+                                title.set(String::new());
+                                description.set(String::new());
+                                quantity.set(String::new());
+                                terms.set(TermsForm::default());
+                                #[cfg(target_arch = "wasm32")]
+                                for d in photos.peek().iter() {
+                                    if let Some(url) = &d.preview {
+                                        crate::image_pipeline::revoke_preview(url);
+                                    }
                                 }
+                                photos.set(Vec::new());
                             }
-                            photos.set(Vec::new());
-                            on_submit.call((listing, count));
+                            target.save(listing, count, on_screen);
                         };
                         // Only the count changed: submit the original, so its
                         // id, and the listing buyers hold, stays the same.
@@ -268,25 +268,34 @@ pub fn ListingForm(
                             return;
                         }
                         uploading.set(true);
-                        // Now, not after the next render: a click on another
-                        // row's Edit queued behind this one must find it set.
-                        if let Some(mut page) = busy_out {
-                            page.set(true);
-                        }
-                        spawn(async move {
+                        let named = listing.title.clone();
+                        // `spawn_forever`, not `spawn`: a task of this
+                        // component's is dropped with it, and leaving the
+                        // page (Back, a tab) mid-upload would then drop the
+                        // listing without a word. Everything the task
+                        // touches afterwards is checked to still be there.
+                        dioxus::core::spawn_forever(async move {
                             let result = publish_after_uploads(
                                 pending,
                                 crate::gateway::image_ops::put_image,
                                 move || finish(listing),
                             )
                             .await;
-                            uploading.set(false);
+                            if let Ok(mut busy) = uploading.try_write() {
+                                *busy = false;
+                            }
                             if let Err(e) = result {
-                                photo_error.set(Some(e));
+                                match photo_error.try_write() {
+                                    Ok(mut shown) => *shown = Some(e),
+                                    Err(_) => crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(format!("\u{201c}{named}\u{201d} was not listed: {e}")),
+                                }
                             }
                         });
                 },
-                if uploading() { "Uploading photos\u{2026}" } else if initial.is_some() { "Save changes" } else { "Publish listing" }
+                if uploading() { "Uploading photos\u{2026}" } else if initial.is_some() { "Save changes" } else { "List it" }
             }
             button {
                 class: "btn btn-outline",
@@ -393,11 +402,11 @@ fn parse_quantity(typed: &str) -> Result<Option<u32>, ()> {
 /// is parsed. Kept as text so a half-typed number is shown back as typed.
 #[derive(Clone, PartialEq, Default, Debug)]
 pub(crate) struct TermsForm {
-    /// The price of one, in sats.
-    pub unit_sats: String,
+    /// The price of one, in bitcoin as typed (`pay_card::parse_coins`).
+    pub unit_price: String,
     /// Delivery priced per region, rather than included.
     pub by_region: bool,
-    /// (region, sats) rows.
+    /// (region, price in bitcoin) rows.
     pub regions: Vec<(String, String)>,
     /// (name, options separated by commas) rows.
     pub choices: Vec<(String, String)>,
@@ -415,12 +424,12 @@ impl TermsForm {
             ..TermsForm::default()
         };
         if let Some(checkout) = &listing.checkout {
-            form.unit_sats = checkout.unit_sats.to_string();
+            form.unit_price = super::pay_card::coins(checkout.unit_sats);
             if let DeliveryPrice::ByRegion(rows) = &checkout.delivery {
                 form.by_region = true;
                 form.regions = rows
                     .iter()
-                    .map(|row| (row.region.clone(), row.sats.to_string()))
+                    .map(|row| (row.region.clone(), super::pay_card::coins(row.sats)))
                     .collect();
             }
         }
@@ -454,11 +463,11 @@ impl TermsForm {
             })
             .collect();
         let checkout = {
-            if self.unit_sats.trim().is_empty() {
+            if self.unit_price.trim().is_empty() {
                 return Err("Give a price.".into());
             }
-            let unit_sats = parse_sats(&self.unit_sats)
-                .ok_or("Give the price as a whole number of sats, like 25000.")?;
+            let unit_sats = super::pay_card::parse_coins(&self.unit_price)
+                .ok_or("Give the price in tBTC, like 0.0001.")?;
             if unit_sats == 0 {
                 return Err("The price has to be more than zero.".into());
             }
@@ -469,8 +478,8 @@ impl TermsForm {
                     .iter()
                     .filter(|(r, s)| !r.trim().is_empty() || !s.trim().is_empty())
                 {
-                    let sats = parse_sats(sats).ok_or(
-                        "Give each delivery price as a whole number of sats. Use 0 for free delivery.",
+                    let sats = super::pay_card::parse_coins(sats).ok_or(
+                        "Give each delivery price in tBTC, like 0.00002. Use 0 for free delivery.",
                     )?;
                     rows.push(RegionPrice {
                         region: region.trim().to_string(),
@@ -509,11 +518,6 @@ impl TermsForm {
     }
 }
 
-/// A whole number of sats, or `None`.
-fn parse_sats(typed: &str) -> Option<u64> {
-    typed.trim().parse::<u64>().ok()
-}
-
 /// A problem from `harvest_common` as a sentence: capital first letter, full
 /// stop at the end.
 fn sentence(problem: &str) -> String {
@@ -532,17 +536,27 @@ fn sentence(problem: &str) -> String {
 #[component]
 fn TermsEditor(terms: Signal<TermsForm>) -> Element {
     let form = terms();
+    // The network sellers here are paid on: what the price is in.
+    let network = crate::gateway::bitcoin_config::default_network();
+    let unit = super::pay_card::coin_unit(network);
+    let test = super::pay_card::is_test_network(network);
     rsx! {
         div { class: "form-group",
-            label { class: "form-label", r#for: "listing-unit-sats", "Price, in sats" }
-            input {
-                id: "listing-unit-sats",
-                class: "form-input field-num",
-                r#type: "text",
-                inputmode: "numeric",
-                placeholder: "10000",
-                value: "{form.unit_sats}",
-                oninput: move |e| terms.with_mut(|t| t.unit_sats = e.value()),
+            label { class: "form-label", r#for: "listing-unit-price", "Price of one" }
+            div { class: "amount-field",
+                input {
+                    id: "listing-unit-price",
+                    class: "form-input field-num",
+                    r#type: "text",
+                    inputmode: "decimal",
+                    placeholder: "e.g. 0.0001",
+                    value: "{form.unit_price}",
+                    oninput: move |e| terms.with_mut(|t| t.unit_price = e.value()),
+                }
+                span { class: "amount-unit", "{unit}" }
+                if test {
+                    span { class: "test-coins", "{super::pay_card::TEST_COIN_TAG}" }
+                }
             }
         }
         div { class: "form-group",
@@ -566,7 +580,7 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                 if !form.regions.is_empty() {
                     div { class: "form-row form-row-fit form-row-head", aria_hidden: "true",
                         span { class: "field-short-text", "Region" }
-                        span { class: "field-num", "Delivery, sats" }
+                        span { class: "field-num", "Delivery, {unit}" }
                     }
                 }
                 for (i, (region, sats)) in form.regions.iter().cloned().enumerate() {
@@ -582,9 +596,9 @@ fn TermsEditor(terms: Signal<TermsForm>) -> Element {
                         input {
                             class: "form-input field-num",
                             r#type: "text",
-                            inputmode: "numeric",
-                            aria_label: "Delivery price, in sats",
-                            placeholder: "sats",
+                            inputmode: "decimal",
+                            aria_label: "Delivery price, in {unit}",
+                            placeholder: "{unit}",
                             value: "{sats}",
                             oninput: move |e| terms.with_mut(|t| t.regions[i].1 = e.value()),
                         }
@@ -846,7 +860,7 @@ mod tests {
         // The form opens with no price, and will not publish without one.
         assert_eq!(reopened.build(), Err("Give a price.".into()));
         let mut priced = reopened.clone();
-        priced.unit_sats = "10000".into();
+        priced.unit_price = "0.0001".into();
         let (checkout, choices) = priced.build().expect("valid");
         assert!(!same_terms(
             &quote_only,
@@ -872,11 +886,11 @@ mod tests {
 
     fn form() -> TermsForm {
         TermsForm {
-            unit_sats: " 10000 ".into(),
+            unit_price: " 0.0001 ".into(),
             by_region: true,
             regions: vec![
-                (" US ".into(), "2000".into()),
-                ("EU".into(), "5000".into()),
+                (" US ".into(), "0.00002".into()),
+                ("EU".into(), "0.00005".into()),
                 (String::new(), String::new()),
             ],
             choices: vec![
@@ -940,15 +954,15 @@ mod tests {
     #[test]
     fn the_terms_form_refuses_unusable_terms() {
         let mut blank = form();
-        blank.unit_sats = "  ".into();
+        blank.unit_price = "  ".into();
         assert_eq!(blank.build(), Err("Give a price.".into()));
 
         let mut junk = form();
-        junk.unit_sats = "0.5".into();
+        junk.unit_price = "0.000000001".into();
         assert!(junk.build().is_err());
 
         let mut zero = form();
-        zero.unit_sats = "0".into();
+        zero.unit_price = "0".into();
         assert_eq!(
             zero.build(),
             Err("The price has to be more than zero.".into())
