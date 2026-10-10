@@ -359,7 +359,9 @@ fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
                 return 0usize;
             }
             gloo_timers::future::TimeoutFuture::new(5_000).await;
-            futures::future::join_all(absent.iter().map(|h| fetch_image(*h, false)))
+            // Subscribing again: the first GET that came back absent made
+            // no subscription, and a photo found now should be kept here.
+            futures::future::join_all(absent.iter().map(|h| fetch_image(*h, true)))
                 .await
                 .into_iter()
                 .filter(|f| *f == Fetched::Absent)

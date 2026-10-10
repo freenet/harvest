@@ -117,7 +117,9 @@ impl ImageWaiters {
     }
 
     /// A `GetResponse` carrying `bytes` for `id`. A state for an image just
-    /// PUT also proves the node holds it, so it settles a waiting PUT too.
+    /// PUT also proves the node holds it, so it settles a waiting PUT too,
+    /// but only bytes that are that image: ones hashing to another id
+    /// settle nothing, so a listing is never published on a bad answer.
     /// Returns whether `id` is an image.
     ///
     /// Update notifications for an image are dropped by the handler before
@@ -136,7 +138,7 @@ impl ImageWaiters {
                 let _ = tx.send(answer.clone());
             }
         }
-        if !bytes.is_empty() {
+        if !bytes.is_empty() && image_instance_id(harvest_image::image_hash(bytes)) == *id {
             if let Some(waiting) = self.puts.remove(id) {
                 for tx in waiting {
                     let _ = tx.send(());
@@ -382,9 +384,14 @@ mod tests {
     #[test]
     fn a_put_is_settled_by_the_state_coming_back() {
         let mut w = ImageWaiters::default();
-        let mut rx = w.register_put(id(1));
-        assert!(w.state(&id(1), b"jpeg"));
+        let jpeg = image_instance_id(harvest_image::image_hash(b"jpeg"));
+        let mut rx = w.register_put(jpeg);
+        assert!(w.state(&jpeg, b"jpeg"));
         assert_eq!(rx.try_recv(), Ok(Some(())));
+        // Bytes that are not this image settle nothing.
+        let mut other = w.register_put(id(1));
+        w.state(&id(1), b"jpeg");
+        assert_eq!(other.try_recv(), Ok(None));
     }
 
     #[test]
