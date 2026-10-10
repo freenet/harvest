@@ -339,3 +339,21 @@ fn a_photo_change_is_a_new_listing() {
     let bad = vec![published(2, false), published(1, true)];
     assert!(plan_submission(None, "Jam", "", None, Vec::new(), &bad, now).is_err());
 }
+
+/// The description box wraps, but a description is one line: Enter, or a
+/// pasted line break, becomes a space, so the store never refuses it.
+#[test]
+fn a_description_typed_on_two_lines_is_one() {
+    assert_eq!(one_line("Jar,\nfront\r\nview"), "Jar, front  view");
+    let mut d = added(1);
+    d.alt = one_line("Lid\nclose up");
+    assert!(listing_images(&[d]).is_ok());
+}
+
+/// A published photo moved first is flagged on its tile, with the same
+/// words Save would refuse with.
+#[test]
+fn a_cover_without_a_thumbnail_is_refused_with_the_tiles_words() {
+    let drafts = vec![published(2, false), published(1, true)];
+    assert_eq!(listing_images(&drafts), Err(COVER_NEEDS_ADDING.to_string()));
+}

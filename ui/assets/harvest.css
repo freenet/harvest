@@ -2228,6 +2228,12 @@ h4 {
 }
 .photo-alt {
   font-size: 0.85rem;
+  resize: vertical;
+  min-height: 0;
+  line-height: 1.35;
+}
+.photo-cover-note {
+  margin: 0;
 }
 /* The file input itself is visually hidden (still focusable); its label,
    `.photo-add`, is the visible control. */

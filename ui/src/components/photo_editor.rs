@@ -52,6 +52,17 @@ pub(crate) fn drafts_from_listing(listing: Option<&Listing>) -> Vec<PhotoDraft> 
         .unwrap_or_default()
 }
 
+/// A photo description as typed into its (wrapping) text box: a line
+/// break, which the store refuses, becomes a space.
+pub(crate) fn one_line(typed: &str) -> String {
+    typed.replace(['\r', '\n'], " ")
+}
+
+/// Said when the photo in first place is a published one with no thumbnail:
+/// on its tile, and again if Save is pressed.
+pub(crate) const COVER_NEEDS_ADDING: &str = "The first photo can\u{2019}t be the cover yet: \
+     add it again from your device, or move another photo first.";
+
 /// What the listing will name: the photos in order, the first carrying its
 /// thumbnail and no other. Fails when the photo in first place has no known
 /// thumbnail (a published photo moved to the front), or when a description
@@ -64,9 +75,7 @@ pub(crate) fn listing_images(drafts: &[PhotoDraft]) -> Result<Vec<ListingImage>,
     let mut images = Vec::with_capacity(drafts.len());
     for (i, d) in drafts.iter().enumerate() {
         let thumb = if i == 0 {
-            Some(d.thumb.clone().ok_or(
-                "To make this photo the cover, add it again from your device.".to_string(),
-            )?)
+            Some(d.thumb.clone().ok_or(COVER_NEEDS_ADDING.to_string())?)
         } else {
             None
         };
@@ -242,6 +251,9 @@ pub(crate) fn PhotoEditor(
                             } else {
                                 None
                             },
+                            // A published photo moved first has no thumbnail
+                            // to be the cover with; said on the photo itself.
+                            needs_adding: i == 0 && draft.thumb.is_none(),
                             disabled,
                         }
                     }
@@ -300,6 +312,8 @@ fn PhotoTile(
     /// The photo's bytes are on this device (added or added again here).
     local: bool,
     cover_thumb: Option<[u8; 32]>,
+    /// In first place without a thumbnail: see [`COVER_NEEDS_ADDING`].
+    needs_adding: bool,
     disabled: bool,
 ) -> Element {
     let n = index + 1;
@@ -309,9 +323,15 @@ fn PhotoTile(
             if index == 0 {
                 span { class: "photo-cover", "Cover" }
             }
-            input {
+            if needs_adding {
+                p { class: "photo-cover-note text-warning small", "{COVER_NEEDS_ADDING}" }
+            }
+            // A text box that wraps, so a long description shows whole in a
+            // narrow tile. One line all the same: the store refuses line
+            // breaks, so Enter becomes a space.
+            textarea {
                 class: "form-input photo-alt",
-                r#type: "text",
+                rows: "2",
                 maxlength: "{MAX_ALT_CHARS}",
                 placeholder: "Describe this photo",
                 aria_label: "Describe photo {n}",
@@ -320,7 +340,7 @@ fn PhotoTile(
                 oninput: move |e| {
                     photos.with_mut(|p| {
                         if let Some(i) = position(p, photo_key) {
-                            p[i].alt = e.value();
+                            p[i].alt = one_line(&e.value());
                         }
                     })
                 },
