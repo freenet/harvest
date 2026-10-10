@@ -217,7 +217,8 @@ body::before {
        .item-page, .bill, .amount-field, .progress, .side-row, .switch-menu,
        .row-more-menu, .needs-menu, .open-steps > li, .todo-note,
        .row-more > summary.btn, .seller-listing:has(.row-thumb),
-       .item-grid:not(.gallery) .item-card:has(.item-card-img)) > * {
+       .item-grid:not(.gallery) .item-card:has(.item-card-img),
+       .photo-grid, .photo-tile, .photo-actions) > * {
   margin-top: 0;
   margin-left: 0;
 }
@@ -2175,6 +2176,110 @@ h4 {
   .two-col {
     grid-template-columns: minmax(0, 1fr) 15.5rem;
   }
+}
+
+/* ── Listing photos: the editor in the listing form (images PR 3) ── */
+.photo-grid {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+.photo-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.photo-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border, #d9cfbd);
+}
+.photo-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.photo-cover {
+  position: absolute;
+  top: 0.35rem;
+  left: 0.35rem;
+  background: var(--accent);
+  color: white;
+  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+}
+.photo-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.photo-actions .btn {
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
+.photo-alt {
+  font-size: 0.85rem;
+  resize: vertical;
+  min-height: 0;
+  line-height: 1.35;
+}
+/* The file input itself is visually hidden (still focusable); its label,
+   `.photo-add`, is the visible control. */
+.photo-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.photo-add {
+  display: inline-block;
+  margin-top: 0.4rem;
+  cursor: pointer;
+}
+.photo-input:focus-visible + .photo-add {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.photo-add-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.form-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.photo-missing {
+  margin: 0;
+  padding: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.75);
+}
+/* Over the picture when there is one (a published cover whose thumbnail is
+   gone still shows its full photo here). */
+.photo-img + .photo-missing {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .col-main > * + * {

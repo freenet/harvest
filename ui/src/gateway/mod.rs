@@ -12,6 +12,8 @@ mod delegate_api;
 // Buyer -> seller messaging. The address derivation and the delta shape are
 // pure and host-testable; only the send itself needs a browser.
 pub mod index_ops;
+// Listing photos: one image contract per photo (harvest#212).
+pub mod image_ops;
 pub mod mailbox_ops;
 // A store's presence contract: where its heartbeats live.
 pub mod presence_ops;

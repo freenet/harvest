@@ -12,13 +12,15 @@
 # where the parameters are the image's own 32-byte BLAKE3 hash, raw, with no
 # CBOR (`harvest_image`). A listing names an image by that hash, not by its
 # contract id, so a new generation re-keys every image's ADDRESS while
-# leaving every listing that names it valid. The planned readers (the buyer's
-# display path and the seller's upload path, later PRs of the images work)
-# look an image up under the current code hash first and then under each hash
-# recorded here, and the seller's app copies its images forward. Nothing
-# reads this registry yet: `ui/build.rs` generates its constant, and no code
-# includes it until those PRs land. It is load-bearing in a way the presence
-# contract's is not: an image is never worthless the way an old heartbeat is.
+# leaving every listing that names it valid. When a generation is
+# superseded, readers (the buyer's display path and the seller's upload
+# path) must look an image up under the current code hash first and then
+# under each hash recorded here, and the seller's app must copy its images
+# forward. Neither exists yet. The only reader of this registry is a test in
+# `ui/src/gateway/image_ops.rs` that pins it empty, so adding a row fails
+# until the lookup and copy-forward are built. This registry matters in a
+# way the presence contract's does not: an image is never worthless the way
+# an old heartbeat is.
 #
 # The crate depends on `harvest-image` and `freenet-stdlib` only, never on
 # `harvest-common`, and `scripts/build-contract-wasm.sh` builds it in a cargo

@@ -99,6 +99,12 @@ fn handle_contract_response(response: ContractResponse) {
             // before any of them looks.
             super::prime::deliver_answer(key.id(), super::prime::Primed::Held);
 
+            // A listing photo is not store, mailbox or reputation state; it
+            // goes to whoever is waiting on it and nowhere else.
+            if super::image_ops::deliver_state(key.id(), &state_bytes) {
+                return;
+            }
+
             // Offer it to the migration probe FIRST. A probe GETs a SUPERSEDED
             // generation's instance, whose state is perfectly decodable
             // store/reputation/mailbox state -- so letting it fall through to
@@ -154,6 +160,9 @@ fn handle_contract_response(response: ContractResponse) {
             // SEND succeeds, which is a different claim entirely.
             #[cfg(target_arch = "wasm32")]
             let _consumed = super::migrate_ops::deliver_put_ack(key.id());
+            // And to a listing photo's upload, which waits for it before the
+            // listing naming the photo is signed.
+            let _photo = super::image_ops::deliver_put_ack(key.id());
         }
 
         // The node answering, positively, that nothing is stored under this
@@ -171,6 +180,15 @@ fn handle_contract_response(response: ContractResponse) {
             info!("NotFound for contract {instance_id}");
             // An answer, so a write waiting on it stops waiting (harvest#119).
             super::prime::deliver_answer(&instance_id, super::prime::Primed::Absent);
+            // A listing photo the seller's listings page asked after. The
+            // consumers below exist only in the browser.
+            let photo = super::image_ops::deliver_absent(&instance_id);
+            #[cfg(target_arch = "wasm32")]
+            if photo {
+                return;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = photo;
             // Offered to the migration probe, which is the only thing that
             // acts on it. `deliver_absent` is the ONE path a `NotFound` may
             // take into a probe: every other way a GET fails to produce state
@@ -235,6 +253,11 @@ fn handle_contract_response(response: ContractResponse) {
 
         ContractResponse::UpdateNotification { key, update: _ } => {
             info!("Update notification for contract {:?}", key);
+            // A photo's state never changes (an identical re-PUT is all an
+            // update to one can be), so there is nothing to re-read.
+            if super::image_ops::is_image(key.id()) {
+                return;
+            }
             // Re-GET the authoritative full state rather than trying to
             // apply `update` in place. `update` is very often a genuine
             // delta -- for composable states (store, bitcoin tip/address)

@@ -6,6 +6,12 @@ use harvest_common::listing::{
 };
 use harvest_common::listing_image::ListingImage;
 
+use super::seller_listings::ListingTarget;
+
+use super::photo_editor::{
+    drafts_from_listing, listing_images, publish_after_uploads, uploads, PhotoEditor,
+};
+
 /// What every listing this form publishes is: a sale at a fixed price, with
 /// fixed delivery (Ian, 2026-09-26). There is no free-text price, no gift or
 /// wanted listing, and no "ask the seller for a total": a buyer can always
@@ -42,7 +48,9 @@ const KIND: ListingKind = ListingKind::Sale;
 /// what every listing was before counts existed.
 #[component]
 pub fn ListingForm(
-    on_submit: EventHandler<(Listing, Option<u32>)>,
+    /// Where the finished listing goes. Plain data rather than a callback:
+    /// see [`ListingTarget`].
+    target: ListingTarget,
     initial: Option<Listing>,
     initial_quantity: Option<u32>,
     /// The listing being edited is sold out: a count puts it back on sale,
@@ -66,7 +74,7 @@ pub fn ListingForm(
     });
     let mut quantity = use_signal(|| initial_quantity.map(|q| q.to_string()).unwrap_or_default());
     let quantity_error = parse_quantity(&quantity()).is_err();
-    let mut terms = use_signal(|| {
+    let terms = use_signal(|| {
         editing
             .as_ref()
             .map(TermsForm::from_listing)
@@ -77,9 +85,22 @@ pub fn ListingForm(
     // (critique C15).
     let mut tried = use_signal(|| false);
     let terms_error = built_terms.as_ref().err().cloned().filter(|_| tried());
+    let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
+    let preparing = use_signal(|| 0usize);
+    let mut uploading = use_signal(|| false);
+    // Set once a press hands the listing on, and cleared only if that
+    // failed: a second click landing before the page leaves (#80) must not
+    // publish it twice. Leaving the page drops the form, so nothing else
+    // clears it.
+    let mut sent = use_signal(|| false);
+    let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "listing-form",
+            // Everything the seller can change is frozen while the photos
+            // upload: the listing being published was built when List it
+            // was pressed, and a change now would be silently lost.
+            fieldset { class: "form-fieldset", disabled: uploading(),
             div { class: "form-group",
                 label { class: "form-label", r#for: "listing-title", "What is it?" }
                 input {
@@ -107,6 +128,8 @@ pub fn ListingForm(
                 p { class: "text-muted small", "You can use **bold** and lists that start with -." }
             }
 
+            PhotoEditor { photos, busy: preparing, disabled: uploading() }
+
             TermsEditor { terms }
             if let Some(problem) = terms_error.clone() {
                 p { class: "text-warning", "{problem}" }
@@ -133,19 +156,50 @@ pub fn ListingForm(
                 }
             }
 
+            }
             div { class: "form-actions",
             button {
                 class: "btn btn-primary",
+                // Validation problems are said after a press (main, C15);
+                // only work in flight disables the button.
+                disabled: uploading() || preparing() > 0,
                 onclick: move |_| {
                         tried.set(true);
                         if terms().build().is_err() || parse_quantity(&quantity()).is_err() {
                             return;
                         }
-                        // Re-checked here, not only in `disabled`: two clicks
-                        // can land before the button re-renders (#80), and the
-                        // first clears the title.
                         if title().trim().is_empty() {
                             return;
+                        }
+                        // Read from the signal, not the last render: two clicks
+                        // can land before the button re-renders (#80).
+                        if sent() {
+                            return;
+                        }
+                        // An edit of a listing still being saved (its photos
+                        // uploading, or its replacement on its way) would
+                        // publish a second replacement beside the first. The
+                        // Listings row holds too; this covers a form reached
+                        // another way (Back, then Forward).
+                        if let Some(old) = &target.replaces {
+                            let state = crate::gateway::APP_STATE.read();
+                            let refused = if state.listing_status_pending(&target.store, old) {
+                                Some(STILL_SAVING)
+                            } else if state.listing_availability(&target.store, old)
+                                == harvest_common::listing::ListingAvailability::Withdrawn
+                            {
+                                // Taken down, or already replaced by an earlier
+                                // save from this form: saving again would
+                                // publish a replacement taken down too.
+                                Some(NOT_LIVE)
+                            } else {
+                                None
+                            };
+                            drop(state);
+                            if let Some(refused) = refused {
+                                photo_error.set(Some(refused.to_string()));
+                                return;
+                            }
                         }
                         let Ok(count) = parse_quantity(&quantity()) else {
                             return;
@@ -153,72 +207,212 @@ pub fn ListingForm(
                         let Ok((checkout, choices)) = terms().build() else {
                             return;
                         };
-                        // The price is the sats price in `checkout`; the old
-                        // free-text one is never written again.
-                        let price: Option<PriceInfo> = None;
-                        // The photos the new listing carries. This form does not
-                        // edit photos yet, so an edit keeps the ones the listing
-                        // has; they are terms like any other and go into the id.
-                        let images = photos_for_edit(editing.as_ref());
-                        // Only the count changed: submit the original, so its
-                        // id, and the listing buyers hold, stays the same.
-                        if let Some(original) = editing.as_ref() {
-                            if same_terms(
-                                original,
-                                &title(),
-                                &description(),
-                                &KIND,
-                                &checkout,
-                                &choices,
-                                &images,
-                            ) {
-                                on_submit.call((original.clone(), count));
-                                return;
-                            }
+                        // Not while photos upload or are still being prepared:
+                        // a photo picked a moment ago must not be left out.
+                        if uploading() || preparing() > 0 {
+                            return;
                         }
-                        let now = Utc::now();
-                        let listing_title = title().trim().to_string();
-                        let listing = Listing {
+                        photo_error.set(None);
+                        let Submission { listing, pending } = match plan_submission(
+                            editing.as_ref(),
+                            &title(),
+                            &description(),
                             checkout,
                             choices,
-                            images,
-                            // Stamped by `with_derived_id` below, out of the
-                            // finished terms: a listing whose id is not the
-                            // one its terms give is refused by every peer
-                            // (see `ListingId::from_terms`), so a literal
-                            // here would be a second place deciding identity.
-                            id: ListingId([0u8; 32]),
-                            title: listing_title,
-                            description: description().trim().to_string(),
-                            kind: KIND,
-                            price,
-                            created_at: now,
+                            &photos(),
+                            Utc::now(),
+                        ) {
+                            Ok(planned) => planned,
+                            Err(problem) => {
+                                photo_error.set(Some(problem));
+                                return;
+                            }
+                        };
+                        sent.set(true);
+                        let target = target.clone();
+                        let failed_notice = target.clone();
+                        // Hands the listing on, then leaves the form, or, if
+                        // that failed, keeps it with the problem said under
+                        // it. Called again by the upload below, when the
+                        // seller may have left the page: the form's signals
+                        // are gone then (all are this component's, so one
+                        // answers for all) and the notices say it instead.
+                        let mut finish = move |listing: Listing| {
+                            let on_screen = uploading.try_peek().is_ok();
+                            let saved = target.apply(
+                                &mut crate::gateway::APP_STATE.write(),
+                                listing,
+                                count,
+                            );
+                            match (saved, on_screen) {
+                                (Ok(()), true) => super::router::replace(target.listings_page()),
+                                (Ok(()), false) => {}
+                                (Err(problem), true) => {
+                                    sent.set(false);
+                                    photo_error.set(Some(problem));
+                                }
+                                (Err(problem), false) => crate::gateway::APP_STATE
+                                    .write()
+                                    .notifications
+                                    .push(problem),
+                            }
+                        };
+
+                        if pending.is_empty() {
+                            finish(listing);
+                            return;
                         }
-                        .with_derived_id();
-
-                        title.set(String::new());
-                        description.set(String::new());
-                        quantity.set(String::new());
-                        terms.set(TermsForm::default());
-
-                        on_submit.call((listing, count));
+                        uploading.set(true);
+                        let named = listing.title.clone();
+                        let store = failed_notice.store.clone();
+                        let replaces = failed_notice.replaces.clone();
+                        // Holds the edited listing's row at "Saving" and says
+                        // on every page that the photos are going up.
+                        let token = crate::gateway::APP_STATE.write().begin_listing_upload(
+                            store,
+                            replaces,
+                            named.clone(),
+                        );
+                        // `spawn_forever`, not `spawn`: a task of this
+                        // component's is dropped with it, and leaving the
+                        // page (Back, a tab) mid-upload would then drop the
+                        // listing without a word. Everything the task
+                        // touches afterwards is checked to still be there.
+                        dioxus::core::spawn_forever(async move {
+                            let result = publish_after_uploads(
+                                pending,
+                                crate::gateway::image_ops::put_image,
+                                move || finish(listing),
+                            )
+                            .await;
+                            crate::gateway::APP_STATE.write().end_listing_upload(token);
+                            if let Ok(mut busy) = uploading.try_write() {
+                                *busy = false;
+                            }
+                            if let Err(e) = result {
+                                if let Ok(mut pressed) = sent.try_write() {
+                                    *pressed = false;
+                                }
+                                match photo_error.try_write() {
+                                    Ok(mut shown) => *shown = Some(e),
+                                    Err(_) => crate::gateway::APP_STATE
+                                        .write()
+                                        .notifications
+                                        .push(failed_notice.upload_failed_notice(&named, &e)),
+                                }
+                            }
+                        });
                 },
-                if initial.is_some() { "Save changes" } else { "List it" }
+                if uploading() { "Uploading photos\u{2026}" } else if initial.is_some() { "Save changes" } else { "List it" }
             }
             button {
                 class: "btn btn-outline",
-                onclick: move |_| on_cancel.call(()),
+                // An upload cannot be called back once sent, and the listing
+                // is published when it ends, whichever page is showing.
+                disabled: uploading() || preparing() > 0,
+                onclick: move |_| {
+                    // Re-checked here: `disabled` is only as fresh as the
+                    // last render.
+                    if uploading() || preparing() > 0 {
+                        return;
+                    }
+                    on_cancel.call(())
+                },
                 "Cancel"
             }
             }
+            if uploading() {
+                p { class: "text-muted small",
+                    "You can leave this page: the listing is saved once its photos are up."
+                }
+            }
+            if let Some(problem) = photo_error() {
+                p { class: "text-warning", "{problem}" }
+            }
             if initial.is_some() {
                 p { class: "text-muted small",
-                    "Changing the title, description, price, delivery or choices publishes a new listing and "
+                    "Changing the title, description, photos, price, delivery or choices publishes a new listing and "
                     "takes this one down. A buyer who already ordered this one can still see it."
                 }
             }
         }
     }
+}
+
+/// Said when an edit is pressed while the listing is still being saved.
+pub(crate) const STILL_SAVING: &str =
+    "This listing is still being saved. Try again once Listings shows it.";
+
+/// Said when an edit is pressed for a listing that is no longer on show.
+pub(crate) const NOT_LIVE: &str = "This listing has been taken down or replaced. Open the \
+     listing on show from Listings to change it.";
+
+/// What pressing List it hands on: the listing to publish, and the photos
+/// to upload before it is signed.
+#[derive(Debug)]
+pub(crate) struct Submission {
+    pub listing: Listing,
+    pub pending: Vec<([u8; 32], Vec<u8>)>,
+}
+
+/// Build the listing the form describes. When editing and no term changed
+/// (only the count did), it is the ORIGINAL listing, so its id, and the
+/// listing buyers hold, stays the same.
+///
+/// The uploads are worked out from the photos alone, before and apart from
+/// that check: every photo the listing names that is not yet on the network
+/// goes up FIRST, and the listing is signed only once the node has taken
+/// each one (`publish_after_uploads`). A missing photo added again changes
+/// no term, and must still be uploaded. Photos carried over are not
+/// re-checked; the listings page reports a missing one.
+pub(crate) fn plan_submission(
+    editing: Option<&Listing>,
+    title: &str,
+    description: &str,
+    checkout: Option<FixedCheckout>,
+    choices: Vec<ChoiceGroup>,
+    photos: &[super::photo_editor::PhotoDraft],
+    now: chrono::DateTime<Utc>,
+) -> Result<Submission, String> {
+    // The photos the listing carries, cover first. They are terms like any
+    // other and go into the id.
+    let images = listing_images(photos)?;
+    let pending = uploads(photos);
+    if let Some(original) = editing {
+        if same_terms(
+            original,
+            title,
+            description,
+            &KIND,
+            &checkout,
+            &choices,
+            &images,
+        ) {
+            return Ok(Submission {
+                listing: original.clone(),
+                pending,
+            });
+        }
+    }
+    let listing = Listing {
+        checkout,
+        choices,
+        images,
+        // Stamped by `with_derived_id` below, out of the finished terms: a
+        // listing whose id is not the one its terms give is refused by every
+        // peer (see `ListingId::from_terms`), so a literal here would be a
+        // second place deciding identity.
+        id: ListingId([0u8; 32]),
+        title: title.trim().to_string(),
+        description: description.trim().to_string(),
+        kind: KIND,
+        // The price is the sats price in `checkout`; the old free-text one is
+        // never written again.
+        price: None::<PriceInfo>,
+        created_at: now,
+    }
+    .with_derived_id();
+    Ok(Submission { listing, pending })
 }
 
 /// Whether what the form holds is the listing it was opened on, term for
@@ -260,13 +454,28 @@ pub(crate) fn same_terms(
         && original_kind == kind
         && original_checkout == checkout
         && original_choices.as_slice() == choices
-        && original_images.as_slice() == images
+        && same_photos(original_images, images)
 }
 
-/// The photos an edit publishes: the listing's own, since this form cannot
-/// change them yet (the upload path will). None for a new listing.
-pub(crate) fn photos_for_edit(editing: Option<&Listing>) -> Vec<ListingImage> {
-    editing.map(|l| l.images.clone()).unwrap_or_default()
+/// The photos match, alt text compared as `listing_images` writes it
+/// (trimmed): a listing another client published with a trailing space in
+/// an alt is not a different listing, and treating it as one would make a
+/// count-only edit publish a new id and take the old one down.
+fn same_photos(original: &[ListingImage], images: &[ListingImage]) -> bool {
+    original.len() == images.len()
+        && original.iter().zip(images).all(|(o, n)| {
+            // Exhaustive, so a field added to `ListingImage` is compared too.
+            let ListingImage {
+                full,
+                thumb,
+                colour,
+                alt,
+            } = o;
+            *full == n.full
+                && *thumb == n.thumb
+                && *colour == n.colour
+                && alt.trim() == n.alt.trim()
+        })
 }
 
 /// The count field: blank is "not counted", anything else a whole number.
@@ -602,16 +811,39 @@ mod tests {
         assert!(terms(&o.images));
         assert!(!terms(&[]));
         assert!(!terms(&[a_photo(2)]));
+        let mut described = a_photo(1);
+        described.alt = "A blue mug".into();
+        assert!(
+            !terms(&[described]),
+            "a changed description of a photo is a change"
+        );
+        let mut rethumbed = a_photo(1);
+        rethumbed.thumb = a_photo(3).thumb;
+        assert!(!terms(&[rethumbed]), "a different thumbnail is a change");
+        let mut recoloured = a_photo(1);
+        recoloured.colour = [9, 9, 9];
+        assert!(!terms(&[recoloured]), "a different colour is a change");
     }
 
-    /// An edit keeps the listing's photos (this form cannot change them yet);
-    /// a new listing has none.
+    /// `listing_images` trims alt text, so a published alt with stray spaces
+    /// (another client's) must still match what the form would sign.
     #[test]
-    fn an_edit_keeps_the_listings_photos() {
+    fn same_terms_ignores_spaces_around_a_photo_description() {
         let mut o = original();
-        o.images = vec![a_photo(1)];
-        assert_eq!(photos_for_edit(Some(&o)), o.images);
-        assert!(photos_for_edit(None).is_empty());
+        let mut spaced = a_photo(1);
+        spaced.alt = " A blue mug ".into();
+        o.images = vec![spaced];
+        let mut trimmed = a_photo(1);
+        trimmed.alt = "A blue mug".into();
+        assert!(same_terms(
+            &o,
+            "Mug",
+            "Blue",
+            &ListingKind::Sale,
+            &o.checkout,
+            &o.choices,
+            &[trimmed]
+        ));
     }
 
     /// Each term, changed alone, is a different listing; formatting alone is

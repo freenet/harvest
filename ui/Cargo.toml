@@ -49,6 +49,8 @@ ed25519-dalek = { workspace = true }
 # one marker slot -- see migrate::marker_key.
 hex = { workspace = true }
 blake3 = { workspace = true }
+# Listing photos: the same JPEG rules the image contract applies (harvest#212).
+harvest-image = { workspace = true }
 # "check" feature enables Base58Check decoding, needed to turn a legacy
 # P2PKH/P2SH address string into its scriptPubKey (see gateway/bitcoin_address.rs).
 bs58 = { workspace = true, features = ["check"] }

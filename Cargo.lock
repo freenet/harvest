@@ -2019,6 +2019,7 @@ dependencies = [
  "ghostkey_lib",
  "gloo-timers",
  "harvest-common",
+ "harvest-image",
  "hex",
  "js-sys",
  "pulldown-cmark",

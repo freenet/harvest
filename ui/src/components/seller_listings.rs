@@ -173,6 +173,74 @@ pub fn SellerListings(store_contract_id: Vec<u8>, fingerprint: String) -> Elemen
     }
 }
 
+/// Where a listing from [`ListingFormPage`]'s form goes: the store it is
+/// published to, and the listing it replaces when editing.
+///
+/// Plain data, not a callback: when a listing has photos to upload first,
+/// the publish runs after the upload, which outlives the form (the seller
+/// may leave the page meanwhile), while a Dioxus callback dies with the
+/// component that made it.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct ListingTarget {
+    pub store: Vec<u8>,
+    pub fingerprint: String,
+    /// The listing being edited; `None` for a new one.
+    pub replaces: Option<ListingId>,
+}
+
+impl ListingTarget {
+    /// Publish `listing`: a new one, or in place of [`Self::replaces`]. An
+    /// error is said as a sentence for the seller; nothing is pushed to the
+    /// notices here, since where it is said depends on whether the form is
+    /// still on screen.
+    pub(crate) fn apply(
+        &self,
+        state: &mut crate::state::AppState,
+        listing: Listing,
+        quantity: Option<u32>,
+    ) -> Result<(), String> {
+        match &self.replaces {
+            Some(old) => state
+                .replace_listing(
+                    self.store.clone(),
+                    self.fingerprint.clone(),
+                    old.clone(),
+                    listing,
+                    quantity,
+                )
+                .map_err(|e| format!("Could not save the listing: {e}")),
+            None => state
+                .publish_new_listing(
+                    self.store.clone(),
+                    self.fingerprint.clone(),
+                    listing,
+                    quantity,
+                )
+                .map_err(|e| format!("Cannot add the listing: {e}")),
+        }
+    }
+
+    /// Where the seller goes once the listing is handed on.
+    pub(crate) fn listings_page(&self) -> super::router::Page {
+        super::seller_pages::seller_page(&self.store, super::router::SellerView::Listings)
+    }
+
+    /// Said when the photos for `title` did not upload and the seller has
+    /// left the form, so its own error line is not there to say it.
+    pub(crate) fn upload_failed_notice(&self, title: &str, problem: &str) -> String {
+        match self.replaces {
+            Some(_) => format!(
+                "The photos for your edit of \u{201c}{title}\u{201d} did not upload, so the \
+                 listing is unchanged. {problem}"
+            ),
+            None => format!(
+                "The photos for \u{201c}{title}\u{201d} did not upload, so it was not listed. \
+                 {problem}"
+            ),
+        }
+    }
+}
+
 /// S8: describe one item and its price. `editing`: the listing to change,
 /// else a new one. Back to Listings when it is published or cancelled.
 #[component]
@@ -199,13 +267,25 @@ pub(crate) fn ListingFormPage(
     let back = rsx! {
         super::seller_pages::BackTo { label: "Listings".to_string(), page: listings_page.clone() }
     };
+    let add_key = format!("add-{}", listings_page.fragment());
+    let on_cancel = {
+        let page = listings_page.clone();
+        move |_| super::router::go(page.clone())
+    };
     match found {
         Some(None) => rsx! {
             {back}
             p { class: "text-muted text-italic", "That listing isn\u{2019}t here, or hasn\u{2019}t loaded yet." }
         },
+        // Keyed: a jump straight from one listing's Edit page to another's
+        // (or from one store's Add page to another's) must get a new form,
+        // not carry the first one's fields over. Dioxus reads a key only in
+        // a list, hence the list of one.
         Some(Some((listing, availability))) => rsx! {
-            {back}
+            // In a one-item list: a key counts only there.
+            for form_key in std::iter::once(listing.id.to_string()) {
+            Fragment { key: "{form_key}",
+            {back.clone()}
             h2 { class: "page-h", "Edit {listing.title}" }
             ListingForm {
                 initial: Some(listing.clone()),
@@ -214,55 +294,93 @@ pub(crate) fn ListingFormPage(
                     _ => None,
                 },
                 sold_out: !availability.is_buyable(),
-                on_cancel: {
-                    let page = listings_page.clone();
-                    move |_| super::router::go(page.clone())
+                on_cancel: on_cancel.clone(),
+                target: ListingTarget {
+                    store: store_contract_id.clone(),
+                    fingerprint: fingerprint.clone(),
+                    replaces: Some(listing.id.clone()),
                 },
-                on_submit: {
-                    let store = store_contract_id.clone();
-                    let fp = fingerprint.clone();
-                    let old = listing.id.clone();
-                    let page = listings_page.clone();
-                    move |(edited, quantity): (Listing, Option<u32>)| {
-                        {
-                            let mut state = APP_STATE.write();
-                            if let Err(e) = state.replace_listing(store.clone(), fp.clone(), old.clone(), edited, quantity) {
-                                state.notifications.push(format!("Could not save the listing: {e}"));
-                            }
-                        }
-                        // In place of the form, so Back does not reopen it.
-                        super::router::replace(page.clone());
-                    }
-                },
+            }
+            }
             }
         },
         None => rsx! {
-            {back}
+            for form_key in std::iter::once(add_key.clone()) {
+            Fragment { key: "{form_key}",
+            {back.clone()}
             h2 { class: "page-h", "Add a listing" }
             ListingForm {
                 initial: None,
                 initial_quantity: None,
-                on_cancel: {
-                    let page = listings_page.clone();
-                    move |_| super::router::go(page.clone())
-                },
-                on_submit: {
-                    let store = store_contract_id.clone();
-                    let fp = fingerprint.clone();
-                    let page = listings_page.clone();
-                    move |(listing, quantity): (Listing, Option<u32>)| {
-                        {
-                            let mut state = APP_STATE.write();
-                            if let Err(e) = state.publish_new_listing(store.clone(), fp.clone(), listing, quantity) {
-                                state.notifications.push(format!("Cannot add the listing: {e}"));
-                            }
-                        }
-                        // In place of the form, so Back does not reopen it.
-                        super::router::replace(page.clone());
-                    }
+                on_cancel: on_cancel.clone(),
+                target: ListingTarget {
+                    store: store_contract_id.clone(),
+                    fingerprint: fingerprint.clone(),
+                    replaces: None,
                 },
             }
+            }
+            }
         },
+    }
+}
+
+/// Every image contract a listing names: each photo, and the cover's
+/// thumbnail.
+pub(crate) fn photo_hashes(listing: &harvest_common::listing::Listing) -> Vec<[u8; 32]> {
+    listing
+        .images
+        .iter()
+        .flat_map(|i| std::iter::once(i.full.hash.0).chain(i.thumb.iter().map(|t| t.hash.0)))
+        .collect()
+}
+
+/// "Photo missing" under a listing whose photos the network no longer has.
+#[component]
+fn MissingPhotos(hashes: Vec<[u8; 32]>) -> Element {
+    #[cfg(target_arch = "wasm32")]
+    let missing = use_resource(move || {
+        let hashes = hashes.clone();
+        async move {
+            use crate::gateway::image_ops::{fetch_image, Fetched};
+            // All at once, and an absent photo asked again before it is
+            // reported: a GET that dead-ends answers "not found" for a
+            // contract that exists, and one such answer is not worth
+            // telling the seller their photo is gone.
+            let first =
+                futures::future::join_all(hashes.iter().map(|h| fetch_image(*h, true))).await;
+            let absent: Vec<[u8; 32]> = hashes
+                .iter()
+                .zip(first)
+                .filter(|(_, f)| *f == Fetched::Absent)
+                .map(|(h, _)| *h)
+                .collect();
+            if absent.is_empty() {
+                return 0usize;
+            }
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            // Subscribing again: the first GET that came back absent made
+            // no subscription, and a photo found now should be kept here.
+            futures::future::join_all(absent.iter().map(|h| fetch_image(*h, true)))
+                .await
+                .into_iter()
+                .filter(|f| *f == Fetched::Absent)
+                .count()
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    let missing = missing.read().unwrap_or(0);
+    #[cfg(not(target_arch = "wasm32"))]
+    let missing = {
+        let _ = hashes;
+        0usize
+    };
+    rsx! {
+        if missing > 0 {
+            p { class: "text-warning small",
+                "A photo is missing from Freenet, so buyers don't see it. Open Edit, remove that photo and add it again."
+            }
+        }
     }
 }
 
@@ -324,6 +442,13 @@ fn SellerListingRow(
                     if let Some(stock) = stock {
                         " \u{00b7} {stock}"
                     }
+                }
+                // Each photo of a listing still on show, looked up (and
+                // subscribed to, which keeps it on this node while the page
+                // is open). One the network no longer has is said here: only
+                // the seller can put it back.
+                if !taken_down && !l.images.is_empty() {
+                    MissingPhotos { hashes: photo_hashes(l) }
                 }
             }
             div { class: "seller-listing-actions",
@@ -406,6 +531,45 @@ fn SellerListingRow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The missing-photo check looks up every image contract the listing
+    /// names, the cover's thumbnail included, and no other.
+    #[test]
+    fn photo_hashes_are_each_photo_and_the_covers_thumbnail() {
+        use harvest_common::listing_image::{ImageBlob, ListingImage};
+        use harvest_common::store::Bytes32;
+        let blob = |s: u8| ImageBlob {
+            hash: Bytes32([s; 32]),
+            len: 10,
+            width: 4,
+            height: 3,
+        };
+        let listing = harvest_common::listing::Listing {
+            images: vec![
+                ListingImage {
+                    full: blob(1),
+                    thumb: Some(blob(9)),
+                    colour: [0; 3],
+                    alt: String::new(),
+                },
+                ListingImage {
+                    full: blob(2),
+                    thumb: None,
+                    colour: [0; 3],
+                    alt: String::new(),
+                },
+            ],
+            id: ListingId([0; 32]),
+            title: "Jam".into(),
+            description: String::new(),
+            kind: harvest_common::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            checkout: None,
+            choices: Vec::new(),
+        };
+        assert_eq!(photo_hashes(&listing), vec![[1; 32], [9; 32], [2; 32]]);
+    }
 
     #[test]
     fn labels_say_what_a_buyer_can_do() {
