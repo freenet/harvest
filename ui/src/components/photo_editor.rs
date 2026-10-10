@@ -63,6 +63,13 @@ pub(crate) fn one_line(typed: &str) -> String {
 pub(crate) const COVER_NEEDS_ADDING: &str = "The first photo can\u{2019}t be the cover yet: \
      add it again from your device, or move another photo first.";
 
+/// Whether the photo at `i` must be added again before the listing can be
+/// saved: it is in first place, so it is the cover, and has no thumbnail
+/// (a published photo moved to the front).
+pub(crate) fn needs_adding(drafts: &[PhotoDraft], i: usize) -> bool {
+    i == 0 && drafts.first().is_some_and(|d| d.thumb.is_none())
+}
+
 /// What the listing will name: the photos in order, the first carrying its
 /// thumbnail and no other. Fails when the photo in first place has no known
 /// thumbnail (a published photo moved to the front), or when a description
@@ -253,7 +260,7 @@ pub(crate) fn PhotoEditor(
                             },
                             // A published photo moved first has no thumbnail
                             // to be the cover with; said on the photo itself.
-                            needs_adding: i == 0 && draft.thumb.is_none(),
+                            needs_adding: needs_adding(&photos.read(), i),
                             disabled,
                         }
                     }
@@ -324,7 +331,7 @@ fn PhotoTile(
                 span { class: "photo-cover", "Cover" }
             }
             if needs_adding {
-                p { class: "photo-cover-note text-warning small", "{COVER_NEEDS_ADDING}" }
+                p { id: "photo-cover-note", class: "text-warning small", "{COVER_NEEDS_ADDING}" }
             }
             // A text box that wraps, so a long description shows whole in a
             // narrow tile. One line all the same: the store refuses line
@@ -332,6 +339,8 @@ fn PhotoTile(
             textarea {
                 class: "form-input photo-alt",
                 rows: "2",
+                // So a screen reader hears the cover note with the photo.
+                aria_describedby: if needs_adding { "photo-cover-note" } else { "" },
                 maxlength: "{MAX_ALT_CHARS}",
                 placeholder: "Describe this photo",
                 aria_label: "Describe photo {n}",

@@ -357,3 +357,29 @@ fn a_cover_without_a_thumbnail_is_refused_with_the_tiles_words() {
     let drafts = vec![published(2, false), published(1, true)];
     assert_eq!(listing_images(&drafts), Err(COVER_NEEDS_ADDING.to_string()));
 }
+
+/// When a tile says its photo must be added again: only in first place,
+/// only without a thumbnail, and no longer once it is added again.
+#[test]
+fn the_cover_note_shows_only_while_the_cover_lacks_a_thumbnail() {
+    let mut drafts = vec![published(1, true), published(2, false)];
+    assert!(!needs_adding(&drafts, 0), "the published cover has one");
+    move_later(&mut drafts, 0);
+    assert!(needs_adding(&drafts, 0), "photo 2 moved first has none");
+    assert!(
+        !needs_adding(&drafts, 1),
+        "never on a photo that is not first"
+    );
+    let mut again = added(2);
+    again.key = 9;
+    assert_eq!(add_photo(&mut drafts, again), Added::Restored);
+    assert!(!needs_adding(&drafts, 0), "added again, it has one");
+    let mut fresh = vec![added(3)];
+    assert!(!needs_adding(&fresh, 0), "a new photo always has one");
+    fresh.clear();
+    assert!(!needs_adding(&fresh, 0));
+    // Removing the cover leaves a thumbless photo in front.
+    let mut drafts = vec![published(1, true), published(2, false)];
+    drafts.remove(0);
+    assert!(needs_adding(&drafts, 0));
+}
