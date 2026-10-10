@@ -17,11 +17,13 @@
 //! * **Despatches: one per order** (they are kept only while their order is,
 //!   so the order cap is theirs): 256.
 //! * **Backing slots: `MAX_BACKINGS` (64)** Ghost Keys, each backing carrying
-//!   a certificate of `MAX_CERTIFICATE_PEM_BYTES` (4096). Half are retired,
-//!   which is how a store reaches the bound in practice (rotation keeps the
-//!   retired key's slot), and each of the other half holds
-//!   `MAX_SCOPES_PER_BACKER` (4) wrapped copies of the store key: 64
-//!   backings, 32 retirements, 128 copies.
+//!   a certificate of `MAX_CERTIFICATE_PEM_BYTES` (4096), none retired, and
+//!   each holding `MAX_SCOPES_PER_BACKER` (4) wrapped copies of the store
+//!   key: 64 backings, 256 copies. A retired backer holds no copies, so a
+//!   retirement in place of a backer's four copies is one record (and one
+//!   signature) instead of four; this is the larger and dearer of the two
+//!   (step 2: until then this fixture retired half, holding 128 copies,
+//!   which is not the most a store holds).
 //! * **The closed flag**: at most one closure, and it is there.
 //! * **Photos: `MAX_IMAGES_HARD` (8) per listing**, each with a description
 //!   of `MAX_ALT_CHARS` (200), the cover with a thumbnail.
@@ -68,8 +70,7 @@ use freenet_bitcoin_common::{
 use freenet_scaffold::ComposableState;
 use harvest_common::backing::{
     sign_with_store_key, store_key_envelope, AuthorizedBacking, AuthorizedClosure,
-    AuthorizedRetirement, BackingAcceptance, BackingStatement, Retirement, StoreClosure,
-    MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
+    BackingAcceptance, BackingStatement, StoreClosure, MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
 };
 use harvest_common::custody::{
     AuthorizedCopy, StoreKeyCopy, WrapScope, WrappedStoreKey, MAX_SCOPES_PER_BACKER, SCHEME_V1,
@@ -591,18 +592,6 @@ impl Shop {
         })
     }
 
-    fn retirement(&self, backer: &SigningKey) -> Result<AuthorizedRetirement> {
-        let retirement = Retirement {
-            backer: backer.verifying_key(),
-        };
-        let (scoped_payload, signature) = self.sign(&retirement)?;
-        Ok(AuthorizedRetirement {
-            retirement,
-            scoped_payload,
-            signature,
-        })
-    }
-
     fn copy(&self, backer: &SigningKey, label: &str, j: u64, scope: u64) -> Result<AuthorizedCopy> {
         let copy = StoreKeyCopy {
             store: self.owner(),
@@ -711,13 +700,8 @@ impl Shop {
             .enumerate()
             .map(|(j, b)| self.backing(b, label, j as u64))
             .collect::<Result<Vec<_>>>()?;
-        let (retired, current) = backers.split_at(MAX_BACKINGS / 2);
-        let retirements = retired
-            .iter()
-            .map(|b| self.retirement(b))
-            .collect::<Result<Vec<_>>>()?;
         let mut copies = Vec::new();
-        for (j, b) in current.iter().enumerate() {
+        for (j, b) in backers.iter().enumerate() {
             for scope in 0..MAX_SCOPES_PER_BACKER as u64 {
                 copies.push(self.copy(b, label, j as u64, scope)?);
             }
@@ -729,7 +713,7 @@ impl Shop {
             listings: Some(listings),
             orders: Some(orders),
             backings: Some(backings),
-            retirements: Some(retirements),
+            retirements: None,
             closed: Some(vec![self.closure()?]),
             copies: Some(copies),
             fulfilment: Some(fulfilment),
@@ -779,6 +763,7 @@ impl Shop {
             && state.fulfilment.records.len() == MAX_ORDERS
             && slots.len() == MAX_BACKINGS
             && per_backer.len() == unretired
+            && state.copies.records.len() == MAX_BACKINGS * MAX_SCOPES_PER_BACKER
             && per_backer.values().all(|&n| n == MAX_SCOPES_PER_BACKER)
             && state.closed.records.len() == 1
             && state

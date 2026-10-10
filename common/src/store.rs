@@ -1209,7 +1209,10 @@ impl OrdersV1 {
 /// delta anyone may send, padded with records the store would only throw
 /// away, costs no more to refuse than its length check.
 ///
-/// It must be at least the largest state the caps allow. If it were less,
+/// It must be at least the largest state the caps allow, and it is exactly
+/// that, with no slack, because [`AT_CAPS_BYTES`] is derived rather than
+/// measured: each record at its largest legal content, each byte-capped
+/// record at its cap, and the frame worked out field by field. If it were less,
 /// two valid states could merge into one `validate_state` refuses, and the
 /// replicas holding them would never converge (review round 4 of step 2).
 /// So every part of a store is capped in bytes, not only in count, and
@@ -1249,9 +1252,18 @@ pub const AT_CAPS_BYTES: usize = STATE_FRAME_BYTES
     + (SLOT_KEY_BYTES + CLOSURE_RECORD_BYTES)
     + (SLOT_KEY_BYTES + PAUSE_RECORD_BYTES);
 
-/// The state's own frame: its field names, each part's wrapper, and the
-/// length headers of its maps and arrays.
-const STATE_FRAME_BYTES: usize = 1024;
+/// The state's own frame, everything outside the records counted above,
+/// derived: the top-level map's header (1 byte) and its 11 field names (96
+/// bytes with their headers: `owner` 6, `info` 5, `listings` 9, `orders` 7,
+/// `backings` 9, `retirements` 12, `closed` 7, `copies` 7, `fulfilment` 11,
+/// `listing_statuses` 17, `pause` 6); the owner's key (34); the listings'
+/// wrapper (a 1-byte map header, `listings` 9, an array header of at most 3:
+/// 13); the orders' wrapper (1 + `orders` 7 + a map header of at most 3:
+/// 11); and seven signed sets' wrappers (1 + `records` 8 + 3: 12 each, 84).
+/// 239 bytes in all, rounded up. The store details are counted whole in
+/// [`MAX_INFO_BYTES`]. Cross-check: the at-caps store in
+/// `at_caps_tests` has a frame of 232 bytes.
+const STATE_FRAME_BYTES: usize = 256;
 /// An order's key in the order map: an [`OrderId`], 32 integers.
 const ORDER_KEY_BYTES: usize = 2 + 32 * 2;
 /// A signed-set record's slot key: a [`Bytes32`], one byte string.
