@@ -50,7 +50,7 @@ that would re-key an artifact as a side effect of running the test tooling.
 The family names the generator takes (`store`, `claim`, `triad`, `triadcap`,
 `reputation`, `mailbox`, `review`, `rr`, `backing`, `review98`, `index`,
 `copies`, `retire98`, `fulfilment`, `status`, `request`, `presence`, `paidcap`,
-`listcap`, `pause`) are not the same as the corpus names the runner takes; one
+`listcap`, `pause`, `statuscap`) are not the same as the corpus names the runner takes; one
 family writes several corpora.
 
 ## Step 2's caps and the pause
@@ -74,8 +74,8 @@ writing (`native_laws_total`).
   cuts, arrived honest, padded, over and under, so the cap and the rule meet.
   And the migration fold's result over a RECOVERED base of 300 orders and 130
   listings (`fold_store`, which models `merge_store_reporting_discard`:
-  each side's listings and orders held to this generation's rules before the
-  merge, `normalize_carried` after; the driver calls
+  each side's listings, orders and listing statuses held to this
+  generation's rules before the merge, `normalize_carried` after; the driver calls
   `merge_with_local(recovered, &local)`, so the unverified side is the base).
   The generator asserts the fold agrees with normalising first (a padded
   `Paid` in the base must not hide the local side's cancellation), and that
@@ -91,6 +91,16 @@ writing (`native_laws_total`).
   revisions with opposite `paused`, `u64::MAX`, a pause beside a listing and
   beside the closed flag, every ordered pair merged, and deltas carrying two
   pauses for the slot in both orders.
+- **`store-statuscap`** (`statuscap`) -- `MAX_LISTING_STATUSES` (512)
+  newest by `(revision, listing id)`, the smaller id first at one revision:
+  two full sides whose union is 700, 64 of one side's oldest slots raised to
+  the top by a later status (a merge can raise a slot's rank, which the order
+  cap's ranking never moves), and 45 statuses at one side's 41st-oldest
+  revision, so a union with it cuts through the tie, and the first side's
+  oldest slot raised to exactly that revision, so it lands on the cut and
+  is kept or cut by its listing id. Deltas carry the newest
+  status there is, one the bound cuts on arrival, a raise, a tie, and one
+  status past the bound (refused whole).
 
 `store-listcap` shows a few inconclusive cases in the bundle run
 (`delta_idempotence`, `delta_permutation_invariance`): fdev applies the delta

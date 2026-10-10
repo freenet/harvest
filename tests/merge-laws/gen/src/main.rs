@@ -1794,6 +1794,9 @@ fn main() {
     if want("pause") {
         gen_pause(&root);
     }
+    if want("statuscap") {
+        gen_statuscap(&root);
+    }
 }
 
 use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
@@ -3400,6 +3403,12 @@ fn gen_retire98(root: &Path) {
 //   store-pause    PauseV1: one store-key-signed slot, the higher revision,
 //                  then the smaller encoding; equal revisions saying opposite
 //                  things.
+//   store-statuscap  MAX_LISTING_STATUSES newest by (revision, listing id):
+//                  unions past the bound, a revision tie straddling the cut,
+//                  old slots raised to the top by a later status (a merge
+//                  can raise a slot's rank, unlike the order cap's), and one
+//                  raised exactly onto the cut, where equal revisions are
+//                  broken by listing id.
 // ---------------------------------------------------------------------------
 
 use ed25519_dalek::VerifyingKey;
@@ -3420,8 +3429,8 @@ use harvest_common::store_pause::{AuthorizedStorePause, StorePause};
 /// RECOVERED predecessor state, which nothing in this generation verified.
 ///
 /// Name a whole-key generation's owner on both sides
-/// (`name_whole_key_owner`), hold each side's listings and orders to this
-/// generation's rules before the merge (so a padded `Paid` on one side
+/// (`name_whole_key_owner`), hold each side's listings, orders and listing
+/// statuses to this generation's rules before the merge (so a padded `Paid` on one side
 /// cannot outrank the other side's cancellation inside it: review round 3
 /// of step 2), merge (a refused merge keeps the base as it was), then
 /// `normalize_carried` and the version-0 info reset, which run on the
@@ -3443,9 +3452,11 @@ fn fold_store(
     let mut base = name(base);
     base.listings.normalize();
     base.orders.normalize();
+    base.listing_statuses.normalize();
     let mut other = name(other.clone());
     other.listings.normalize();
     other.orders.normalize();
+    other.listing_statuses.normalize();
     let snap = base.clone();
     if let Err(e) = base.merge(&snap, params, &other) {
         println!("  fold refused: {e}");
@@ -4055,6 +4066,125 @@ fn gen_listcap(root: &Path) {
         "big_under_new3",
     ];
     write_step2_corpus(root, "store-listcap", &fx, named, &pairs, &bases, &deltas, &native);
+}
+
+fn gen_statuscap(root: &Path) {
+    use harvest_common::store::MAX_LISTING_STATUSES;
+    let bx = BackingFx::new();
+    let owner = Some(bx.store.verifying_key());
+    let st = |n: u32, revision: u64| {
+        let status = ListingStatus {
+            listing: ListingId(*blake3::hash(format!("statuscap/{n}").as_bytes()).as_bytes()),
+            revision,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (scoped_payload, signature) = sign_scoped(&bx.store, &status);
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    let cap = MAX_LISTING_STATUSES as u32;
+    let range = |from: u32, to: u32, revision: &dyn Fn(u32) -> u64| {
+        (from..to).map(|n| st(n, revision(n))).collect::<Vec<_>>()
+    };
+    let by_n = |n: u32| 100 + u64::from(n);
+    let build = |ss: Vec<AuthorizedListingStatus>| {
+        let s = bx.build_s(vec![], ss, vec![]);
+        assert!(s.listing_statuses.records.len() <= MAX_LISTING_STATUSES);
+        s
+    };
+    // A full side, a full side overlapping it (their union is past the
+    // bound), old slots raised to the top, and a tie at A's 41st-oldest
+    // revision that a union with A cuts through.
+    let a = build(range(0, cap, &by_n));
+    let b = build(range(cap - 324, cap + 188, &by_n));
+    let raised = build(range(0, 64, &|_| 10_000));
+    let tie = build(range(1_000, 1_045, &|_| by_n(40)));
+    let few_new = build(range(2_000, 2_008, &|_| 20_000));
+    // Slot 0, A's oldest, raised to exactly the tie's revision: in a union
+    // with A and the tie it lands on the cut, where equal revisions are
+    // broken by listing id.
+    let edge = build(vec![st(0, by_n(40))]);
+    let union = bx.fx.merged(&bx.fx.merged(&a, &edge), &tie);
+    assert_eq!(
+        cbor(&union),
+        cbor(&bx.fx.merged(&a, &bx.fx.merged(&edge, &tie))),
+        "a slot raised onto the cut is cut the same way in either grouping"
+    );
+    assert_eq!(union.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+    assert_eq!(
+        cbor(&bx.fx.merged(&a, &tie)),
+        cbor(&bx.fx.merged(&tie, &a)),
+        "the tie is cut the same way round"
+    );
+    let named: Vec<(String, StoreStateV1)> = vec![
+        ("default".into(), StoreStateV1::default()),
+        ("A_full".into(), a),
+        ("B_full_overlap".into(), b),
+        ("R_raised64".into(), raised),
+        ("T_tie45".into(), tie),
+        ("N_new8".into(), few_new),
+        ("E_slot0_at_tie".into(), edge),
+    ];
+    let sd = |ss: Vec<AuthorizedListingStatus>| StoreStateV1Delta {
+        owner,
+        listing_statuses: Some(ss),
+        ..Default::default()
+    };
+    let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
+        ("newest", sd(vec![st(5_000, 1_000_000)])),
+        ("oldest", sd(vec![st(5_001, 1)])),
+        ("raise0", sd(vec![st(0, 50_000)])),
+        ("tie1", sd(vec![st(1_000, by_n(40))])),
+        ("slot0_at_tie", sd(vec![st(0, by_n(40))])),
+        ("over_cap", sd(range(0, cap + 1, &by_n))),
+        (
+            "newest_oldest_raise",
+            sd(vec![st(5_000, 1_000_000), st(5_001, 1), st(1, 60_000)]),
+        ),
+    ];
+    let pairs = [
+        ("A_full", "B_full_overlap"),
+        ("B_full_overlap", "A_full"),
+        ("A_full", "R_raised64"),
+        ("R_raised64", "A_full"),
+        ("B_full_overlap", "R_raised64"),
+        ("A_full", "T_tie45"),
+        ("T_tie45", "A_full"),
+        ("N_new8", "B_full_overlap"),
+        ("default", "A_full"),
+        ("A_full", "E_slot0_at_tie"),
+        ("E_slot0_at_tie", "T_tie45"),
+        ("T_tie45", "E_slot0_at_tie"),
+    ];
+    let bases = [
+        "default",
+        "A_full",
+        "B_full_overlap",
+        "R_raised64",
+        "T_tie45",
+    ];
+    let native = [
+        "default",
+        "A_full",
+        "B_full_overlap",
+        "R_raised64",
+        "T_tie45",
+        "N_new8",
+        "E_slot0_at_tie",
+    ];
+    write_step2_corpus(
+        root,
+        "store-statuscap",
+        &bx.fx,
+        named,
+        &pairs,
+        &bases,
+        &deltas,
+        &native,
+    );
 }
 
 fn gen_pause(root: &Path) {

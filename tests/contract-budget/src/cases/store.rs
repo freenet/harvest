@@ -36,14 +36,12 @@
 //!   store keeps it. The two stores share 120 listings and each has 8 the
 //!   other lacks; the merge keeps the 128 newest.
 //! * **The pause**: one record, signed.
+//! * **Listing statuses: `MAX_LISTING_STATUSES` (512)** (step 2), one for
+//!   each listing held and the rest for listings taken down and cut, as a
+//!   long edit history leaves them.
 //!
 //! What has NO cap in the contract, and the size chosen:
 //!
-//! * **Listing statuses** (one per listing here). Nothing bounds them: a
-//!   status outlives the cut of its listing. Every state here stays under
-//!   the node's own `MAX_STATE_SIZE` (50 MiB, freenet-core
-//!   `wasm_runtime/state_store.rs`), which [`cases`] checks: a state over it
-//!   is one no node stores, so measuring it would prove nothing.
 //! * **A listing's title** (200 characters), and the store's own name and
 //!   description ([`DESCRIPTION_BYTES`] = 16 KiB, the UI markdown renderer's
 //!   `MAX_SOURCE_BYTES`, which shows no more than that).
@@ -89,7 +87,7 @@ use harvest_common::listing_image::{
 use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
 use harvest_common::store::{
     AuthorizedStoreInfoV1, Bytes32, StoreInfoV1, StoreParameters, StoreStateV1, StoreStateV1Delta,
-    MAX_ORDERS,
+    MAX_LISTING_STATUSES, MAX_ORDERS,
 };
 
 use super::{array, bytes, cbor, now, signing_key, Case, Kind, Update};
@@ -681,9 +679,17 @@ impl Shop {
         let listings = listings
             .map(|i| self.listing("store/listing", i))
             .collect::<Result<Vec<_>>>()?;
+        // A status for every listing held, and the rest of the bound for
+        // listings an edit history took down and the cut dropped.
+        let gone = (0u64..).map(|i| {
+            ListingId(*blake3::hash(format!("store/withdrawn-listing/{i}").as_bytes()).as_bytes())
+        });
         let listing_statuses = listings
             .iter()
-            .map(|l| self.listing_status(&l.listing.id, revision))
+            .map(|l| l.listing.id.clone())
+            .chain(gone)
+            .take(MAX_LISTING_STATUSES)
+            .map(|id| self.listing_status(&id, revision))
             .collect::<Result<Vec<_>>>()?;
         let orders = (0..MAX_ORDERS as u64)
             .map(|i| match paid_bytes {
@@ -781,8 +787,7 @@ impl Shop {
                 .iter()
                 .all(|l| l.listing.images.len() == MAX_IMAGES_HARD)
             && state.listings.listings.len() == harvest_common::store::MAX_LISTINGS
-            // A status outlives the cut of its listing (step 2).
-            && state.listing_statuses.records.len() >= state.listings.listings.len()
+            && state.listing_statuses.records.len() == MAX_LISTING_STATUSES
             && state.pause.records.len() == 1
             // Every order still `Paid`: one the store kept as its unpaid
             // terms (`store::as_kept`) would make this a cheaper state than
@@ -916,8 +921,27 @@ pub fn cases() -> Result<Vec<Case>> {
             "a status",
             cbor(&held.listing_statuses.records.values().next()).len(),
         ),
+        ("  its info", cbor(&big.info).len()),
+        ("  its listings", cbor(&big.listings).len()),
+        ("  its orders", cbor(&big.orders).len()),
+        ("  its despatches", cbor(&big.fulfilment).len()),
+        ("  its listing statuses", cbor(&big.listing_statuses).len()),
+        ("  its backings", cbor(&big.backings).len()),
+        ("  its retirements", cbor(&big.retirements).len()),
+        ("  its wrapped copies", cbor(&big.copies).len()),
+        (
+            "  its closure and pause",
+            cbor(&big.closed).len() + cbor(&big.pause).len(),
+        ),
     ] {
         println!("store      size: {what}: {bytes} bytes");
+    }
+    if cbor(&big).len() > harvest_common::store::AT_CAPS_BYTES {
+        bail!(
+            "the store at its caps encodes in {} bytes, past `AT_CAPS_BYTES` ({})",
+            cbor(&big).len(),
+            harvest_common::store::AT_CAPS_BYTES
+        );
     }
     fits_a_node("the store of paid orders at their byte bound", &big)?;
     fits_a_node("the held store fixture", &held)?;
@@ -983,8 +1007,9 @@ pub fn cases() -> Result<Vec<Case>> {
     ];
     // (f) Replayed genuine records (review round 4 of step 2): copies of
     // records the store holds, beside the one new listing, are not
-    // verified again. 256 copies of a held paid order (the most an order
-    // delta may carry) and 4,000 of a held listing status.
+    // verified again. 256 copies of a held paid order and 512 of a held
+    // listing status, the most a delta may carry of each; one status more
+    // and the delta is refused whole, on its count.
     let held_order = held
         .orders
         .orders
@@ -1008,9 +1033,9 @@ pub fn cases() -> Result<Vec<Case>> {
             },
         ),
         (
-            "4000 copies of a held listing status".to_string(),
+            format!("{MAX_LISTING_STATUSES} copies of a held listing status"),
             StoreStateV1Delta {
-                listing_statuses: Some(vec![held_status.clone(); 4000]),
+                listing_statuses: Some(vec![held_status.clone(); MAX_LISTING_STATUSES]),
                 ..one.clone()
             },
         ),
@@ -1023,6 +1048,19 @@ pub fn cases() -> Result<Vec<Case>> {
             update: Update::Delta(cbor(&delta)),
         });
     }
+    sized.push(Case {
+        kind: Kind::Store,
+        name: format!(
+            "{MAX_ORDERS} orders at caps + one-listing delta + {} copies of a held listing status (refused)",
+            MAX_LISTING_STATUSES + 1
+        ),
+        parameters: parameters.clone(),
+        held: held_bytes.clone(),
+        update: Update::RefusedDelta(cbor(&StoreStateV1Delta {
+            listing_statuses: Some(vec![held_status.clone(); MAX_LISTING_STATUSES + 1]),
+            ..one.clone()
+        })),
+    });
     sized.push(Case {
         kind: Kind::Store,
         name: "a new subscriber's whole store (paid orders at their byte bound) as one delta"

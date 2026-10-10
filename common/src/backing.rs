@@ -296,6 +296,16 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     }
     /// What a verify error calls this kind of record.
     const WHAT: &'static str;
+    /// The most records of this kind a store holds, and so the most one
+    /// delta may carry (step 2): a longer delta is copies or records the
+    /// store would cut, and is refused before any of it is checked.
+    const MAX_RECORDS: usize;
+    /// Whether the set itself keeps only its [`Self::MAX_RECORDS`] newest
+    /// slots (the listing statuses), rather than a rule over the whole store
+    /// (the backings, `StoreStateV1::normalize_backings`) or `verify` (one
+    /// closure, one pause) holding it to the bound. See
+    /// `SignedSetV1::cut_to_newest`.
+    const CUT_TO_NEWEST: bool = false;
 }
 
 impl SignedRecord for AuthorizedBacking {
@@ -306,6 +316,7 @@ impl SignedRecord for AuthorizedBacking {
         self.verify(owner)
     }
     const WHAT: &'static str = "backing";
+    const MAX_RECORDS: usize = MAX_BACKINGS;
 }
 
 impl SignedRecord for AuthorizedRetirement {
@@ -316,6 +327,7 @@ impl SignedRecord for AuthorizedRetirement {
         self.verify(owner)
     }
     const WHAT: &'static str = "retirement";
+    const MAX_RECORDS: usize = MAX_BACKINGS;
 }
 
 impl SignedRecord for AuthorizedClosure {
@@ -326,8 +338,9 @@ impl SignedRecord for AuthorizedClosure {
         self.verify(owner)
     }
     // `verify` requires the closure to name the owner and to sit in its own
-    // slot, so a store holds at most one: there is no bound to exceed.
+    // slot, so a store holds at most one.
     const WHAT: &'static str = "closure";
+    const MAX_RECORDS: usize = 1;
 }
 
 /// The CBOR bytes of a record, which is what two records for one slot are
@@ -391,8 +404,8 @@ impl<T: SignedRecord> SignedSetV1<T> {
         self.records.is_empty()
     }
 
-    /// Fold one already-verified record in, keeping the higher rank and, on
-    /// equal ranks, the smaller encoding. See the type's docs.
+    /// Fold one record in, keeping the higher rank and, on equal ranks, the
+    /// smaller encoding. See the type's docs.
     fn merge_record(&mut self, incoming: T) {
         let slot = incoming.slot();
         match self.records.get(&slot) {
@@ -400,6 +413,86 @@ impl<T: SignedRecord> SignedSetV1<T> {
             _ => {
                 self.records.insert(slot, incoming);
             }
+        }
+    }
+
+    /// The records of `incoming` a merge has to look at: not one held here
+    /// as it is, nor one the delta already carried. Those change nothing,
+    /// so are not verified again: replayed copies of a genuine record cost
+    /// no signature checks (review round 4 of step 2: 4,000 copies of one
+    /// listing status cost five calls' budget). A delta carrying more than
+    /// [`SignedRecord::MAX_RECORDS`] is refused whole.
+    pub(crate) fn admit<'a>(&self, incoming: &'a [T]) -> Result<Vec<&'a T>, String> {
+        if incoming.len() > T::MAX_RECORDS {
+            return Err(format!(
+                "a delta of {} {} records is more than a store holds ({})",
+                incoming.len(),
+                T::WHAT,
+                T::MAX_RECORDS
+            ));
+        }
+        let mut fresh: Vec<&T> = Vec::with_capacity(incoming.len());
+        for record in incoming {
+            if self.records.get(&record.slot()) != Some(record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Merge records in WITHOUT verifying them: for a caller that has, or
+    /// that checks what the merge kept and what it did not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked<'a>(&mut self, records: impl IntoIterator<Item = &'a T>)
+    where
+        T: 'a,
+    {
+        for record in records {
+            self.merge_record(record.clone());
+        }
+        if T::CUT_TO_NEWEST {
+            self.cut_to_newest();
+        }
+    }
+
+    /// Keep the [`SignedRecord::MAX_RECORDS`] slots whose records rank
+    /// highest, the smaller slot first between two at one rank (step 2, for
+    /// the listing statuses).
+    ///
+    /// # Why it obeys the merge laws, though a merge can raise a slot's rank
+    ///
+    /// A slot ranks by the record it holds, and a later record for it ranks
+    /// higher, so unlike the order cap's ranking (`store::enforce_order_cap`)
+    /// a merge can move a slot up. The kept set is still a function of the
+    /// union: the top slots by their best record in it. Take a slot cut from
+    /// one side: N slots rank above its best record there, and they rank at
+    /// least as high in any union containing that side. If the union brings
+    /// the slot a better record, the slot is judged on that one, wherever it
+    /// came from; if not, its best record is one that was cut, and it is cut
+    /// again. Either way cutting it early changed nothing, so the cut is
+    /// idempotent, commutative and associative. The seeded laws in
+    /// `store::status_tests` check it on bytes.
+    pub(crate) fn cut_to_newest(&mut self) {
+        if self.records.len() <= T::MAX_RECORDS {
+            return;
+        }
+        let mut ranked: Vec<(u64, Bytes32)> = self
+            .records
+            .iter()
+            .map(|(slot, record)| (record.rank(), *slot))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, slot) in ranked.into_iter().skip(T::MAX_RECORDS) {
+            self.records.remove(&slot);
+        }
+    }
+
+    /// The set as this generation keeps it, for a state an earlier one wrote
+    /// that a migration fold carries forward (see
+    /// `StoreStateV1::normalize_carried`).
+    pub fn normalize(&mut self) {
+        if T::CUT_TO_NEWEST {
+            self.cut_to_newest();
         }
     }
 }
@@ -420,6 +513,16 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
     ) -> Result<(), String> {
         if self.records.is_empty() {
             return Ok(());
+        }
+        // The bound first: it is cheap, and a state past it is refused before
+        // a single signature is checked.
+        if self.records.len() > T::MAX_RECORDS {
+            return Err(format!(
+                "store holds {} {} records, the most it keeps is {}",
+                self.records.len(),
+                T::WHAT,
+                T::MAX_RECORDS
+            ));
         }
         let owner = crate::store::owner_key(parent_state)?;
         for (slot, record) in &self.records {
@@ -486,31 +589,21 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         if incoming.is_empty() {
             return Ok(());
         }
-        // Verify the whole delta before merging any of it, and merge into a
-        // copy, so a refused delta leaves `self` exactly as it was -- the
-        // discipline `OrdersV1::apply_delta` states.
-        // A record held as it is, or that came earlier in this delta,
-        // changes nothing and is not verified again: replayed copies of a
-        // genuine record cost no signature checks (review round 4 of step
-        // 2: 4,000 copies of one listing status cost five calls' budget).
-        let owner = crate::store::owner_key(parent_state)?;
-        let mut fresh: Vec<&T> = Vec::with_capacity(incoming.len());
-        for record in incoming {
-            if self.records.get(&record.slot()) != Some(record) && !fresh.contains(&record) {
-                fresh.push(record);
+        let fresh = self.admit(incoming)?;
+        // Verify the whole delta before merging any of it, so a refused
+        // delta leaves `self` exactly as it was -- the discipline
+        // `OrdersV1::apply_delta` states.
+        if !fresh.is_empty() {
+            let owner = crate::store::owner_key(parent_state)?;
+            for record in &fresh {
+                record.verify_for(owner)?;
             }
         }
-        for record in &fresh {
-            record.verify_for(owner)?;
-        }
-        let mut next = self.clone();
-        for record in fresh {
-            next.merge_record(record.clone());
-        }
-        // No bound is applied here. The bound on backings and retirements
-        // is about the store as a whole, so `StoreStateV1::normalize_backings`
-        // applies it after every part has been merged; see [`MAX_BACKINGS`].
-        *self = next;
+        // No store-wide bound is applied here. The bound on backings and
+        // retirements is about the store as a whole, so
+        // `StoreStateV1::normalize_backings` applies it after every part has
+        // been merged; see [`MAX_BACKINGS`].
+        self.merge_unchecked(fresh);
         Ok(())
     }
 }
@@ -1145,12 +1238,21 @@ mod tests {
     #[test]
     fn a_union_past_the_bound_keeps_the_smallest_keys_and_everything_else() {
         let many = many_backings(MAX_BACKINGS + 3);
+        // Two updates, each within what a delta may carry, whose union is
+        // past the bound; the closure comes with the second.
+        let (first, second) = many.split_at(MAX_BACKINGS - 4);
         let mut next = StoreStateV1::default();
         next.apply_delta(
             &StoreStateV1::default(),
             &params(),
+            &Some(delta_with(first.to_vec(), vec![], vec![])),
+        )
+        .expect("within the bound");
+        next.apply_delta(
+            &StoreStateV1::default(),
+            &params(),
             &Some(delta_with(
-                many.clone(),
+                second.to_vec(),
                 vec![],
                 vec![closure_by(&store_key(), &store_key())],
             )),

@@ -236,6 +236,8 @@ impl crate::backing::SignedRecord for AuthorizedCopy {
         self.verify(owner)
     }
     const WHAT: &'static str = "wrapped copy";
+    // Every copy's backer takes a backing slot (`StoreStateV1::normalize_backings`).
+    const MAX_RECORDS: usize = crate::backing::MAX_BACKINGS * MAX_SCOPES_PER_BACKER;
 }
 
 /// Every wrapped copy a store holds.

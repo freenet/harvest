@@ -91,6 +91,8 @@ impl crate::backing::SignedRecord for AuthorizedDespatch {
         self.verify(owner)
     }
     const WHAT: &'static str = "despatch";
+    // One per order held (`StoreStateV1::normalize_fulfilment`).
+    const MAX_RECORDS: usize = crate::store::MAX_ORDERS;
 }
 
 /// How many blocks after payment the seller has to send: about a week.

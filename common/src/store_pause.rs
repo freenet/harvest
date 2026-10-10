@@ -93,6 +93,9 @@ impl crate::backing::SignedRecord for AuthorizedStorePause {
         self.pause.revision
     }
     const WHAT: &'static str = "pause";
+    // `verify` requires the pause to name the owner, so it sits in the
+    // owner's slot.
+    const MAX_RECORDS: usize = 1;
 }
 
 /// Whether `pause` says the store is paused now.
@@ -133,17 +136,21 @@ mod tests {
             owner: Some(store_key().verifying_key()),
             ..Default::default()
         };
-        state
-            .apply_delta(
-                &StoreStateV1::default(),
-                &params(),
-                &Some(StoreStateV1Delta {
-                    owner: Some(store_key().verifying_key()),
-                    pause: Some(pauses),
-                    ..Default::default()
-                }),
-            )
-            .map_err(|e| format!("{e:?}"))?;
+        // One delta per pause: a delta carries at most one (a store holds
+        // one), so several reach a store as several updates.
+        for pause in pauses {
+            state
+                .apply_delta(
+                    &StoreStateV1::default(),
+                    &params(),
+                    &Some(StoreStateV1Delta {
+                        owner: Some(store_key().verifying_key()),
+                        pause: Some(vec![pause]),
+                        ..Default::default()
+                    }),
+                )
+                .map_err(|e| format!("{e:?}"))?;
+        }
         Ok(state)
     }
 

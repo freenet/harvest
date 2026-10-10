@@ -3499,6 +3499,75 @@ fn a_predecessor_over_the_order_cap_is_capped_whichever_side_it_is_on() {
     }
 }
 
+/// Step 2: an earlier generation kept every listing status (they were
+/// uncapped), so one can hold more than `MAX_LISTING_STATUSES`, more than a
+/// delta of this generation may carry. Whichever side of the fold it is on,
+/// its newest 512 are carried and the result is a state this generation
+/// accepts. Red with `listing_statuses.normalize()` left out of the fold or
+/// of `normalize_carried`.
+#[test]
+fn a_predecessor_over_the_status_bound_is_cut_to_its_newest_whichever_side_it_is_on() {
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::{sign_with_store_key, SignedRecord};
+    use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    use harvest_common::store::MAX_LISTING_STATUSES;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    let status = |n: u32| {
+        let status = ListingStatus {
+            listing: ListingId(*blake3::hash(format!("status/{n}").as_bytes()).as_bytes()),
+            revision: 1_000 + u64::from(n),
+            availability: ListingAvailability::Withdrawn,
+        };
+        let (scoped_payload, signature) =
+            sign_with_store_key(&seller(), harvest_common::to_cbor(&status).expect("encode"))
+                .expect("a store record");
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    for n in 0..600 {
+        let s = status(n);
+        older.listing_statuses.records.insert(s.slot(), s);
+    }
+    let oldest_kept = status(600 - MAX_LISTING_STATUSES as u32).slot();
+    let newest_cut = status(600 - MAX_LISTING_STATUSES as u32 - 1).slot();
+    let ops = store_ops();
+    let empty = StoreStateV1::default();
+    let local = store_with(&[signed_listing("Plum")]);
+    for (shape, state) in [
+        (
+            "merge_with_local(older, empty)",
+            ops.merge_with_local(older.clone(), &empty),
+        ),
+        (
+            "merge_with_local(older, local)",
+            ops.merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations(older, empty)",
+            ops.merge_generations(older.clone(), empty.clone()),
+        ),
+        (
+            "merge_generations(empty, older)",
+            ops.merge_generations(empty.clone(), older.clone()),
+        ),
+    ] {
+        let held = &state.listing_statuses.records;
+        assert_eq!(held.len(), MAX_LISTING_STATUSES, "{shape}");
+        assert!(held.contains_key(&oldest_kept), "{shape}: the newest are kept");
+        assert!(!held.contains_key(&newest_cut), "{shape}: the oldest go");
+        assert!(
+            state.listings.listings.iter().any(|l| l.listing.title == "Jam"),
+            "{shape}: its listing is carried"
+        );
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
 /// [`signed_order`] marked `Paid` on evidence that is not the minimal proof
 /// (here none that could be: no claims), as an earlier generation kept a
 /// padded one.

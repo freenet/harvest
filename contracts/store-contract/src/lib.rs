@@ -5,7 +5,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 
 use harvest_common::store::{
-    StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary,
+    StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary, Unchecked,
 };
 
 #[allow(dead_code)]
@@ -107,6 +107,20 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
+        // Each record merged is verified once: here if the state this ends
+        // with does not hold it as it came, and otherwise by the
+        // `validate_state` the node runs on that state before keeping it
+        // (`StoreStateV1::apply_update`, step 2).
+        //
+        // That second half is freenet-core's, not ours: it validates the
+        // result of every `update_state` before storing it
+        // (`crates/core/src/contract/executor/runtime/contract_ops.rs:97` and
+        // `:392`, `executor_impl.rs:780` and `:1285` at 60a6c1f; its
+        // `.claude/rules/contracts.md`, "WHEN updating contract state"). A
+        // core change that dropped that validation would silently let a
+        // forged record that wins its slot into the store. See
+        // `docs/untested-invariants.md`.
+        let mut unchecked = Unchecked::default();
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
@@ -121,7 +135,7 @@ impl ContractInterface for Contract {
                     let new_state = from_reader::<StoreStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
-                        .merge(&store_state.clone(), &parameters, &new_state)
+                        .merge_update(&parameters, &new_state, &mut unchecked)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         })?;
@@ -134,7 +148,7 @@ impl ContractInterface for Contract {
                     let delta = from_reader::<StoreStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
-                        .apply_delta(&store_state.clone(), &parameters, &Some(delta))
+                        .apply_update(&parameters, &delta, &mut unchecked)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         })?;
@@ -149,6 +163,9 @@ impl ContractInterface for Contract {
         // nothing, so a stored state that is not canonical would otherwise be
         // written back as it came (harvest#26).
         store_state.listings.normalize();
+        unchecked
+            .check(&store_state)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
 
         if nothing_here {
             return Ok(UpdateModification::valid(State::from(vec![])));
@@ -296,6 +313,70 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(why.contains("together"), "{why}");
+    }
+
+    /// Step 2: `update_state` merges without verifying, verifies what the
+    /// result does not hold, and leaves the rest to `validate_state`. A
+    /// forged status an EARLIER update of the same call put in, and a later
+    /// one's newer statuses cut, is in no result, and is refused. Red with
+    /// the check run per update instead of against the final state, and
+    /// with it skipped.
+    #[test]
+    fn a_forged_record_a_later_update_cuts_is_refused() {
+        use harvest_common::backing::sign_with_store_key;
+        use harvest_common::listing::{
+            AuthorizedListingStatus, ListingAvailability, ListingId, ListingStatus,
+        };
+        use harvest_common::store::MAX_LISTING_STATUSES;
+        let seller = seller_key();
+        let status = |n: u16, revision: u64, forged: bool| {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            let status = ListingStatus {
+                listing: ListingId(id),
+                revision,
+                availability: ListingAvailability::SoldOut,
+            };
+            let (scoped_payload, mut signature) =
+                sign_with_store_key(&seller, harvest_common::to_cbor(&status).unwrap()).unwrap();
+            if forged {
+                signature[0] ^= 1;
+            }
+            AuthorizedListingStatus {
+                status,
+                scoped_payload,
+                signature,
+            }
+        };
+        let delta = |statuses: Vec<AuthorizedListingStatus>| {
+            UpdateData::Delta(StateDelta::from(
+                harvest_common::to_cbor(&StoreStateV1Delta {
+                    owner: Some(seller.verifying_key()),
+                    listing_statuses: Some(statuses),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+        };
+        let params = Parameters::from(params_bytes(&seller));
+        let newer: Vec<_> = (0..MAX_LISTING_STATUSES as u16)
+            .map(|n| status(n, 2_000_000 + u64::from(n), false))
+            .collect();
+        let update = |forged: bool| {
+            <Contract as ContractInterface>::update_state(
+                params.clone(),
+                State::from(vec![]),
+                vec![
+                    delta(vec![status(9_000, 1_000_000, forged)]),
+                    delta(newer.clone()),
+                ],
+            )
+        };
+        let kept = update(false).expect("genuine statuses apply");
+        let kept: StoreStateV1 = from_reader(kept.new_state.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(kept.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        let why = update(true).unwrap_err().to_string();
+        assert!(why.contains("listing status"), "{why}");
     }
 
     fn seller_key() -> SigningKey {

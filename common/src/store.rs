@@ -343,20 +343,26 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        if let Some(new_info) = delta {
-            if new_info.info.version <= self.info.version {
-                return Ok(()); // stale update, ignore
-            }
-            verify_scoped_signature(
-                &new_info.scoped_payload,
-                &new_info.signature,
-                owner_key(parent_state)?,
-                &new_info.info,
-            )
-            .map_err(|e| format!("store info delta signature invalid: {e}"))?;
+        if let Some(new_info) = self.admit(delta) {
+            new_info.check_signature(owner_key(parent_state)?)?;
             *self = new_info.clone();
         }
         Ok(())
+    }
+}
+
+impl AuthorizedStoreInfoV1 {
+    /// The info a merge takes from `delta`: one at a higher version than
+    /// held. A stale one is ignored.
+    pub(crate) fn admit<'a>(&self, delta: &'a Option<Self>) -> Option<&'a Self> {
+        delta
+            .as_ref()
+            .filter(|new_info| new_info.info.version > self.info.version)
+    }
+
+    fn check_signature(&self, owner: &VerifyingKey) -> Result<(), String> {
+        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.info)
+            .map_err(|e| format!("store info delta signature invalid: {e}"))
     }
 }
 
@@ -535,35 +541,60 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        if let Some(new_listings) = delta {
-            let mut known_ids: std::collections::HashSet<ListingId> =
-                self.listings.iter().map(|l| l.listing.id.clone()).collect();
-
-            // Collect first, push after. Verifying and pushing in one pass
-            // left a delta of [valid, invalid] with the valid listing already
-            // in `self` when the error returned -- see `OrdersV1::apply_delta`
-            // for the same defect and why the call site's habit of discarding
-            // the state on error is not a substitute for this.
-            let mut to_add = Vec::new();
-            for listing in new_listings {
-                // `insert` is false for a listing already held -- including
-                // one added by an EARLIER entry of this same delta, which the
-                // snapshot this used to take before the loop could not see, so
-                // a delta naming one listing twice stored it twice. `listings`
-                // is a plain `Vec` with no uniqueness invariant of its own, so
-                // that duplicate then survived every later merge and sort.
-                if !known_ids.insert(listing.listing.id.clone()) {
-                    continue; // already have this listing
-                }
-                listing.verify(owner_key(parent_state)?)?;
-                crate::listing_image::check_listing_images(&listing.listing)?;
-                to_add.push(listing.clone());
-            }
-            self.listings.extend(to_add);
+        let Some(new_listings) = delta else {
+            self.normalize();
+            return Ok(());
+        };
+        // Collect first, push after. Verifying and pushing in one pass left a
+        // delta of [valid, invalid] with the valid listing already in `self`
+        // when the error returned -- see `OrdersV1::apply_delta` for the same
+        // defect and why the call site's habit of discarding the state on
+        // error is not a substitute for this.
+        let fresh = self.admit(new_listings)?;
+        for listing in &fresh {
+            listing.verify(owner_key(parent_state)?)?;
+            crate::listing_image::check_listing_images(&listing.listing)?;
         }
-
-        self.normalize();
+        self.merge_unchecked(fresh);
         Ok(())
+    }
+}
+
+impl ListingsV1 {
+    /// The listings of `incoming` a merge takes: not one held, nor one the
+    /// delta already named. A delta of more than [`MAX_LISTINGS`] is refused
+    /// whole (step 2): no store holds more, so the rest are copies or
+    /// listings the cut would drop.
+    pub(crate) fn admit<'a>(
+        &self,
+        incoming: &'a [AuthorizedListing],
+    ) -> Result<Vec<&'a AuthorizedListing>, String> {
+        if incoming.len() > MAX_LISTINGS {
+            return Err(format!(
+                "a listing delta of {} records is more than a store holds ({MAX_LISTINGS})",
+                incoming.len()
+            ));
+        }
+        let mut known_ids: std::collections::HashSet<&ListingId> =
+            self.listings.iter().map(|l| &l.listing.id).collect();
+        // `insert` is false for a listing already held -- including one
+        // added by an EARLIER entry of this same delta, which the snapshot
+        // this used to take before the loop could not see, so a delta naming
+        // one listing twice stored it twice. `listings` is a plain `Vec` with
+        // no uniqueness invariant of its own, so that duplicate then survived
+        // every later merge and sort.
+        Ok(incoming
+            .iter()
+            .filter(|listing| known_ids.insert(&listing.listing.id))
+            .collect())
+    }
+
+    /// Add listings WITHOUT verifying them, then sort and cut: for a caller
+    /// that has, or that checks what was kept and what was not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked(&mut self, listings: Vec<&AuthorizedListing>) {
+        self.listings.extend(listings.into_iter().cloned());
+        self.normalize();
     }
 }
 
@@ -573,16 +604,43 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
 /// A [`crate::backing::SignedSetV1`] like the backings, with one difference:
 /// two statuses for one listing resolve to the higher `revision` before the
 /// smaller encoding, so a later status supersedes an earlier one. Nothing
-/// removes a status, and a status for a listing the store does not hold is
-/// kept, since it may arrive first.
+/// removes a status by itself, and a status for a listing the store does not
+/// hold is kept, since it may arrive first.
 ///
-/// Unbounded, unlike the listings (step 2 caps those). Only the store key's
-/// holder can add one, and one is kept per listing id, but a status need not
-/// name a listing the store holds, so the holder can add as many as they
-/// sign: their own store's state to grow. A cap that looked at which
-/// listings are held would depend on arrival order. What a long edit history
-/// costs instant checkout is measured (`tests/delegate-budget`).
+/// At most [`MAX_LISTING_STATUSES`], the newest by revision (step 2): see
+/// there for why that many, and `SignedSetV1::cut_to_newest` for why the cut
+/// obeys the merge laws.
 pub type ListingStatusesV1 = crate::backing::SignedSetV1<crate::listing::AuthorizedListingStatus>;
+
+/// The most listing statuses a store keeps (step 2): the
+/// `MAX_LISTING_STATUSES` with the highest revisions, the smaller listing id
+/// first between two at one revision.
+///
+/// A store holds one status per listing id, but every edit publishes a new
+/// listing and withdraws the old one, so the ids, and their statuses, grow
+/// with the edit history. Before this bound nothing stopped them, and two
+/// copies of a store near [`MAX_STORE_BYTES`] could each refuse the other's
+/// last edit.
+///
+/// # Why this many
+///
+/// Every reader of a status reads it for a listing the store holds (the
+/// UI's listing pages and `listing_status_flow`, the delegate's `settle` and
+/// light store read), and a status for a listing it cannot find is ignored.
+/// So the bound must never cut a held listing's status: if it did, a listing
+/// sold out or taken down would read as on sale again, since a listing with
+/// no status reads that way.
+///
+/// Cutting held listing X's status takes this many newer statuses on other
+/// listings. The app signs a status only for a listing the store holds, and
+/// a revision is the time it was signed, so each of those was for a listing
+/// held at some time since X's status. While X is held, fewer than
+/// [`MAX_LISTINGS`] listings are newer than it, and the older ones held since
+/// were held alongside X when its status was signed, fewer than
+/// [`MAX_LISTINGS`] again: at most 254 in all. Twice that again leaves room
+/// for clocks that disagree across a seller's devices, at about 550 bytes a
+/// status (280 KB in all).
+pub const MAX_LISTING_STATUSES: usize = 4 * MAX_LISTINGS;
 
 impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     fn slot(&self) -> Bytes32 {
@@ -595,6 +653,8 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
         self.status.revision
     }
     const WHAT: &'static str = "listing status";
+    const MAX_RECORDS: usize = MAX_LISTING_STATUSES;
+    const CUT_TO_NEWEST: bool = true;
 }
 
 /// The most listings a store keeps (step 2): the newest, by
@@ -1039,27 +1099,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         let Some(incoming) = delta else {
             return Ok(());
         };
-        // No honest delta carries more orders than a store holds (a whole
-        // store's is `MAX_ORDERS`); a longer one is copies, each of which
-        // would be verified below (review round 4 of step 2: 400 copies of
-        // one paid record cost more than twice a call's budget).
-        if incoming.len() > MAX_ORDERS {
-            return Err(format!(
-                "an order delta of {} records is more than a store holds ({MAX_ORDERS})",
-                incoming.len()
-            ));
-        }
-        // Each record as the store keeps it, before anything else: a padded
-        // `Paid` is its unpaid terms from here on (`as_kept`). One the store
-        // already holds as it is, or that came earlier in this delta, changes
-        // nothing and is not verified again.
-        let mut fresh: Vec<AuthorizedOrder> = Vec::with_capacity(incoming.len());
-        for record in incoming.iter().cloned().map(as_kept) {
-            if self.orders.get(&record.order.id) != Some(&record) && !fresh.contains(&record) {
-                fresh.push(record);
-            }
-        }
-        let incoming = fresh;
+        let incoming = self.admit(incoming)?;
         // Verify the WHOLE delta before merging any of it. Verifying and
         // merging in one pass left a delta of [valid, invalid] with the valid
         // record already folded into `self` when the error returned, so a
@@ -1072,11 +1112,48 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
         }
-        for record in incoming {
+        self.merge_unchecked(incoming);
+        Ok(())
+    }
+}
+
+impl OrdersV1 {
+    /// The records of `incoming` a merge has to look at, each as the store
+    /// keeps it: a padded `Paid` is its unpaid terms from here on
+    /// (`as_kept`). One the store already holds as it is, or that came
+    /// earlier in this delta, changes nothing and is left out.
+    ///
+    /// No honest delta carries more orders than a store holds (a whole
+    /// store's is `MAX_ORDERS`); a longer one is copies, and is refused whole
+    /// (review round 4 of step 2: 400 copies of one paid record cost more
+    /// than twice a call's budget).
+    pub(crate) fn admit(
+        &self,
+        incoming: &[AuthorizedOrder],
+    ) -> Result<Vec<AuthorizedOrder>, String> {
+        if incoming.len() > MAX_ORDERS {
+            return Err(format!(
+                "an order delta of {} records is more than a store holds ({MAX_ORDERS})",
+                incoming.len()
+            ));
+        }
+        let mut fresh: Vec<AuthorizedOrder> = Vec::with_capacity(incoming.len());
+        for record in incoming.iter().cloned().map(as_kept) {
+            if self.orders.get(&record.order.id) != Some(&record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Merge records WITHOUT verifying them, then cut to [`MAX_ORDERS`]: for
+    /// a caller that has, or that checks what was kept and what was not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked(&mut self, records: Vec<AuthorizedOrder>) {
+        for record in records {
             merge_order(&mut self.orders, record);
         }
         enforce_order_cap(&mut self.orders);
-        Ok(())
     }
 }
 
@@ -1102,20 +1179,36 @@ impl OrdersV1 {
 /// send, padded with records the store would only throw away, costs no more
 /// to refuse than its length check.
 ///
-/// Sized by measurement on a node (`tests/contract-budget`, and the step-2
-/// wall-time runs): the largest state the caps allow (every order paid at
-/// [`MAX_PAID_ORDER_BYTES`], every listing at [`MAX_LISTING_BYTES`], every
-/// backing slot full) encodes in about 7.9 MB, and a new subscriber's
-/// whole-store delta of it took 3.2 to 4.2 s to apply. A padded delta's cost
-/// grows with its bytes, outside the contract too (the node took about 1.2 s
-/// to hand a 17 MB delta to it), and at 16 MiB took 4.2 to 5.9 s; at this
-/// bound it costs no more than the honest one. What is left above the
-/// capped parts is room for the one uncapped part, the listing statuses
-/// (about 550 bytes each): about 8,000 status edits past a full store. A
-/// store that edits more often than that stops taking more, and two copies
-/// of a store that near the bound can each refuse the other's last edit
-/// (harvest#227, which bounds the status history, is the fix).
-pub const MAX_STORE_BYTES: usize = 12 * 1024 * 1024;
+/// Every part of a store is capped (step 2), so the largest state the caps
+/// allow is a computed figure, [`AT_CAPS_BYTES`], and this is that plus
+/// about 3%. Nothing honest is past it: the largest delta there is, a new
+/// subscriber's whole store, is the state itself. The slack is for what
+/// the contract caps by count but not by bytes, which
+/// [`AT_CAPS_REST_BYTES`] measures at what the app writes (a store's
+/// description, a backing's certificate, a status's count): an app that
+/// writes those a little larger must not find its own store refused. Much
+/// more would only be room for padding: a padded delta's cost on a node
+/// grows with its bytes, outside the contract too (the node took about
+/// 1.2 s to hand a 17 MB delta to it), which is why the earlier 16 and
+/// 12 MiB bounds were too high (the step-2 wall-time runs).
+pub const MAX_STORE_BYTES: usize = 8_600 * 1024;
+
+/// What a store at every cap encodes to, at most: [`MAX_LISTINGS`] listings
+/// of [`MAX_LISTING_BYTES`], [`MAX_ORDERS`] paid orders of
+/// [`MAX_PAID_ORDER_BYTES`], and [`AT_CAPS_REST_BYTES`] for the rest.
+pub const AT_CAPS_BYTES: usize =
+    MAX_LISTINGS * MAX_LISTING_BYTES + MAX_ORDERS * MAX_PAID_ORDER_BYTES + AT_CAPS_REST_BYTES;
+
+/// A store's parts besides its listings and orders, at every cap: 2,143,269
+/// bytes, measured part by part on `tests/contract-budget`'s at-caps store
+/// (which fails if that store encodes past [`AT_CAPS_BYTES`]). That is a despatch for each order
+/// (156 KB), [`MAX_LISTING_STATUSES`] statuses (299 KB), `MAX_BACKINGS`
+/// backings with 4 KiB certificates (1,394 KB) and four wrapped copies each
+/// (229 KB, more than a retirement), and the store's details with a 16 KiB
+/// description (65 KB).
+pub const AT_CAPS_REST_BYTES: usize = 2_150 * 1024;
+
+const _: () = assert!(MAX_STORE_BYTES >= AT_CAPS_BYTES + AT_CAPS_BYTES / 32);
 
 /// The most bytes a `Paid` record may take, as it encodes, for the store to
 /// keep it as paid (step 2): see [`as_kept`].
@@ -1218,7 +1311,11 @@ fn proof_bytes_at_least(record: &AuthorizedOrder) -> usize {
 /// owner can hold nothing that needs a signature -- which is everything but
 /// the empty default.
 pub(crate) fn owner_key(parent: &StoreStateV1) -> Result<&VerifyingKey, String> {
-    parent.owner.as_ref().ok_or_else(|| {
+    owner_of(&parent.owner)
+}
+
+fn owner_of(owner: &Option<VerifyingKey>) -> Result<&VerifyingKey, String> {
+    owner.as_ref().ok_or_else(|| {
         "this store has no owner yet, so nothing in it can be verified: a store's first \
          signed record has to name the key that signed it"
             .to_string()
@@ -1682,47 +1779,229 @@ impl StoreStateV1 {
     }
 
     /// Apply a delta's parts under the owner already in `self`, all or
-    /// nothing.
+    /// nothing. With `unchecked`, a record is merged without being verified,
+    /// and is noted there instead: see [`Self::apply_update`].
     fn apply_parts(
         &mut self,
         parameters: &StoreParameters,
         delta: &StoreStateV1Delta,
+        unchecked: Option<&mut Unchecked>,
     ) -> Result<(), String> {
         let parent = self.owner_only();
         let mut next = self.clone();
-        next.info.apply_delta(&parent, parameters, &delta.info)?;
-        next.listings
-            .apply_delta(&parent, parameters, &delta.listings)?;
-        next.orders
-            .apply_delta(&parent, parameters, &delta.orders)?;
-        next.backings
-            .apply_delta(&parent, parameters, &delta.backings)?;
-        next.retirements
-            .apply_delta(&parent, parameters, &delta.retirements)?;
-        next.closed
-            .apply_delta(&parent, parameters, &delta.closed)?;
-        next.copies
-            .apply_delta(&parent, parameters, &delta.copies)?;
-        next.fulfilment
-            .apply_delta(&parent, parameters, &delta.fulfilment)?;
-        next.listing_statuses
-            .apply_delta(&parent, parameters, &delta.listing_statuses)?;
-        next.pause.apply_delta(&parent, parameters, &delta.pause)?;
+        let Some(unchecked) = unchecked else {
+            next.info.apply_delta(&parent, parameters, &delta.info)?;
+            next.listings
+                .apply_delta(&parent, parameters, &delta.listings)?;
+            next.orders
+                .apply_delta(&parent, parameters, &delta.orders)?;
+            next.backings
+                .apply_delta(&parent, parameters, &delta.backings)?;
+            next.retirements
+                .apply_delta(&parent, parameters, &delta.retirements)?;
+            next.closed
+                .apply_delta(&parent, parameters, &delta.closed)?;
+            next.copies
+                .apply_delta(&parent, parameters, &delta.copies)?;
+            next.fulfilment
+                .apply_delta(&parent, parameters, &delta.fulfilment)?;
+            next.listing_statuses
+                .apply_delta(&parent, parameters, &delta.listing_statuses)?;
+            next.pause.apply_delta(&parent, parameters, &delta.pause)?;
+            next.normalize_backings();
+            next.normalize_fulfilment();
+            *self = next;
+            return Ok(());
+        };
+        // The same merge, each record that `apply_delta` would verify noted
+        // instead, with the owner it would be verified against.
+        let owner = self.owner;
+        if let Some(info) = next.info.admit(&delta.info).cloned() {
+            next.info = info.clone();
+            unchecked.note(move |merged| {
+                if merged.info == info {
+                    return Ok(());
+                }
+                info.check_signature(owner_of(&owner)?)
+            });
+        }
+        if let Some(incoming) = &delta.listings {
+            let fresh = next.listings.admit(incoming)?;
+            for listing in &fresh {
+                let listing = (*listing).clone();
+                unchecked.note(move |merged| {
+                    if merged.listings.listings.contains(&listing) {
+                        return Ok(());
+                    }
+                    listing.verify(owner_of(&owner)?)?;
+                    crate::listing_image::check_listing_images(&listing.listing)
+                });
+            }
+            next.listings.merge_unchecked(fresh);
+        }
+        if let Some(incoming) = &delta.orders {
+            let fresh = next.orders.admit(incoming)?;
+            for record in &fresh {
+                let record = record.clone();
+                unchecked.note(move |merged| {
+                    if merged.orders.orders.get(&record.order.id) == Some(&record) {
+                        return Ok(());
+                    }
+                    record
+                        .verify(owner_of(&owner)?)
+                        .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))
+                });
+            }
+            next.orders.merge_unchecked(fresh);
+        }
+        take_unchecked(&mut next.backings, &delta.backings, owner, unchecked, |s| {
+            &s.backings
+        })?;
+        take_unchecked(
+            &mut next.retirements,
+            &delta.retirements,
+            owner,
+            unchecked,
+            |s| &s.retirements,
+        )?;
+        take_unchecked(&mut next.closed, &delta.closed, owner, unchecked, |s| {
+            &s.closed
+        })?;
+        take_unchecked(&mut next.copies, &delta.copies, owner, unchecked, |s| {
+            &s.copies
+        })?;
+        take_unchecked(
+            &mut next.fulfilment,
+            &delta.fulfilment,
+            owner,
+            unchecked,
+            |s| &s.fulfilment,
+        )?;
+        take_unchecked(
+            &mut next.listing_statuses,
+            &delta.listing_statuses,
+            owner,
+            unchecked,
+            |s| &s.listing_statuses,
+        )?;
+        take_unchecked(&mut next.pause, &delta.pause, owner, unchecked, |s| {
+            &s.pause
+        })?;
         next.normalize_backings();
         next.normalize_fulfilment();
         *self = next;
         Ok(())
     }
 
+    /// Apply a delta, deciding first whose records the store holds. All or
+    /// nothing: on an error `self` is unchanged.
+    fn apply_with(
+        &mut self,
+        parameters: &StoreParameters,
+        delta: &StoreStateV1Delta,
+        unchecked: Option<&mut Unchecked>,
+    ) -> Result<(), String> {
+        let Some(incoming) = delta.owner else {
+            // No owner named: the records are verified against the owner
+            // already held, and against nobody if there is none, which fails.
+            return self.apply_parts(parameters, delta, unchecked);
+        };
+        if !parameters.admits(&incoming) {
+            return Err(format!(
+                "an update names owner {}, which does not begin with this store's code {}",
+                bs58::encode(incoming.as_bytes()).into_string(),
+                parameters.code()
+            ));
+        }
+        match self.owner {
+            Some(held) if held == incoming => self.apply_parts(parameters, delta, unchecked),
+            // The owner held outranks the one this delta speaks for, so its
+            // records are another key's and are not ours to take. Not an
+            // error: an error is not a merge, and the result has to be the
+            // same whichever way round two peers exchange their states.
+            Some(held) if outranks(&held, &incoming) => Ok(()),
+            // Nobody holds the address, or the incoming owner outranks the
+            // one who does: start again from nothing under the incoming owner.
+            _ => {
+                let mut claimed = Self {
+                    owner: Some(incoming),
+                    ..Default::default()
+                };
+                claimed.apply_parts(parameters, delta, unchecked)?;
+                if !claimed.holds_signed_content() {
+                    return Err("an update that claims a store must carry something its \
+                                owner signed"
+                        .into());
+                }
+                *self = claimed;
+                Ok(())
+            }
+        }
+    }
+
+    /// [`ComposableState::apply_delta`] for the store contract's
+    /// `update_state`, which costs half as much (step 2): a record is merged
+    /// without being verified, and noted in `unchecked`, which the caller
+    /// must check against the state it ends with ([`Unchecked::check`]).
+    ///
+    /// # Why the result is the same
+    ///
+    /// The node keeps a merged state only after the contract's
+    /// `validate_state` passes on it, and that verifies every record the
+    /// state holds (freenet-core: `contract_ops.rs` and `executor_impl.rs`
+    /// call `validate_state` on the result of every `update_state` before
+    /// committing it; its `.claude/rules/contracts.md`, "WHEN updating
+    /// contract state", step 3). So `apply_delta` verified each record that
+    /// lands twice, once as it arrived and once in the result: half of what
+    /// a new subscriber's whole-store delta cost on a node (the step-2 wall
+    /// time runs).
+    ///
+    /// [`Unchecked::check`] verifies every noted record the final state does
+    /// NOT hold as it came: one that lost its slot, was cut by a bound, or
+    /// was replaced by a later update. `validate_state` verifies the rest.
+    /// So every record `apply_delta` would have verified is verified, by one
+    /// or the other, and an update is accepted exactly when it was before. A
+    /// record the merge throws away still has to be checked: a forged order
+    /// that wins its slot and is then cut by the order bound would otherwise
+    /// take a genuine one with it.
+    ///
+    /// Everything else -- the app, the delegate, the tests -- keeps calling
+    /// `apply_delta`, which verifies everything itself.
+    pub fn apply_update(
+        &mut self,
+        parameters: &StoreParameters,
+        delta: &StoreStateV1Delta,
+        unchecked: &mut Unchecked,
+    ) -> Result<(), String> {
+        self.apply_with(parameters, delta, Some(unchecked))
+    }
+
+    /// [`ComposableState::merge`] the way [`Self::apply_update`] applies a
+    /// delta.
+    pub fn merge_update(
+        &mut self,
+        parameters: &StoreParameters,
+        other: &Self,
+        unchecked: &mut Unchecked,
+    ) -> Result<(), String> {
+        let summary = self.summarize(self, parameters);
+        match other.delta(other, parameters, &summary) {
+            Some(delta) => self.apply_update(parameters, &delta, unchecked),
+            None => Ok(()),
+        }
+    }
+
     /// The whole state as this generation keeps it, for a state an earlier
     /// generation wrote that a migration fold carries forward: the listings
-    /// sorted and capped, the orders as kept and capped, and a despatch for
-    /// a cut order cut with it. Each is what `apply_delta` does to what it
-    /// touches; the fold's merge skips the parts the other side brings
-    /// nothing new for. (Step 2 changed no other cap.)
+    /// sorted and capped, the orders as kept and capped, the listing
+    /// statuses capped, and a despatch for a cut order cut with it. Each is
+    /// what `apply_delta` does to what it touches; the fold's merge skips the
+    /// parts the other side brings nothing new for. (Step 2 changed no other
+    /// cap.)
     pub fn normalize_carried(&mut self) {
         self.listings.normalize();
         self.orders.normalize();
+        self.listing_statuses.normalize();
         self.normalize_fulfilment();
     }
 }
@@ -1914,46 +2193,90 @@ impl ComposableState for StoreStateV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let Some(delta) = delta else {
-            return Ok(());
-        };
-        let Some(incoming) = delta.owner else {
-            // No owner named: the records are verified against the owner
-            // already held, and against nobody if there is none, which fails.
-            return self.apply_parts(parameters, delta);
-        };
-        if !parameters.admits(&incoming) {
-            return Err(format!(
-                "an update names owner {}, which does not begin with this store's code {}",
-                bs58::encode(incoming.as_bytes()).into_string(),
-                parameters.code()
-            ));
-        }
-        match self.owner {
-            Some(held) if held == incoming => self.apply_parts(parameters, delta),
-            // The owner held outranks the one this delta speaks for, so its
-            // records are another key's and are not ours to take. Not an
-            // error: an error is not a merge, and the result has to be the
-            // same whichever way round two peers exchange their states.
-            Some(held) if outranks(&held, &incoming) => Ok(()),
-            // Nobody holds the address, or the incoming owner outranks the
-            // one who does: start again from nothing under the incoming owner.
-            _ => {
-                let mut claimed = Self {
-                    owner: Some(incoming),
-                    ..Default::default()
-                };
-                claimed.apply_parts(parameters, delta)?;
-                if !claimed.holds_signed_content() {
-                    return Err("an update that claims a store must carry something its \
-                                owner signed"
-                        .into());
-                }
-                *self = claimed;
-                Ok(())
-            }
+        match delta {
+            Some(delta) => self.apply_with(parameters, delta, None),
+            None => Ok(()),
         }
     }
+}
+
+/// The records an update merged without verifying them
+/// ([`StoreStateV1::apply_update`]), each with how to tell whether the final
+/// state holds it as it came and how to verify it if not.
+#[derive(Default)]
+pub struct Unchecked(Vec<Check>);
+
+/// One noted record's check against the final state.
+type Check = Box<dyn FnOnce(&StoreStateV1) -> Result<(), String>>;
+
+impl Unchecked {
+    fn note(&mut self, check: impl FnOnce(&StoreStateV1) -> Result<(), String> + 'static) {
+        self.0.push(Box::new(check));
+    }
+
+    /// Verify every noted record `merged` does not hold as it came. The
+    /// records it does hold are left to `validate_state`, which the caller
+    /// must be sure runs on `merged` before anything keeps it.
+    pub fn check(self, merged: &StoreStateV1) -> Result<(), String> {
+        self.0.into_iter().try_for_each(|check| check(merged))
+    }
+}
+
+/// One signed-set part of [`StoreStateV1::apply_parts`] with its checks
+/// noted, not run: `held_in` finds the part in the final state.
+fn take_unchecked<T: crate::backing::SignedRecord + 'static>(
+    set: &mut SignedSetV1<T>,
+    incoming: &Option<Vec<T>>,
+    owner: Option<VerifyingKey>,
+    unchecked: &mut Unchecked,
+    held_in: fn(&StoreStateV1) -> &SignedSetV1<T>,
+) -> Result<(), String> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let fresh = set.admit(incoming)?;
+    for record in &fresh {
+        let record = (*record).clone();
+        unchecked.note(move |merged| {
+            if held_in(merged).records.get(&record.slot()) == Some(&record) {
+                return Ok(());
+            }
+            record.verify_for(owner_of(&owner)?)
+        });
+    }
+    set.merge_unchecked(fresh);
+    Ok(())
+}
+
+/// A delta the way the store contract's `update_state` and then the node
+/// apply it (step 2): [`StoreStateV1::apply_update`], its
+/// [`Unchecked::check`], then `validate_state`'s `verify` on the result.
+#[cfg(test)]
+fn through_the_node(
+    base: &StoreStateV1,
+    parameters: &StoreParameters,
+    delta: &StoreStateV1Delta,
+) -> Result<StoreStateV1, String> {
+    let mut state = base.clone();
+    let mut unchecked = Unchecked::default();
+    state.apply_update(parameters, delta, &mut unchecked)?;
+    unchecked.check(&state)?;
+    state.verify(&state, parameters)?;
+    Ok(state)
+}
+
+/// The same delta through `apply_delta`, which verifies as it merges, then
+/// `verify` on the result: what the node did before step 2.
+#[cfg(test)]
+fn through_apply_delta(
+    base: &StoreStateV1,
+    parameters: &StoreParameters,
+    delta: &StoreStateV1Delta,
+) -> Result<StoreStateV1, String> {
+    let mut state = base.clone();
+    state.apply_delta(base, parameters, &Some(delta.clone()))?;
+    state.verify(&state, parameters)?;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -2411,6 +2734,159 @@ mod order_tests {
             .apply_delta(&parent(), &p, &Some(vec![unpaid(1); MAX_ORDERS + 1]))
             .unwrap_err();
         assert!(why.contains("more than a store holds"), "{why}");
+    }
+
+    /// Step 2: the contract's `update_state` leaves a record the result
+    /// holds to `validate_state`, and verifies one it does not. A forged
+    /// order the order bound cuts on arrival is in no result, so only the
+    /// second check sees it, and the update is refused as `apply_delta`
+    /// refused it. Mutated red by skipping `Unchecked::check`.
+    #[test]
+    fn a_forged_order_the_cut_drops_is_still_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let unpaid = |n: i64| {
+            make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("cut-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xbb, (n % 251) as u8, (n / 251) as u8],
+                ),
+                OrderStatus::AwaitingPayment,
+                None,
+            )
+        };
+        let mut held = parent();
+        held.apply_delta(
+            &parent(),
+            &p,
+            &Some(StoreStateV1Delta {
+                orders: Some((1..=MAX_ORDERS as i64).map(unpaid).collect()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        // Older than every order held, so the bound cuts it at once.
+        let mut forged = unpaid(0);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            orders: Some(vec![forged.clone()]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged.apply_update(&p, &delta, &mut unchecked).unwrap();
+        assert!(!merged.orders.orders.contains_key(&forged.order.id));
+        assert_eq!(merged, held, "the cut record changed nothing");
+        let why = unchecked.check(&merged).unwrap_err();
+        assert!(why.contains("delta invalid"), "{why}");
+        assert!(through_the_node(&held, &p, &delta).is_err());
+        assert!(through_apply_delta(&held, &p, &delta).is_err());
+
+        // One the result holds is left to `validate_state`, which refuses it.
+        let mut forged_cancel = make_authorized_order(
+            &seller,
+            held.orders.orders.values().next().unwrap().order.clone(),
+            OrderStatus::Cancelled,
+            None,
+        );
+        forged_cancel.status_signature.as_mut().unwrap()[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            orders: Some(vec![forged_cancel]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged.apply_update(&p, &delta, &mut unchecked).unwrap();
+        unchecked
+            .check(&merged)
+            .expect("held as it came: left to validate");
+        assert!(merged.verify(&merged, &p).is_err());
+        assert!(through_apply_delta(&held, &p, &delta).is_err());
+    }
+
+    /// Step 2, seeded: genuine and forged orders, at and past the bound,
+    /// against a full store, in deltas of one to several records. Every
+    /// delta the node path accepts, `apply_delta` accepts, to the same state,
+    /// and every one it refuses, `apply_delta` refuses. Both outcomes occur,
+    /// and so does a refusal only `Unchecked::check` makes.
+    #[test]
+    fn the_node_path_accepts_exactly_what_apply_delta_accepts_for_orders() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let order = |n: i64, status: OrderStatus, forged: bool| {
+            let mut record = make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("eq-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xcc, (n % 251) as u8, (n / 251) as u8],
+                ),
+                status,
+                None,
+            );
+            if forged {
+                match record.status_signature.as_mut() {
+                    Some(signature) => signature[0] ^= 1,
+                    None => record.signature[0] ^= 1,
+                }
+            }
+            record
+        };
+        let mut held = parent();
+        held.apply_delta(
+            &parent(),
+            &p,
+            &Some(StoreStateV1Delta {
+                orders: Some(
+                    (100..100 + MAX_ORDERS as i64)
+                        .map(|n| order(n, OrderStatus::AwaitingPayment, false))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let mut pool = Vec::new();
+        // Older than all held (cut), among them, and newer (kept).
+        for n in [0, 1, 150, 151, 200, 400, 401] {
+            for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+                for forged in [false, true] {
+                    pool.push(order(n, status, forged));
+                }
+            }
+        }
+        let mut rng = crate::merge_laws::Rng::new(0x5_7e9);
+        let (mut accepted, mut refused, mut by_check) = (0, 0, 0);
+        for round in 0..300 {
+            let records = rng.subset(&pool, 1 + round % 4);
+            let delta = StoreStateV1Delta {
+                orders: Some(records),
+                ..Default::default()
+            };
+            let node = through_the_node(&held, &p, &delta);
+            let checked = through_apply_delta(&held, &p, &delta);
+            match (&node, &checked) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b);
+                    accepted += 1;
+                }
+                (Err(_), Err(_)) => refused += 1,
+                _ => panic!("the paths disagree on {delta:?}: {node:?} against {checked:?}"),
+            }
+            let mut merged = held.clone();
+            let mut unchecked = Unchecked::default();
+            if merged.apply_update(&p, &delta, &mut unchecked).is_ok()
+                && unchecked.check(&merged).is_err()
+            {
+                by_check += 1;
+            }
+        }
+        assert!(
+            accepted > 0 && refused > 0 && by_check > 0,
+            "{accepted} {refused} {by_check}"
+        );
     }
 
     /// Step 2: a `Paid` record on the minimal proof but past
@@ -6216,7 +6692,7 @@ mod listing_status_tests {
     //! harvest#70: a listing's availability, signed by the store key, the
     //! highest revision kept.
     use super::*;
-    use crate::backing::sign_with_store_key;
+    use crate::backing::{sign_with_store_key, SignedRecord};
     use crate::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
     use crate::merge_laws::{assert_laws, Rng};
     use ed25519_dalek::SigningKey;
@@ -6518,6 +6994,184 @@ mod listing_status_tests {
             states.push(state_with(picked));
         }
         assert_laws(&states, 300, &mut rng, merged, bytes);
+    }
+
+    /// A status on listing `n`, for the bound's tests: more listings than
+    /// one byte names.
+    fn status_on(key: &SigningKey, n: u16, revision: u64) -> AuthorizedListingStatus {
+        let mut id = [0u8; 32];
+        id[..2].copy_from_slice(&n.to_be_bytes());
+        let status = ListingStatus {
+            listing: ListingId(id),
+            revision,
+            availability: ListingAvailability::Withdrawn,
+        };
+        let (scoped_payload, signature) =
+            sign_with_store_key(key, crate::to_cbor(&status).unwrap()).expect("a store record");
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    }
+
+    /// Step 2: a store keeps its `MAX_LISTING_STATUSES` newest statuses,
+    /// the smaller listing first at one revision; a delta carrying more is
+    /// refused whole, and so is a state holding more, before a signature is
+    /// checked. Mutated red by dropping the cut, and by ranking it oldest
+    /// first.
+    #[test]
+    fn a_store_keeps_its_newest_statuses() {
+        let key = store_key();
+        let full: Vec<_> = (0..MAX_LISTING_STATUSES as u16)
+            .map(|n| status_on(&key, n, 10 + u64::from(n)))
+            .collect();
+        let mut state = state_with(full.clone());
+        assert_eq!(state.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        // One newer: the oldest (listing 0) goes. One at the oldest's
+        // revision on a larger listing: it goes itself.
+        let newer = status_on(&key, 9_000, 1_000_000);
+        let tied = status_on(&key, 9_001, 11);
+        state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(key.verifying_key()),
+                    listing_statuses: Some(vec![newer.clone(), tied.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let held = &state.listing_statuses.records;
+        assert_eq!(held.len(), MAX_LISTING_STATUSES);
+        assert!(held.contains_key(&newer.slot()));
+        assert!(!held.contains_key(&full[0].slot()), "the oldest is cut");
+        assert!(
+            held.contains_key(&full[1].slot()),
+            "revision 11, the smaller listing"
+        );
+        assert!(
+            !held.contains_key(&tied.slot()),
+            "revision 11, the larger listing"
+        );
+
+        let mut too_many = full.clone();
+        too_many.push(newer);
+        let why = StoreStateV1::default()
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(key.verifying_key()),
+                    listing_statuses: Some(too_many.clone()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
+
+        let mut over = state.clone();
+        let mut forged = status_on(&key, 9_002, 1);
+        forged.signature[0] ^= 1;
+        over.listing_statuses.records.insert(forged.slot(), forged);
+        let why = over.verify(&over, &params()).unwrap_err();
+        assert!(why.contains("the most it keeps"), "{why}");
+    }
+
+    /// Step 2: the bound obeys the merge laws on bytes, over sets whose
+    /// unions cross it, with slots whose revisions differ between sides (a
+    /// merge can raise a slot's rank, unlike the order cap's). At the
+    /// set's own merge, which `apply_delta` runs once every record has
+    /// verified: the statuses here are unsigned so a union can be large.
+    #[test]
+    fn the_status_bound_obeys_the_merge_laws() {
+        let unsigned = |n: u16, revision: u64| {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            AuthorizedListingStatus {
+                status: ListingStatus {
+                    listing: ListingId(id),
+                    revision,
+                    availability: ListingAvailability::SoldOut,
+                },
+                scoped_payload: vec![],
+                signature: vec![],
+            }
+        };
+        let mut rng = Rng::new(0x5_7a7);
+        let ids = (MAX_LISTING_STATUSES + MAX_LISTING_STATUSES / 2) as u16;
+        let mut sets = vec![ListingStatusesV1::default()];
+        for _ in 0..12 {
+            let mut set = ListingStatusesV1::default();
+            let picks: Vec<AuthorizedListingStatus> = (0..MAX_LISTING_STATUSES)
+                .map(|_| unsigned(rng.below(ids as usize) as u16, rng.below(40) as u64))
+                .collect();
+            set.merge_unchecked(&picks);
+            sets.push(set);
+        }
+        let merge = |a: &ListingStatusesV1, b: &ListingStatusesV1| {
+            let mut out = a.clone();
+            out.merge_unchecked(b.records.values());
+            out
+        };
+        assert_laws(&sets, 300, &mut rng, merge, |set: &ListingStatusesV1| {
+            crate::to_cbor(set).expect("encode")
+        });
+        let crossed = merge(&sets[1], &sets[2]);
+        assert_eq!(
+            crossed.records.len(),
+            MAX_LISTING_STATUSES,
+            "the unions cross the bound"
+        );
+    }
+
+    /// Step 2: a forged status the bound cuts on arrival is in no result, so
+    /// only `Unchecked::check` sees it; the node path refuses it as
+    /// `apply_delta` did. Mutated red by skipping the check.
+    #[test]
+    fn a_forged_status_the_cut_drops_is_still_refused() {
+        let key = store_key();
+        let held = state_with(
+            (0..MAX_LISTING_STATUSES as u16)
+                .map(|n| status_on(&key, n, 10 + u64::from(n)))
+                .collect(),
+        );
+        let mut forged = status_on(&key, 9_000, 1);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listing_statuses: Some(vec![forged]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged
+            .apply_update(&params(), &delta, &mut unchecked)
+            .unwrap();
+        assert_eq!(merged, held);
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params(), &delta).is_err());
+        assert!(through_apply_delta(&held, &params(), &delta).is_err());
+
+        // One for a listing the store holds a NEWER status for: it loses its
+        // slot, the slot still holds the genuine status, and the check must
+        // look at the record, not the slot. Red with the check judging by
+        // slot alone.
+        let mut stale = status_on(&key, 5, 1);
+        stale.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listing_statuses: Some(vec![stale]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged
+            .apply_update(&params(), &delta, &mut unchecked)
+            .unwrap();
+        assert_eq!(merged, held, "the held status keeps its slot");
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params(), &delta).is_err());
+        assert!(through_apply_delta(&held, &params(), &delta).is_err());
     }
 }
 
@@ -6855,16 +7509,20 @@ mod listing_cap_tests {
                 owner: Some(store_key().verifying_key()),
                 ..Default::default()
             };
-            s.apply_delta(
-                &StoreStateV1::default(),
-                &params,
-                &Some(StoreStateV1Delta {
-                    owner: Some(store_key().verifying_key()),
-                    listings: Some(range.map(|n| listing(n, i64::from(n), 0, true)).collect()),
-                    ..Default::default()
-                }),
-            )
-            .expect("applies");
+            // In deltas of at most `MAX_LISTINGS`, the most one carries.
+            let all: Vec<_> = range.map(|n| listing(n, i64::from(n), 0, true)).collect();
+            for chunk in all.chunks(MAX_LISTINGS) {
+                s.apply_delta(
+                    &StoreStateV1::default(),
+                    &params,
+                    &Some(StoreStateV1Delta {
+                        owner: Some(store_key().verifying_key()),
+                        listings: Some(chunk.to_vec()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("applies");
+            }
             s
         };
         let (a, b, c) = (state(0..300), state(200..500), state(450..560));
@@ -6893,6 +7551,62 @@ mod listing_cap_tests {
             .listings
             .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         assert!(big.verify(&StoreStateV1::default(), &params).is_err());
+    }
+
+    /// Step 2: a forged listing the cap cuts on arrival is in no result, so
+    /// only `Unchecked::check` sees it, and the node path refuses it as
+    /// `apply_delta` does; a delta of more listings than a store holds is
+    /// refused whole. Red with the check skipped, and with the count bound
+    /// dropped from `ListingsV1::admit`.
+    #[test]
+    fn a_forged_listing_the_cut_drops_is_still_refused() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let mut held = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        held.apply_delta(
+            &StoreStateV1::default(),
+            &params,
+            &Some(StoreStateV1Delta {
+                owner: Some(store_key().verifying_key()),
+                listings: Some(
+                    (0..MAX_LISTINGS as u32)
+                        .map(|n| listing(n, 100 + i64::from(n), 0, true))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .expect("applies");
+        // Older than every listing held, so the cap cuts it at once.
+        let mut forged = listing(9_000, 0, 0, true);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listings: Some(vec![forged]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged.apply_update(&params, &delta, &mut unchecked).unwrap();
+        assert_eq!(merged, held, "the cut listing changed nothing");
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params, &delta).is_err());
+        assert!(through_apply_delta(&held, &params, &delta).is_err());
+
+        let too_many = StoreStateV1Delta {
+            listings: Some(
+                (0..=MAX_LISTINGS as u32)
+                    .map(|n| listing(20_000 + n, 1_000 + i64::from(n), 0, true))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let why = held
+            .clone()
+            .apply_delta(&held, &params, &Some(too_many))
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
     }
 
     /// An open order outlives its listing: once the listing an order was
