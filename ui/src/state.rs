@@ -817,7 +817,7 @@ pub struct AppState {
     /// `crate::seller_book`).
     pub seller_books: HashMap<[u8; 32], crate::seller_book::SellerBook>,
     /// Orders this tab proved paid whose `Paid` record is past the store's
-    /// byte bound (`harvest_common::store::MAX_PAID_ORDER_BYTES`), so the
+    /// byte bound (`harvest_common::store::MAX_ORDER_BYTES`), so the
     /// store keeps them unpaid: what the seller's views show for them,
     /// rebuilt from the address claims each session.
     pub paid_past_store_bound:
@@ -8725,7 +8725,7 @@ impl AppState {
             // Past the store's byte bound for a `Paid` record (step 2): the
             // store would keep it unpaid, so it is not sent there. This tab
             // shows it paid, and the seller's own book keeps it paid.
-            if !harvest_common::store::paid_within_cap(&settled) {
+            if !harvest_common::store::within_order_cap(&settled) {
                 self.paid_past_store_bound
                     .insert(settled.order.id.clone(), settled.clone());
                 let out = self.keep_paid_past_bound(store_contract_id, settled);
@@ -27861,7 +27861,7 @@ mod buy_flow_tests {
         state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
         let settled = state.settled_orders(STORE).pop().expect("settles");
         assert!(
-            !harvest_common::store::paid_within_cap(&settled),
+            !harvest_common::store::within_order_cap(&settled),
             "past the bound"
         );
         harvest_common::payment::verify_minimal_proof(
@@ -35442,7 +35442,7 @@ mod buy_flow_tests {
         let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
         assert_eq!(upgrade.order.status, OrderStatus::Paid);
         assert!(
-            !harvest_common::store::paid_within_cap(&upgrade.order),
+            !harvest_common::store::within_order_cap(&upgrade.order),
             "past the store's bound"
         );
         state.on_kept_purchases(vec![kept(&upgrade.order)]);

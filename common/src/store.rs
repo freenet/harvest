@@ -307,6 +307,11 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
                 Err("store info at version 0 must be empty: nothing signs it".into())
             };
         }
+        if !self.within_cap() {
+            return Err(format!(
+                "store info is past {MAX_INFO_BYTES} bytes as it encodes"
+            ));
+        }
         verify_scoped_signature(
             &self.scoped_payload,
             &self.signature,
@@ -353,11 +358,28 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
 
 impl AuthorizedStoreInfoV1 {
     /// The info a merge takes from `delta`: one at a higher version than
-    /// held. A stale one is ignored.
+    /// held, within [`MAX_INFO_BYTES`]. A stale one is ignored, and so is
+    /// one past the bound (step 2): a pure function of the one record, as
+    /// `as_kept` is for orders, so the merge laws hold.
     pub(crate) fn admit<'a>(&self, delta: &'a Option<Self>) -> Option<&'a Self> {
         delta
             .as_ref()
-            .filter(|new_info| new_info.info.version > self.info.version)
+            .filter(|new_info| new_info.info.version > self.info.version && new_info.within_cap())
+    }
+
+    /// Whether this info takes at most [`MAX_INFO_BYTES`] as it encodes.
+    /// Its strings and signed payload are a floor on that, so a padded one
+    /// is judged without encoding it.
+    pub fn within_cap(&self) -> bool {
+        let info = &self.info;
+        let floor = self.scoped_payload.len()
+            + info.certificate_pem.len()
+            + info.seller_fingerprint.len()
+            + info.store_name.len()
+            + info.description.len()
+            + info.record_public_key.as_ref().map_or(0, Vec::len);
+        floor <= MAX_INFO_BYTES
+            && crate::to_cbor(self).is_ok_and(|bytes| bytes.len() <= MAX_INFO_BYTES)
     }
 
     fn check_signature(&self, owner: &VerifyingKey) -> Result<(), String> {
@@ -649,6 +671,9 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.status)
+    }
     fn rank(&self) -> u64 {
         self.status.revision
     }
@@ -667,7 +692,7 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
 /// PUT one time in three and on a one-listing delta every time, while 256
 /// listings with 500 orders fitted every run (2026-10-04 wall-time matrix).
 /// 128 leaves room for listings at the per-listing bound, and for paid
-/// records at [`MAX_PAID_ORDER_BYTES`] (see [`MAX_ORDERS`]). The seller's own
+/// records at [`MAX_ORDER_BYTES`] (see [`MAX_ORDERS`]). The seller's own
 /// delegate reads the whole store on every instant-checkout decision too,
 /// within one call's budget (`tests/delegate-budget`).
 pub const MAX_LISTINGS: usize = 128;
@@ -697,7 +722,7 @@ pub const MAX_LISTING_BYTES: usize = 32 * 1024;
 /// on a node, a store of 1,000 paid orders took 3 to 4 s to PUT and 4 to 6
 /// s for a one-listing delta against the node's 5 s limit, and every PUT of
 /// 4,096 was refused. 500 fitted every run with ordinary proofs, but a paid
-/// record may take up to [`MAX_PAID_ORDER_BYTES`] (8 KiB), and with every
+/// record may take up to [`MAX_ORDER_BYTES`] (8 KiB), and with every
 /// order at that bound and [`MAX_LISTINGS`] full at 32 KiB, 384 orders took
 /// up to 3.1 s to PUT and 4.5 s for a one-listing delta, while 256 took at
 /// most 1.8 s and 2.2 s, every run (2026-10-09 wall-time runs, step 2).
@@ -1019,10 +1044,14 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             record
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
-            if record.status == crate::payment::OrderStatus::Paid && !paid_minimally(record) {
+            let kept = match record.status {
+                crate::payment::OrderStatus::Paid => paid_minimally(record),
+                _ => within_order_cap(record),
+            };
+            if !kept {
                 return Err(format!(
-                    "order {id} is Paid on evidence that is not the minimal proof, or past \
-                     {MAX_PAID_ORDER_BYTES} bytes"
+                    "order {id} is past {MAX_ORDER_BYTES} bytes, or Paid on evidence that is \
+                     not the minimal proof"
                 ));
             }
         }
@@ -1120,7 +1149,8 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 impl OrdersV1 {
     /// The records of `incoming` a merge has to look at, each as the store
     /// keeps it: a padded `Paid` is its unpaid terms from here on
-    /// (`as_kept`). One the store already holds as it is, or that came
+    /// (`as_kept`), and unpaid terms past `MAX_ORDER_BYTES` are left out
+    /// (`kept`). One the store already holds as it is, or that came
     /// earlier in this delta, changes nothing and is left out.
     ///
     /// No honest delta carries more orders than a store holds (a whole
@@ -1138,7 +1168,7 @@ impl OrdersV1 {
             ));
         }
         let mut fresh: Vec<AuthorizedOrder> = Vec::with_capacity(incoming.len());
-        for record in incoming.iter().cloned().map(as_kept) {
+        for record in incoming.iter().cloned().filter_map(kept) {
             if self.orders.get(&record.order.id) != Some(&record) && !fresh.contains(&record) {
                 fresh.push(record);
             }
@@ -1167,51 +1197,101 @@ impl OrdersV1 {
         let held = std::mem::take(&mut self.orders);
         self.orders = held
             .into_iter()
-            .map(|(id, record)| (id, as_kept(record)))
+            .filter_map(|(id, record)| Some((id, kept(record)?)))
             .collect();
         enforce_order_cap(&mut self.orders);
     }
 }
 
 /// The most bytes a store's state, or one update to it (a delta, or a whole
-/// state to merge), may take as it encodes (step 2). The contract refuses a
-/// larger one on its length, before reading any of it: a delta anyone may
-/// send, padded with records the store would only throw away, costs no more
-/// to refuse than its length check.
+/// state to merge), may take as it encodes (step 2): [`AT_CAPS_BYTES`]. The
+/// contract refuses a larger one on its length, before reading any of it: a
+/// delta anyone may send, padded with records the store would only throw
+/// away, costs no more to refuse than its length check.
 ///
-/// Every part of a store is capped (step 2), so the largest state the caps
-/// allow is a computed figure, [`AT_CAPS_BYTES`], and this is that plus
-/// about 3%. Nothing honest is past it: the largest delta there is, a new
-/// subscriber's whole store, is the state itself. The slack is for what
-/// the contract caps by count but not by bytes, which
-/// [`AT_CAPS_REST_BYTES`] measures at what the app writes (a store's
-/// description, a backing's certificate, a status's count): an app that
-/// writes those a little larger must not find its own store refused. Much
-/// more would only be room for padding: a padded delta's cost on a node
-/// grows with its bytes, outside the contract too (the node took about
-/// 1.2 s to hand a 17 MB delta to it), which is why the earlier 16 and
-/// 12 MiB bounds were too high (the step-2 wall-time runs).
-pub const MAX_STORE_BYTES: usize = 8_600 * 1024;
+/// It must be at least the largest state the caps allow. If it were less,
+/// two valid states could merge into one `validate_state` refuses, and the
+/// replicas holding them would never converge (review round 4 of step 2).
+/// So every part of a store is capped in bytes, not only in count, and
+/// this is computed from those caps. Nothing honest is past it: the largest
+/// delta there is, a new subscriber's whole store, is the state itself. More
+/// would only be room for padding: a padded delta's cost on a node grows
+/// with its bytes, outside the contract too (the node took about 1.2 s to
+/// hand a 17 MB delta to it), which is why the earlier 16 and 12 MiB bounds
+/// were too high (the step-2 wall-time runs).
+pub const MAX_STORE_BYTES: usize = AT_CAPS_BYTES;
 
-/// What a store at every cap encodes to, at most: [`MAX_LISTINGS`] listings
-/// of [`MAX_LISTING_BYTES`], [`MAX_ORDERS`] paid orders of
-/// [`MAX_PAID_ORDER_BYTES`], and [`AT_CAPS_REST_BYTES`] for the rest.
-pub const AT_CAPS_BYTES: usize =
-    MAX_LISTINGS * MAX_LISTING_BYTES + MAX_ORDERS * MAX_PAID_ORDER_BYTES + AT_CAPS_REST_BYTES;
+/// The largest state the caps allow, as it encodes: each part at its count
+/// cap, every record at its largest (step 2). Counted part by part, an
+/// upper bound rather than a reachable state: the backings, their
+/// retirements and their wrapped copies are each counted full, though they
+/// share `MAX_BACKINGS` Ghost Keys. Built record by record, at the largest
+/// content each field can legally hold, by
+/// `at_caps_tests::a_store_at_every_cap_encodes_within_at_caps_bytes`.
+///
+/// Listings, orders and the store's details are bounded by their own byte
+/// caps. Every other record has a fixed shape, and its signed envelope must
+/// be exactly the Harvest envelope of the record
+/// (`backing::verify_exact_scoped_signature`), so its size is a function of
+/// its content; the `*_RECORD_BYTES` figures below are the largest each can
+/// take, checked by `at_caps_tests::each_kind_at_its_largest_is_within_its_bound`.
+pub const AT_CAPS_BYTES: usize = STATE_FRAME_BYTES
+    + MAX_INFO_BYTES
+    + MAX_LISTINGS * MAX_LISTING_BYTES
+    + MAX_ORDERS * (ORDER_KEY_BYTES + MAX_ORDER_BYTES)
+    + crate::backing::MAX_BACKINGS * (SLOT_KEY_BYTES + BACKING_RECORD_BYTES)
+    + crate::backing::MAX_BACKINGS * (SLOT_KEY_BYTES + RETIREMENT_RECORD_BYTES)
+    + crate::backing::MAX_BACKINGS
+        * crate::custody::MAX_SCOPES_PER_BACKER
+        * (SLOT_KEY_BYTES + COPY_RECORD_BYTES)
+    + MAX_ORDERS * (SLOT_KEY_BYTES + DESPATCH_RECORD_BYTES)
+    + MAX_LISTING_STATUSES * (SLOT_KEY_BYTES + STATUS_RECORD_BYTES)
+    + (SLOT_KEY_BYTES + CLOSURE_RECORD_BYTES)
+    + (SLOT_KEY_BYTES + PAUSE_RECORD_BYTES);
 
-/// A store's parts besides its listings and orders, at every cap: 2,143,269
-/// bytes, measured part by part on `tests/contract-budget`'s at-caps store
-/// (which fails if that store encodes past [`AT_CAPS_BYTES`]). That is a despatch for each order
-/// (156 KB), [`MAX_LISTING_STATUSES`] statuses (299 KB), `MAX_BACKINGS`
-/// backings with 4 KiB certificates (1,394 KB) and four wrapped copies each
-/// (229 KB, more than a retirement), and the store's details with a 16 KiB
-/// description (65 KB).
-pub const AT_CAPS_REST_BYTES: usize = 2_150 * 1024;
+/// The state's own frame: its field names, each part's wrapper, and the
+/// length headers of its maps and arrays.
+const STATE_FRAME_BYTES: usize = 1024;
+/// An order's key in the order map: an [`OrderId`], 32 integers.
+const ORDER_KEY_BYTES: usize = 2 + 32 * 2;
+/// A signed-set record's slot key: a [`Bytes32`], one byte string.
+const SLOT_KEY_BYTES: usize = 2 + 32;
+/// The largest of each fixed-shape record, as it encodes.
+const BACKING_RECORD_BYTES: usize = 21_794;
+const RETIREMENT_RECORD_BYTES: usize = 322;
+const COPY_RECORD_BYTES: usize = 886;
+const DESPATCH_RECORD_BYTES: usize = 600;
+const STATUS_RECORD_BYTES: usize = 589;
+const CLOSURE_RECORD_BYTES: usize = 316;
+const PAUSE_RECORD_BYTES: usize = 468;
 
-const _: () = assert!(MAX_STORE_BYTES >= AT_CAPS_BYTES + AT_CAPS_BYTES / 32);
+/// The longest store name the app publishes, in bytes (step 2): the store
+/// details form refuses a longer one, so the largest details the app writes
+/// stay within [`MAX_INFO_BYTES`].
+pub const MAX_STORE_NAME_BYTES: usize = 200;
 
-/// The most bytes a `Paid` record may take, as it encodes, for the store to
-/// keep it as paid (step 2): see [`as_kept`].
+/// The longest store description the app publishes, in bytes (step 2): the
+/// details form refuses a longer one, and the UI's markdown renderer shows
+/// no more (its `MAX_SOURCE_BYTES` is this).
+pub const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+
+/// The most bytes a store's details ([`AuthorizedStoreInfoV1`]) may take as
+/// they encode (step 2): one past it is not taken by a merge, and `verify`
+/// refuses a state holding one. Above the largest the app writes, a
+/// [`MAX_DESCRIPTION_BYTES`] description with a 4 KiB certificate and a
+/// [`MAX_STORE_NAME_BYTES`] name, which encodes to about 65 KB:
+/// the description is in it twice, once as text and once inside the signed
+/// payload as an array of integers
+/// (`the_largest_honest_store_info_is_within_the_bound`).
+pub const MAX_INFO_BYTES: usize = 72 * 1024;
+
+/// The most bytes an order record may take, as it encodes (step 2): a
+/// `Paid` record past it is kept as its unpaid terms ([`as_kept`]), and so is
+/// any other record carrying a status; unpaid terms past it are not kept at
+/// all, and `verify` refuses a state holding one. Every order the store
+/// holds is within it, which is what lets [`AT_CAPS_BYTES`] count orders as
+/// `MAX_ORDERS` of these. Honest unpaid terms are far smaller
+/// (`the_largest_honest_unpaid_order_is_within_the_bound`).
 ///
 /// A minimal proof carries only the claims a payment needs, but each claim
 /// carries its whole transaction, so a minimal proof is still as large as
@@ -1226,14 +1306,17 @@ const _: () = assert!(MAX_STORE_BYTES >= AT_CAPS_BYTES + AT_CAPS_BYTES / 32);
 /// batched withdrawal straight to an order's address is a legitimate payment
 /// whose transaction can pass it; the store then keeps the order unpaid and
 /// the seller's and buyer's own copies hold it as paid.
-pub const MAX_PAID_ORDER_BYTES: usize = 8 * 1024;
+pub const MAX_ORDER_BYTES: usize = 8 * 1024;
 
 /// A record as the store keeps it (step 2): a `Paid` record whose payment
 /// proof is not the canonical minimal one
 /// ([`crate::payment::verify_minimal_proof`], the proof a complaint must
-/// carry), or that takes more than [`MAX_PAID_ORDER_BYTES`] as it encodes,
-/// is kept as its unpaid terms, the seller-signed order anyone could
-/// publish; every other record as it is.
+/// carry), or any record with a status that takes more than
+/// [`MAX_ORDER_BYTES`] as it encodes (a `PaymentReversed` padded with copies
+/// of its claims, a cancel padded by the buyer who signs it), is kept as its
+/// unpaid terms, the seller-signed order anyone could publish; every other
+/// record as it is. Unpaid terms past the bound are then not kept at all
+/// ([`kept`]).
 ///
 /// # Why
 ///
@@ -1255,7 +1338,12 @@ pub const MAX_PAID_ORDER_BYTES: usize = 8 * 1024;
 /// retraction, which no minimal proof can (and nothing produces one yet).
 pub fn as_kept(record: AuthorizedOrder) -> AuthorizedOrder {
     use crate::payment::OrderStatus;
-    if record.status != OrderStatus::Paid || paid_minimally(&record) {
+    let keeps_status = match record.status {
+        OrderStatus::AwaitingPayment => true,
+        OrderStatus::Paid => paid_minimally(&record),
+        OrderStatus::PaymentReversed | OrderStatus::Cancelled => within_order_cap(&record),
+    };
+    if keeps_status {
         return record;
     }
     AuthorizedOrder {
@@ -1267,28 +1355,37 @@ pub fn as_kept(record: AuthorizedOrder) -> AuthorizedOrder {
     }
 }
 
+/// [`as_kept`], and `None` for unpaid terms past [`MAX_ORDER_BYTES`], which
+/// the store does not keep: a pure function of the one record, so dropping it
+/// keeps the merge laws as `as_kept` does.
+pub fn kept(record: AuthorizedOrder) -> Option<AuthorizedOrder> {
+    Some(as_kept(record)).filter(within_order_cap)
+}
+
 /// Whether a `Paid` record is one the store keeps as paid: the canonical
-/// minimal proof, within [`MAX_PAID_ORDER_BYTES`].
+/// minimal proof, within [`MAX_ORDER_BYTES`].
 fn paid_minimally(record: &AuthorizedOrder) -> bool {
-    paid_within_cap(record)
+    within_order_cap(record)
         && record
             .payment_proof
             .as_ref()
             .is_some_and(|proof| crate::payment::verify_minimal_proof(&record.order, proof).is_ok())
 }
 
-/// Whether a record takes at most [`MAX_PAID_ORDER_BYTES`] as it encodes.
+/// Whether a record takes at most [`MAX_ORDER_BYTES`] as it encodes.
 ///
-/// A proof's signed bodies and signatures alone are a floor on the record's
-/// size (each of their bytes takes at least one as it encodes), so a record
-/// whose proof is past the bound by that count is judged without encoding it:
-/// a padded record anyone may send costs nothing more to throw away than
-/// reading it did.
-pub fn paid_within_cap(record: &AuthorizedOrder) -> bool {
-    if proof_bytes_at_least(record) > MAX_PAID_ORDER_BYTES {
+/// A proof's signed bodies and signatures, and the record's own signed
+/// payloads, are a floor on the record's size (each of their bytes takes at
+/// least one as it encodes), so a record past the bound by that count is
+/// judged without encoding it: a padded record anyone may send costs nothing
+/// more to throw away than reading it did.
+pub fn within_order_cap(record: &AuthorizedOrder) -> bool {
+    let payloads =
+        record.scoped_payload.len() + record.status_scoped_payload.as_ref().map_or(0, Vec::len);
+    if proof_bytes_at_least(record).saturating_add(payloads) > MAX_ORDER_BYTES {
         return false;
     }
-    crate::to_cbor(record).is_ok_and(|bytes| bytes.len() <= MAX_PAID_ORDER_BYTES)
+    crate::to_cbor(record).is_ok_and(|bytes| bytes.len() <= MAX_ORDER_BYTES)
 }
 
 /// A floor on the bytes `record`'s payment proof takes as it encodes: the
@@ -1991,6 +2088,28 @@ impl StoreStateV1 {
         }
     }
 
+    /// Drop what an earlier generation kept that this one's byte bounds
+    /// refuse (step 2): a signed record whose envelope is not exactly the
+    /// Harvest envelope of the record (`SignedSetV1::drop_inexact`), and
+    /// store details past [`MAX_INFO_BYTES`], which become "no details
+    /// published" until the seller publishes again. (Orders past
+    /// [`MAX_ORDER_BYTES`] and listings past [`MAX_LISTING_BYTES`] are their
+    /// own parts' `normalize`.) For a migration fold, on each side before the
+    /// merge: each record is dropped, never the state, so one such record
+    /// does not discard everything an earlier generation held beside it.
+    pub fn drop_unbounded(&mut self) {
+        self.backings.drop_inexact();
+        self.retirements.drop_inexact();
+        self.closed.drop_inexact();
+        self.copies.drop_inexact();
+        self.fulfilment.drop_inexact();
+        self.listing_statuses.drop_inexact();
+        self.pause.drop_inexact();
+        if !self.info.within_cap() {
+            self.info = Default::default();
+        }
+    }
+
     /// The whole state as this generation keeps it, for a state an earlier
     /// generation wrote that a migration fold carries forward: the listings
     /// sorted and capped, the orders as kept and capped, the listing
@@ -2651,7 +2770,7 @@ mod order_tests {
         )
     }
 
-    /// Step 2: what `MAX_PAID_ORDER_BYTES` admits of honest payments. The
+    /// Step 2: what `MAX_ORDER_BYTES` admits of honest payments. The
     /// minimal `Paid` record for a payment whose transaction has 1, 2, 5,
     /// 10 or 20 inputs (two outputs, a 12-deep Merkle branch: a block of a
     /// few thousand transactions), segwit (the witness is not part of the
@@ -2675,22 +2794,22 @@ mod order_tests {
             crate::payment::verify_payment_proof(&order, record.payment_proof.as_ref().unwrap())
                 .expect("a genuine proof");
             let len = crate::to_cbor(&record).unwrap().len();
-            // The floor `paid_within_cap` judges by first never passes the
+            // The floor `within_order_cap` judges by first never passes the
             // record's real size, or an honest record would be stripped
             // without being measured.
             assert!(super::proof_bytes_at_least(&record) <= len);
-            assert_eq!(paid_within_cap(&record), len <= MAX_PAID_ORDER_BYTES);
+            assert_eq!(within_order_cap(&record), len <= MAX_ORDER_BYTES);
             len
         };
         for inputs in [1usize, 2, 5, 10, 20] {
             eprintln!(
-                "PAID-SIZE inputs {inputs}: segwit {} bytes, legacy {} bytes (bound {MAX_PAID_ORDER_BYTES})",
+                "PAID-SIZE inputs {inputs}: segwit {} bytes, legacy {} bytes (bound {MAX_ORDER_BYTES})",
                 size(inputs, 0),
                 size(inputs, 107)
             );
         }
-        assert!(size(20, 0) <= MAX_PAID_ORDER_BYTES);
-        assert!(size(9, 107) <= MAX_PAID_ORDER_BYTES);
+        assert!(size(20, 0) <= MAX_ORDER_BYTES);
+        assert!(size(9, 107) <= MAX_ORDER_BYTES);
     }
 
     /// Review round 4 of step 2 (codex, code-first): copies of a record
@@ -2942,7 +3061,7 @@ mod order_tests {
     }
 
     /// Step 2: a `Paid` record on the minimal proof but past
-    /// `MAX_PAID_ORDER_BYTES` is kept as its unpaid terms, and a state
+    /// `MAX_ORDER_BYTES` is kept as its unpaid terms, and a state
     /// holding one does not verify; one just under it is kept paid. Mutated
     /// red by dropping the byte bound.
     #[test]
@@ -2955,11 +3074,7 @@ mod order_tests {
             &seller,
             order.clone(),
             OrderStatus::Paid,
-            Some(make_big_payment_proof(
-                &order,
-                &bridge,
-                MAX_PAID_ORDER_BYTES,
-            )),
+            Some(make_big_payment_proof(&order, &bridge, MAX_ORDER_BYTES)),
         );
         let small = make_authorized_order(
             &seller,
@@ -2972,14 +3087,14 @@ mod order_tests {
                 // in the record: an integer array inside the bridge's
                 // signed body, itself an integer array (freenet-bitcoin's
                 // encoding).
-                MAX_PAID_ORDER_BYTES / 8,
+                MAX_ORDER_BYTES / 8,
             )),
         );
         let proof = big.payment_proof.as_ref().unwrap();
         crate::payment::verify_minimal_proof(&order, proof).expect("still the minimal proof");
         crate::payment::verify_payment_proof(&order, proof).expect("a genuine proof");
-        assert!(crate::to_cbor(&big).unwrap().len() > MAX_PAID_ORDER_BYTES);
-        assert!(crate::to_cbor(&small).unwrap().len() <= MAX_PAID_ORDER_BYTES);
+        assert!(crate::to_cbor(&big).unwrap().len() > MAX_ORDER_BYTES);
+        assert!(crate::to_cbor(&small).unwrap().len() <= MAX_ORDER_BYTES);
         assert_eq!(as_kept(big.clone()).status, OrderStatus::AwaitingPayment);
         assert_eq!(as_kept(small.clone()), small);
         assert!(orders_of([(order.id.clone(), big)])
@@ -5027,11 +5142,7 @@ mod order_tests {
                 &seller,
                 order.clone(),
                 OrderStatus::Paid,
-                Some(make_big_payment_proof(
-                    &order,
-                    &bridge,
-                    MAX_PAID_ORDER_BYTES,
-                )),
+                Some(make_big_payment_proof(&order, &bridge, MAX_ORDER_BYTES)),
             ));
         }
         let merge = |a: &OrdersV1, b: &OrdersV1| {
@@ -7936,5 +8047,790 @@ mod byte_string_encoding_tests {
             &decoded,
             &crate::to_cbor(&decoded).unwrap()
         ));
+    }
+}
+
+#[cfg(test)]
+mod at_caps_tests {
+    //! Step 2: [`AT_CAPS_BYTES`] is an upper bound on every state the caps
+    //! allow, built record by record at the largest content each field can
+    //! legally hold, NOT from a fixture of what the app writes.
+    //!
+    //! Every byte array a record carries as integers is filled with values
+    //! of 24 or more, which take two bytes each where smaller ones take one;
+    //! every integer is at its type's maximum; every `Option` is `Some`;
+    //! every enum is at its longest variant; every signed envelope is the
+    //! longest the store accepts (`backing::is_exact_harvest_envelope`'s
+    //! webapp ids). Records whose bytes are capped (listings, orders, the
+    //! store's details) are padded to exactly their cap. Signatures are 64
+    //! bytes as every one must be; whether they verify does not change a
+    //! record's size, so these are not signed.
+    use super::*;
+    use crate::backing::{
+        AuthorizedBacking, AuthorizedClosure, AuthorizedRetirement, BackingStatement, Retirement,
+        StoreClosure, MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
+    };
+    use crate::custody::{
+        AuthorizedCopy, StoreKeyCopy, WrapScope, WrappedStoreKey, MAX_SCOPES_PER_BACKER, SCHEME_V1,
+    };
+    use crate::fulfilment::{AuthorizedDespatch, Despatch};
+    use crate::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    use crate::payment::OrderId;
+    use crate::store_pause::{AuthorizedStorePause, StorePause};
+    use ed25519_dalek::SigningKey;
+    use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
+
+    /// 32 bytes, each of 24 or more (two bytes each as a CBOR integer),
+    /// distinct for distinct `n`.
+    fn wide(n: u32) -> [u8; 32] {
+        let mut bytes = [0xffu8; 32];
+        for (i, b) in n.to_be_bytes().iter().enumerate() {
+            // 24 + a base-200 digit: always 24 or more, and one-to-one.
+            bytes[i * 2] = 24 + (b % 200);
+            bytes[i * 2 + 1] = 24 + (b / 200);
+        }
+        bytes
+    }
+
+    /// The `n`th key whose 32 bytes are each 24 or more, so that it takes
+    /// the most bytes inside an envelope, where the signed payload is an
+    /// array of integers. About one key in 23 is.
+    fn key(n: u32) -> ed25519_dalek::VerifyingKey {
+        static KEYS: std::sync::OnceLock<Vec<ed25519_dalek::VerifyingKey>> =
+            std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            (0u32..)
+                .map(|i| {
+                    let mut seed = [0x5au8; 32];
+                    seed[..4].copy_from_slice(&i.to_le_bytes());
+                    SigningKey::from_bytes(&seed).verifying_key()
+                })
+                .filter(|k| k.as_bytes().iter().all(|b| *b >= 24))
+                .take(MAX_BACKINGS + 1)
+                .collect()
+        })[n as usize]
+    }
+
+    /// The longest envelope the store accepts around `data`.
+    fn envelope<T: Serialize>(data: &T) -> Vec<u8> {
+        let payload = crate::to_cbor(data).unwrap();
+        std::iter::once(crate::HARVEST_WEBAPP_CONTRACT_ID)
+            .chain(crate::LEGACY_HARVEST_WEBAPP_CONTRACT_IDS.iter().copied())
+            .map(|id| crate::backing::envelope_with_requestor(id, payload.clone()).unwrap())
+            .max_by_key(Vec::len)
+            .unwrap()
+    }
+
+    fn anchor() -> BlockAnchor {
+        BlockAnchor {
+            height: u32::MAX,
+            hash: BlockHash([0xff; 32]),
+        }
+    }
+
+    /// The longest network name.
+    const NETWORK: BitcoinNetwork = BitcoinNetwork::Testnet4;
+
+    fn status(n: u32) -> AuthorizedListingStatus {
+        let status = ListingStatus {
+            listing: ListingId(wide(n)),
+            revision: u64::MAX,
+            availability: ListingAvailability::Available {
+                quantity: Some(u32::MAX),
+            },
+        };
+        AuthorizedListingStatus {
+            scoped_payload: envelope(&status),
+            signature: vec![0xff; 64],
+            status,
+        }
+    }
+
+    fn pause(owner: ed25519_dalek::VerifyingKey) -> AuthorizedStorePause {
+        let mut pause = StorePause::new(owner, u64::MAX, true);
+        pause.revision = u64::MAX;
+        AuthorizedStorePause {
+            scoped_payload: envelope(&pause),
+            signature: vec![0xff; 64],
+            pause,
+        }
+    }
+
+    fn closure(owner: ed25519_dalek::VerifyingKey) -> AuthorizedClosure {
+        let closure = StoreClosure { store: owner };
+        AuthorizedClosure {
+            scoped_payload: envelope(&closure),
+            signature: vec![0xff; 64],
+            closure,
+        }
+    }
+
+    fn retirement(n: u32) -> AuthorizedRetirement {
+        let retirement = Retirement { backer: key(n) };
+        AuthorizedRetirement {
+            scoped_payload: envelope(&retirement),
+            signature: vec![0xff; 64],
+            retirement,
+        }
+    }
+
+    fn despatch(n: u32) -> AuthorizedDespatch {
+        let despatch = Despatch {
+            order_id: OrderId(wide(n)),
+            anchor: anchor(),
+        };
+        AuthorizedDespatch {
+            scoped_payload: envelope(&despatch),
+            signature: vec![0xff; 64],
+            despatch,
+        }
+    }
+
+    fn copy(owner: ed25519_dalek::VerifyingKey, backer: u32, scope: u32) -> AuthorizedCopy {
+        let copy = StoreKeyCopy {
+            store: owner,
+            backer: key(backer),
+            scope: WrapScope(wide(scope)),
+            wrapped: WrappedStoreKey {
+                scheme: SCHEME_V1,
+                ciphertext: vec![0xff; crate::custody::WRAPPED_LEN_V1],
+            },
+        };
+        AuthorizedCopy {
+            scoped_payload: envelope(&copy),
+            signature: vec![0xff; 64],
+            copy,
+        }
+    }
+
+    fn backing(owner: ed25519_dalek::VerifyingKey, n: u32) -> AuthorizedBacking {
+        let statement = BackingStatement {
+            store: owner,
+            backer: key(n),
+            // Every byte two as an integer inside the envelopes.
+            certificate_pem: "z".repeat(MAX_CERTIFICATE_PEM_BYTES),
+            network: NETWORK,
+            block: anchor(),
+        };
+        AuthorizedBacking {
+            backer_scoped_payload: envelope(&statement),
+            backer_signature: vec![0xff; 64],
+            acceptance_scoped_payload: envelope(&crate::backing::BackingAcceptance {
+                backing: statement.clone(),
+            }),
+            acceptance_signature: vec![0xff; 64],
+            statement,
+        }
+    }
+
+    /// `record` with `pad` grown until it encodes to as close under `cap`
+    /// as a byte string's length header allows.
+    fn padded_to<T: Serialize + Clone>(record: &T, cap: usize, pad: impl Fn(&mut T, usize)) -> T {
+        let mut n = cap.saturating_sub(crate::to_cbor(record).unwrap().len());
+        loop {
+            let mut grown = record.clone();
+            pad(&mut grown, n);
+            if crate::to_cbor(&grown).unwrap().len() <= cap {
+                return grown;
+            }
+            n -= 1;
+        }
+    }
+
+    fn listing(n: u32) -> AuthorizedListing {
+        let listing = crate::listing::Listing {
+            images: Vec::new(),
+            checkout: None,
+            choices: Vec::new(),
+            id: ListingId(wide(n)),
+            title: "t".into(),
+            description: String::new(),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        let record = AuthorizedListing {
+            listing,
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+            certificate_pem: String::new(),
+        };
+        padded_to(&record, MAX_LISTING_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    fn order(n: u32) -> AuthorizedOrder {
+        let mut order = crate::test_orders::order(0);
+        order.id = OrderId(wide(n));
+        let record = AuthorizedOrder {
+            order,
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+            status: crate::payment::OrderStatus::Cancelled,
+            payment_proof: None,
+            status_scoped_payload: Some(Vec::new()),
+            status_signature: Some(vec![0xff; 64]),
+        };
+        padded_to(&record, MAX_ORDER_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    fn info() -> AuthorizedStoreInfoV1 {
+        let record = AuthorizedStoreInfoV1 {
+            info: StoreInfoV1 {
+                version: u32::MAX,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0xff; 32],
+                store_name: String::new(),
+                description: String::new(),
+                encryption_public_key: Some([0xff; 32]),
+                record_public_key: None,
+            },
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+        };
+        padded_to(&record, MAX_INFO_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    /// Each fixed-shape record at its largest is within the figure
+    /// `AT_CAPS_BYTES` counts it at. Red with any of those figures lowered
+    /// past the record.
+    #[test]
+    fn each_kind_at_its_largest_is_within_its_bound() {
+        let owner = key(0);
+        let len = |bytes: Result<Vec<u8>, String>| bytes.unwrap().len();
+        for (what, bytes, bound) in [
+            (
+                "backing",
+                len(crate::to_cbor(&backing(owner, 1))),
+                BACKING_RECORD_BYTES,
+            ),
+            (
+                "retirement",
+                len(crate::to_cbor(&retirement(1))),
+                RETIREMENT_RECORD_BYTES,
+            ),
+            (
+                "wrapped copy",
+                len(crate::to_cbor(&copy(owner, 1, 1))),
+                COPY_RECORD_BYTES,
+            ),
+            (
+                "despatch",
+                len(crate::to_cbor(&despatch(1))),
+                DESPATCH_RECORD_BYTES,
+            ),
+            (
+                "listing status",
+                len(crate::to_cbor(&status(1))),
+                STATUS_RECORD_BYTES,
+            ),
+            (
+                "closure",
+                len(crate::to_cbor(&closure(owner))),
+                CLOSURE_RECORD_BYTES,
+            ),
+            (
+                "pause",
+                len(crate::to_cbor(&pause(owner))),
+                PAUSE_RECORD_BYTES,
+            ),
+            (
+                "an order key",
+                len(crate::to_cbor(&OrderId(wide(1)))),
+                ORDER_KEY_BYTES,
+            ),
+            (
+                "a slot key",
+                len(crate::to_cbor(&Bytes32(wide(1)))),
+                SLOT_KEY_BYTES,
+            ),
+        ] {
+            println!("{what}: {bytes} bytes, counted at {bound}");
+            assert!(bytes <= bound, "{what}: {bytes} bytes, counted at {bound}");
+        }
+    }
+
+    /// A store with every part at its count cap and every record at its
+    /// largest encodes within `AT_CAPS_BYTES`, and so within
+    /// `MAX_STORE_BYTES`. Red with any part's figure in `AT_CAPS_BYTES`
+    /// lowered by more than the slack the others leave.
+    #[test]
+    fn a_store_at_every_cap_encodes_within_at_caps_bytes() {
+        let owner = key(0);
+        let mut state = StoreStateV1 {
+            owner: Some(owner),
+            info: info(),
+            ..Default::default()
+        };
+        state.listings.listings = (0..MAX_LISTINGS as u32).map(listing).collect();
+        state.orders.orders = (0..MAX_ORDERS as u32)
+            .map(|n| (OrderId(wide(n)), order(n)))
+            .collect();
+        for n in 0..MAX_BACKINGS as u32 {
+            let b = backing(owner, n + 1);
+            state
+                .backings
+                .records
+                .insert(Bytes32(key(n + 1).to_bytes()), b);
+            let r = retirement(n + 1);
+            state
+                .retirements
+                .records
+                .insert(Bytes32(key(n + 1).to_bytes()), r);
+            for scope in 0..MAX_SCOPES_PER_BACKER as u32 {
+                let c = copy(owner, n + 1, scope);
+                use crate::backing::SignedRecord;
+                state.copies.records.insert(c.slot(), c);
+            }
+        }
+        for n in 0..MAX_ORDERS as u32 {
+            state
+                .fulfilment
+                .records
+                .insert(Bytes32(wide(n)), despatch(n));
+        }
+        for n in 0..MAX_LISTING_STATUSES as u32 {
+            state
+                .listing_statuses
+                .records
+                .insert(Bytes32(wide(n)), status(n));
+        }
+        state
+            .closed
+            .records
+            .insert(Bytes32(owner.to_bytes()), closure(owner));
+        state
+            .pause
+            .records
+            .insert(Bytes32(owner.to_bytes()), pause(owner));
+
+        // Every part of the state is filled above. Naming them all here
+        // means a part added later fails to compile until it is counted.
+        let StoreStateV1 {
+            owner: _,
+            info: _,
+            listings: _,
+            orders: _,
+            backings: _,
+            retirements: _,
+            closed: _,
+            copies: _,
+            fulfilment: _,
+            listing_statuses: _,
+            pause: _,
+        } = &state;
+        assert_eq!(
+            state.copies.records.len(),
+            MAX_BACKINGS * MAX_SCOPES_PER_BACKER
+        );
+        assert_eq!(state.orders.orders.len(), MAX_ORDERS);
+        assert_eq!(state.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        let bytes = crate::to_cbor(&state).unwrap().len();
+        println!("a store at every cap: {bytes} bytes; AT_CAPS_BYTES {AT_CAPS_BYTES}");
+        assert!(bytes <= AT_CAPS_BYTES, "{bytes} > {AT_CAPS_BYTES}");
+        assert!(MAX_STORE_BYTES >= AT_CAPS_BYTES);
+    }
+
+    /// The largest unpaid order the app writes, cancelled (its terms and a
+    /// status envelope), is within `MAX_ORDER_BYTES`. An order's terms carry
+    /// no text a buyer types: the address and note go to the seller's
+    /// delegate encrypted, never into the store. What varies is the
+    /// fingerprints (base58 of 32 bytes, at most 44 characters), the payment
+    /// address and script (here at the longest bech32 allows, 90 characters
+    /// and a 42-byte witness program), and the bridges the app trusts (one).
+    /// Everything else at its largest. A `Paid` record's room for its proof
+    /// is `the_paid_byte_bound_admits_ordinary_payments`.
+    #[test]
+    fn the_largest_honest_unpaid_order_is_within_the_bound() {
+        use crate::payment::{Order, OrderStatus};
+        use crate::test_orders::{sign_scoped, store_key};
+        let order = Order {
+            request_id: Some([0xff; 32]),
+            id: OrderId([0u8; 32]),
+            buyer_fingerprint: "z".repeat(44),
+            seller_fingerprint: "z".repeat(44),
+            amount_sats: u64::MAX,
+            network: NETWORK,
+            payment_script_pubkey: vec![0xff; 42],
+            payment_hash: Some([0xff; 32]),
+            payment_address: "z".repeat(90),
+            required_confirmations: u32::MAX,
+            trusted_bridges: vec![freenet_bitcoin_common::BridgeId([0xff; 32])],
+            bitcoin_address_code_hash: Some([0xff; 32]),
+            anchor: Some(anchor()),
+            order_binding: Some([0xff; 32]),
+            listing_tag: Some([0xff; 32]),
+            buyer_receipt_key: Some([0xff; 32]),
+            created_at: chrono::DateTime::from_timestamp(4_000_000_000, 999_999_999).unwrap(),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &order);
+        let (status_scoped, status_signature) =
+            sign_scoped(&store_key(), &(order.id.clone(), OrderStatus::Cancelled));
+        let record = AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::Cancelled,
+            payment_proof: None,
+            status_scoped_payload: Some(status_scoped),
+            status_signature: Some(status_signature),
+        };
+        let bytes = crate::to_cbor(&record).unwrap().len();
+        println!("the largest honest unpaid order: {bytes} bytes of {MAX_ORDER_BYTES}");
+        assert!(bytes <= MAX_ORDER_BYTES / 2, "{bytes}");
+        assert_eq!(kept(record.clone()), Some(record));
+    }
+
+    /// The largest store details the app writes are within
+    /// `MAX_INFO_BYTES`: a `MAX_STORE_NAME_BYTES` name and a
+    /// `MAX_DESCRIPTION_BYTES` description (the details form refuses longer,
+    /// `my_store::details_too_long`), the Ghost Key certificate at the most a
+    /// backing may carry, and a legacy record key (an RSA-2048 public key,
+    /// 270 bytes). Text is in it twice, once as text and once, two bytes a
+    /// character, inside the signed payload.
+    #[test]
+    fn the_largest_honest_store_info_is_within_the_bound() {
+        use crate::test_orders::{sign_scoped, store_key};
+        let info = StoreInfoV1 {
+            version: u32::MAX,
+            certificate_pem: "z".repeat(MAX_CERTIFICATE_PEM_BYTES),
+            seller_fingerprint: "z".repeat(44),
+            reputation_contract_id: [0xff; 32],
+            store_name: "z".repeat(MAX_STORE_NAME_BYTES),
+            description: "z".repeat(MAX_DESCRIPTION_BYTES),
+            encryption_public_key: Some([0xff; 32]),
+            record_public_key: Some(vec![0xff; 270]),
+        };
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &info);
+        let record = AuthorizedStoreInfoV1 {
+            info,
+            scoped_payload,
+            signature,
+        };
+        let bytes = crate::to_cbor(&record).unwrap().len();
+        println!("the largest honest store details: {bytes} bytes of {MAX_INFO_BYTES}");
+        assert!(record.within_cap(), "{bytes}");
+    }
+
+    /// Every fixed-shape record a store holds is refused when its signed
+    /// envelope carries a byte more than the exact Harvest envelope of the
+    /// record, though the signature over it is genuine; the exact one
+    /// verifies. One record of each kind, each through the producer the app
+    /// uses (`sign_with_store_key`; for a backing's Ghost Key half, the same
+    /// envelope the vault builds). Red with any one kind's check back to
+    /// `verify_scoped_signature`.
+    #[test]
+    fn a_padded_envelope_is_refused_for_every_fixed_shape_record() {
+        use crate::backing::{sign_with_store_key, store_key_envelope, BackingAcceptance};
+        use ed25519_dalek::Signer;
+        let owner_key = crate::test_orders::store_key();
+        let owner = owner_key.verifying_key();
+        let backer_key = SigningKey::from_bytes(&[0x33; 32]);
+        let sign =
+            |data: &dyn erased::Encode| sign_with_store_key(&owner_key, data.cbor()).unwrap();
+        let pad = |key: &SigningKey, scoped: &[u8]| {
+            let mut padded = scoped.to_vec();
+            padded.push(0);
+            let signature = key.sign(&padded).to_bytes().to_vec();
+            (padded, signature)
+        };
+        let mut checked = 0;
+        let mut check = |what: &str, exact: Result<(), String>, padded: Result<(), String>| {
+            exact.unwrap_or_else(|e| panic!("{what}: the exact envelope is refused: {e}"));
+            let why = padded.expect_err(what);
+            assert!(why.contains("exactly"), "{what}: {why}");
+            checked += 1;
+        };
+
+        let status = ListingStatus {
+            listing: ListingId([7; 32]),
+            revision: 3,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (scoped_payload, signature) = sign(&status);
+        let record = AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedListingStatus {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check(
+            "listing status",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+
+        let pause = StorePause::new(owner, 5, true);
+        let (scoped_payload, signature) = sign(&pause);
+        let record = AuthorizedStorePause {
+            pause,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedStorePause {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("pause", record.verify(&owner), padded.verify(&owner));
+
+        let closure = StoreClosure { store: owner };
+        let (scoped_payload, signature) = sign(&closure);
+        let record = AuthorizedClosure {
+            closure,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedClosure {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("closure", record.verify(&owner), padded.verify(&owner));
+
+        let retirement = Retirement {
+            backer: backer_key.verifying_key(),
+        };
+        let (scoped_payload, signature) = sign(&retirement);
+        let record = AuthorizedRetirement {
+            retirement,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedRetirement {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("retirement", record.verify(&owner), padded.verify(&owner));
+
+        let despatch = Despatch {
+            order_id: OrderId([9; 32]),
+            anchor: anchor(),
+        };
+        let (scoped_payload, signature) = sign(&despatch);
+        let record = AuthorizedDespatch {
+            despatch,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedDespatch {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("despatch", record.verify(&owner), padded.verify(&owner));
+
+        let copy = StoreKeyCopy {
+            store: owner,
+            backer: backer_key.verifying_key(),
+            scope: WrapScope([4; 32]),
+            wrapped: WrappedStoreKey {
+                scheme: SCHEME_V1,
+                ciphertext: vec![5; crate::custody::WRAPPED_LEN_V1],
+            },
+        };
+        let (scoped_payload, signature) = sign(&copy);
+        let record = AuthorizedCopy {
+            copy,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedCopy {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("wrapped copy", record.verify(&owner), padded.verify(&owner));
+
+        let statement = BackingStatement {
+            store: owner,
+            backer: backer_key.verifying_key(),
+            certificate_pem: "cert".into(),
+            network: BitcoinNetwork::Signet,
+            block: anchor(),
+        };
+        let backer_scoped = store_key_envelope(crate::to_cbor(&statement).unwrap()).unwrap();
+        let backer_signature = backer_key.sign(&backer_scoped).to_bytes().to_vec();
+        let (acceptance_scoped, acceptance_signature) = sign(&BackingAcceptance {
+            backing: statement.clone(),
+        });
+        let record = AuthorizedBacking {
+            statement,
+            backer_scoped_payload: backer_scoped,
+            backer_signature,
+            acceptance_scoped_payload: acceptance_scoped,
+            acceptance_signature,
+        };
+        let (scoped, signature) = pad(&backer_key, &record.backer_scoped_payload);
+        let padded = AuthorizedBacking {
+            backer_scoped_payload: scoped,
+            backer_signature: signature,
+            ..record.clone()
+        };
+        check(
+            "backing (the Ghost Key's half)",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+        let (scoped, signature) = pad(&owner_key, &record.acceptance_scoped_payload);
+        let padded = AuthorizedBacking {
+            acceptance_scoped_payload: scoped,
+            acceptance_signature: signature,
+            ..record.clone()
+        };
+        check(
+            "backing (the store key's half)",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+        assert_eq!(checked, 8);
+    }
+
+    /// `sign_with_store_key` takes a record's CBOR; this lets one closure
+    /// sign records of every type.
+    mod erased {
+        pub trait Encode {
+            fn cbor(&self) -> Vec<u8>;
+        }
+        impl<T: serde::Serialize> Encode for T {
+            fn cbor(&self) -> Vec<u8> {
+                crate::to_cbor(self).unwrap()
+            }
+        }
+    }
+
+    /// Step 2: every order record is within `MAX_ORDER_BYTES`. A cancel the
+    /// buyer padded past it is kept as the order's unpaid terms, and so is a
+    /// reversal padded with copies of its claims; unpaid terms past it are
+    /// not kept at all, and a state holding any record past it does not
+    /// verify. Red with the cap applied to `Paid` only, as it was.
+    #[test]
+    fn every_order_record_is_held_to_the_byte_bound() {
+        use crate::payment::OrderStatus;
+        use crate::test_orders::{order, sign_scoped, store_key};
+        let terms = order(1);
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &terms);
+        let unpaid = AuthorizedOrder {
+            order: terms.clone(),
+            scoped_payload,
+            signature,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        let (status_scoped, status_signature) =
+            sign_scoped(&store_key(), &(terms.id.clone(), OrderStatus::Cancelled));
+        let cancel = AuthorizedOrder {
+            status: OrderStatus::Cancelled,
+            status_scoped_payload: Some(status_scoped),
+            status_signature: Some(status_signature),
+            ..unpaid.clone()
+        };
+        assert_eq!(kept(cancel.clone()), Some(cancel.clone()));
+        // Padded and signed again: genuine signatures over padded envelopes,
+        // which `verify_scoped_signature` accepts.
+        use ed25519_dalek::Signer;
+        let resign = |bytes: &[u8]| store_key().sign(bytes).to_bytes().to_vec();
+        let mut padded_cancel = cancel.clone();
+        let status_payload = padded_cancel.status_scoped_payload.as_mut().unwrap();
+        status_payload.resize(MAX_ORDER_BYTES, 0);
+        padded_cancel.status_signature = Some(resign(status_payload));
+        assert_eq!(kept(padded_cancel.clone()), Some(unpaid.clone()));
+        let reversed = AuthorizedOrder {
+            status: OrderStatus::PaymentReversed,
+            payment_proof: Some(crate::test_orders::proof(&terms, 1)),
+            status_scoped_payload: None,
+            status_signature: None,
+            ..unpaid.clone()
+        };
+        assert_eq!(
+            as_kept(reversed.clone()),
+            reversed,
+            "within the bound, kept"
+        );
+        let mut padded_unpaid = unpaid.clone();
+        padded_unpaid.scoped_payload.resize(MAX_ORDER_BYTES, 0);
+        padded_unpaid.signature = resign(&padded_unpaid.scoped_payload);
+        assert_eq!(kept(padded_unpaid.clone()), None);
+
+        let owner = Some(store_key().verifying_key());
+        let parent = StoreStateV1 {
+            owner,
+            ..Default::default()
+        };
+        let p = StoreParameters::new(store_key().verifying_key());
+        for (what, record) in [("cancel", padded_cancel), ("unpaid", padded_unpaid)] {
+            let mut held = OrdersV1::default();
+            held.orders.insert(record.order.id.clone(), record);
+            let why = held.verify(&parent, &p).unwrap_err();
+            assert!(why.contains("past"), "{what}: {why}");
+        }
+        let mut held = OrdersV1::default();
+        held.orders.insert(cancel.order.id.clone(), cancel);
+        held.verify(&parent, &p).expect("within the bound");
+    }
+
+    /// Step 2: store details past `MAX_INFO_BYTES` are not taken by a merge
+    /// and do not verify; the same details within it are. Red with the
+    /// bound dropped from `admit` or from `verify`.
+    #[test]
+    fn store_details_past_the_byte_bound_are_not_taken() {
+        use crate::test_orders::{sign_scoped, store_key};
+        let details = |description: usize| {
+            let info = StoreInfoV1 {
+                version: 2,
+                certificate_pem: String::new(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Jam".into(),
+                description: "d".repeat(description),
+                encryption_public_key: None,
+                record_public_key: None,
+            };
+            let (scoped_payload, signature) = sign_scoped(&store_key(), &info);
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let parent = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        let p = StoreParameters::new(store_key().verifying_key());
+        let small = details(100);
+        let big = details(MAX_INFO_BYTES / 3);
+        assert!(crate::to_cbor(&big).unwrap().len() > MAX_INFO_BYTES);
+        let mut held = AuthorizedStoreInfoV1::default();
+        held.apply_delta(&parent, &p, &Some(big.clone())).unwrap();
+        assert_eq!(
+            held,
+            AuthorizedStoreInfoV1::default(),
+            "past the bound, not taken"
+        );
+        assert!(big.verify(&parent, &p).unwrap_err().contains("past"));
+        held.apply_delta(&parent, &p, &Some(small.clone())).unwrap();
+        assert_eq!(held, small);
+        small.verify(&parent, &p).expect("within the bound");
     }
 }

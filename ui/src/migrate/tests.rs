@@ -3575,6 +3575,86 @@ fn a_predecessor_over_the_status_bound_is_cut_to_its_newest_whichever_side_it_is
     }
 }
 
+/// Step 2: an earlier generation kept a record whose signed envelope was
+/// padded (it checked only the payload inside), which this generation
+/// refuses. Whichever side of the fold it is on, that record is dropped and
+/// everything else is carried, and a genuine record for the same slot on
+/// the other side is kept though the padded one outranks it. Red with
+/// `drop_unbounded` left out on either side.
+#[test]
+fn a_predecessors_padded_record_is_dropped_and_the_rest_carried() {
+    use ed25519_dalek::Signer;
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::{sign_with_store_key, SignedRecord};
+    use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    let status = |revision: u64, padded: bool| {
+        let status = ListingStatus {
+            listing: ListingId([0x42; 32]),
+            revision,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (mut scoped_payload, mut signature) =
+            sign_with_store_key(&seller(), harvest_common::to_cbor(&status).expect("encode"))
+                .expect("a store record");
+        if padded {
+            scoped_payload.extend_from_slice(&[0; 64]);
+            signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+        }
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    let padded = status(9, true);
+    let genuine = status(5, false);
+    let mut older = store_with(&[signed_listing("Jam")]);
+    older.listing_statuses.records.insert(padded.slot(), padded);
+    let mut newer = store_with(&[signed_listing("Plum")]);
+    newer
+        .listing_statuses
+        .records
+        .insert(genuine.slot(), genuine.clone());
+    let ops = store_ops();
+    for (shape, state) in [
+        (
+            "merge_with_local(older, newer)",
+            ops.merge_with_local(older.clone(), &newer),
+        ),
+        (
+            "merge_with_local(newer, older)",
+            ops.merge_with_local(newer.clone(), &older),
+        ),
+        (
+            "merge_generations(older, newer)",
+            ops.merge_generations(older.clone(), newer.clone()),
+        ),
+        (
+            "merge_generations(newer, older)",
+            ops.merge_generations(newer.clone(), older.clone()),
+        ),
+    ] {
+        assert_eq!(
+            state.listing_statuses.records.get(&genuine.slot()),
+            Some(&genuine),
+            "{shape}: the genuine status is kept, the padded one dropped"
+        );
+        for title in ["Jam", "Plum"] {
+            assert!(
+                state
+                    .listings
+                    .listings
+                    .iter()
+                    .any(|l| l.listing.title == title),
+                "{shape}: {title} is carried"
+            );
+        }
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
 /// [`signed_order`] marked `Paid` on evidence that is not the minimal proof
 /// (here none that could be: no claims), as an earlier generation kept a
 /// padded one.

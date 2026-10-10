@@ -16,7 +16,6 @@
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::store::Bytes32;
 
 /// A one-variant tag, so a pause never decodes as any other store-key message
@@ -73,8 +72,13 @@ impl AuthorizedStorePause {
         if self.pause.store != *owner {
             return Err("pause names a different store key than this store's owner".into());
         }
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.pause)
-            .map_err(|e| format!("pause is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.pause,
+        )
+        .map_err(|e| format!("pause is not signed by the store key: {e}"))
     }
 }
 
@@ -88,6 +92,9 @@ impl crate::backing::SignedRecord for AuthorizedStorePause {
     }
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
+    }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.pause)
     }
     fn rank(&self) -> u64 {
         self.pause.revision

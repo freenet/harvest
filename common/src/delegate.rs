@@ -287,7 +287,7 @@ pub enum HarvestDelegateRequest {
     /// [`SELLER_ORDERS_PER_CALL`] a call, each checked as the store would
     /// keep it (it verifies against `store_key`, a despatch is the store
     /// key's, and a `Paid` carries the minimal proof or is kept unpaid; one
-    /// on the minimal proof past `store::MAX_PAID_ORDER_BYTES` is kept paid
+    /// on the minimal proof past `store::MAX_ORDER_BYTES` is kept paid
     /// without it, and one without a proof is kept paid only with the store
     /// key's despatch, or where the book already holds it paid). Only for a
     /// store whose key this node holds. Merged with what is held: nothing

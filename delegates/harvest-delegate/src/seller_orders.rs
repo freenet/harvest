@@ -468,7 +468,7 @@ fn checked(
             order.payment_proof = None;
         }
     } else if order.status == OrderStatus::Paid
-        && !harvest_common::store::paid_within_cap(&order)
+        && !harvest_common::store::within_order_cap(&order)
         && order
             .payment_proof
             .as_ref()
@@ -476,7 +476,7 @@ fn checked(
         && order.verify(owner).is_ok()
     {
         // Paid on the minimal proof, but past the store's byte bound
-        // (`store::MAX_PAID_ORDER_BYTES`): the store keeps it unpaid, and the
+        // (`store::MAX_ORDER_BYTES`): the store keeps it unpaid, and the
         // seller's own book keeps it paid (the overseer, 2026-10-09: an
         // honest payment over the bound still reaches the seller as paid).
         // Without the proof, which would make the book as large as the
@@ -1149,9 +1149,9 @@ pub(crate) mod tests {
         big.order = authorized(&store_signing_key(), terms.clone(), OrderStatus::Paid, 1);
         big.order.payment_proof = Some(crate::kept_purchases::fixtures::big_proof(
             &terms,
-            harvest_common::store::MAX_PAID_ORDER_BYTES,
+            harvest_common::store::MAX_ORDER_BYTES,
         ));
-        assert!(!harvest_common::store::paid_within_cap(&big.order));
+        assert!(!harvest_common::store::within_order_cap(&big.order));
         assert_eq!(
             harvest_common::store::as_kept(big.order.clone()).status,
             OrderStatus::AwaitingPayment,
@@ -1862,7 +1862,7 @@ pub(crate) mod tests {
         big.order = authorized(&store_signing_key(), terms.clone(), OrderStatus::Paid, 1);
         big.order.payment_proof = Some(crate::kept_purchases::fixtures::big_proof(
             &terms,
-            harvest_common::store::MAX_PAID_ORDER_BYTES,
+            harvest_common::store::MAX_ORDER_BYTES,
         ));
         kept(&mut old, vec![big]).unwrap();
         // Marked paid by a store notification: no proof ever.
@@ -2045,7 +2045,7 @@ pub(crate) mod tests {
         let terms = swapped.order.order.clone();
         swapped.order.payment_proof = Some(crate::kept_purchases::fixtures::big_proof(
             &terms,
-            harvest_common::store::MAX_PAID_ORDER_BYTES,
+            harvest_common::store::MAX_ORDER_BYTES,
         ));
         assert!(swapped
             .order

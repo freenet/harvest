@@ -3390,7 +3390,7 @@ fn gen_retire98(root: &Path) {
 // Step 2 (review round 2): the store rules no corpus exercised.
 //   store-paidcap  `as_kept`: a Paid record stays paid only on the canonical
 //                  minimal proof (`verify_minimal_proof`) within
-//                  MAX_PAID_ORDER_BYTES, and is otherwise kept as its unpaid
+//                  MAX_ORDER_BYTES, and is otherwise kept as its unpaid
 //                  terms. Deltas carry the RAW records (honest minimal,
 //                  padded, minimal-but-over-8-KiB, unpaid, cancelled); states
 //                  carry what the store keeps, since a state holding a padded
@@ -3417,8 +3417,8 @@ use freenet_bitcoin_common::spv::SpvProof;
 use freenet_bitcoin_common::Txid;
 use harvest_common::payment::verify_minimal_proof;
 use harvest_common::store::{
-    as_kept, paid_within_cap, StoreStateV1Summary, MAX_LISTINGS, MAX_LISTING_BYTES,
-    MAX_PAID_ORDER_BYTES,
+    as_kept, within_order_cap, StoreStateV1Summary, MAX_LISTINGS, MAX_LISTING_BYTES,
+    MAX_ORDER_BYTES,
 };
 use harvest_common::store_pause::{AuthorizedStorePause, StorePause};
 
@@ -3473,7 +3473,7 @@ fn fold_store(
 /// its public halves.
 fn kept_paid(r: &AuthorizedOrder) -> bool {
     r.status == OrderStatus::Paid
-        && paid_within_cap(r)
+        && within_order_cap(r)
         && r.payment_proof
             .as_ref()
             .is_some_and(|proof| verify_minimal_proof(&r.order, proof).is_ok())
@@ -3552,7 +3552,7 @@ impl StoreFx {
         self.paid_on(order, OrderPaymentProof::on_chain(vec![claim], self.tip(order, 100)))
     }
 
-    /// The two minimal `Paid` records either side of MAX_PAID_ORDER_BYTES,
+    /// The two minimal `Paid` records either side of MAX_ORDER_BYTES,
     /// as close to it as one output's script length allows: the largest
     /// that fits, and the smallest that does not. Both pay the order once,
     /// in a transaction padded with filler outputs, as an honest batched
@@ -3569,21 +3569,21 @@ impl StoreFx {
         };
         let size = |r: &AuthorizedOrder| cbor(r).len();
         let mut full = 0;
-        while size(&rec(full + 1, None)) <= MAX_PAID_ORDER_BYTES {
+        while size(&rec(full + 1, None)) <= MAX_ORDER_BYTES {
             full += 1;
         }
         let mut under = rec(full, None);
         let mut over = rec(full + 1, None);
         for l in 0..250 {
             let r = rec(full, Some(l));
-            if size(&r) <= MAX_PAID_ORDER_BYTES {
+            if size(&r) <= MAX_ORDER_BYTES {
                 under = r;
             } else {
                 over = r;
                 break;
             }
         }
-        assert!(size(&under) <= MAX_PAID_ORDER_BYTES && size(&over) > MAX_PAID_ORDER_BYTES);
+        assert!(size(&under) <= MAX_ORDER_BYTES && size(&over) > MAX_ORDER_BYTES);
         (under, over)
     }
 
@@ -3726,7 +3726,7 @@ fn gen_paidcap(root: &Path) {
         ];
         for (n, r, kept) in variants {
             let minimal = verify_minimal_proof(&r.order, r.payment_proof.as_ref().unwrap()).is_ok();
-            let within = paid_within_cap(&r);
+            let within = within_order_cap(&r);
             if i == 0 {
                 println!("paidcap: {n}: {} bytes, minimal {minimal}, within {within}", cbor(&r).len());
             }

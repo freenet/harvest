@@ -52,7 +52,6 @@
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::store::Bytes32;
 
 // --- Domain labels ----------------------------------------------------------
@@ -214,8 +213,13 @@ impl AuthorizedCopy {
             .wrapped
             .check_shape()
             .map_err(|e| format!("wrapped copy is malformed: {e}"))?;
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.copy)
-            .map_err(|e| format!("wrapped copy is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.copy,
+        )
+        .map_err(|e| format!("wrapped copy is not signed by the store key: {e}"))
     }
 
     /// The slot a copy occupies: one per (backer, scope).
@@ -234,6 +238,9 @@ impl crate::backing::SignedRecord for AuthorizedCopy {
     }
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
+    }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.copy)
     }
     const WHAT: &'static str = "wrapped copy";
     // Every copy's backer takes a backing slot (`StoreStateV1::normalize_backings`).

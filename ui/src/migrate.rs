@@ -867,11 +867,18 @@ pub(crate) fn merge_store_reporting_discard(
     // holds; the base's are cut by `normalize_carried` below, which keeps
     // the same newest ones (the cut is a function of the union:
     // `SignedSetV1::cut_to_newest`). Not the despatches yet: one side's
-    // despatch may name an order only the other side holds.
+    // despatch may name an order only the other side holds. And first, on
+    // both sides, what this generation's byte bounds refuse is dropped
+    // (`drop_unbounded`, step 2): on the other side, so one such record does
+    // not discard the whole side; on the base, BEFORE the merge, because a
+    // padded record there can outrank the other side's genuine one for its
+    // slot, and dropping it after would lose both.
     let mut base = name_whole_key_owner(base, seller);
+    base.drop_unbounded();
     base.listings.normalize();
     base.orders.normalize();
     let mut owned_other = name_whole_key_owner(other.clone(), seller);
+    owned_other.drop_unbounded();
     owned_other.listings.normalize();
     owned_other.orders.normalize();
     owned_other.listing_statuses.normalize();

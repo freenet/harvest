@@ -62,7 +62,7 @@ writing (`native_laws_total`).
 
 - **`store-paidcap`** (`paidcap`) -- the item rule `as_kept`: a `Paid` record
   stays paid only on the canonical minimal proof, within
-  `MAX_PAID_ORDER_BYTES` (8 KiB), and is otherwise kept as its unpaid terms.
+  `MAX_ORDER_BYTES` (8 KiB), and is otherwise kept as its unpaid terms.
   A state holding a padded `Paid` does not verify, so the raw records ride
   in hand-built DELTAS (that is where the WASM meets the rule), and the
   states hold what the store keeps. For the same orders the deltas carry an

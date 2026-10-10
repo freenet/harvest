@@ -188,14 +188,14 @@ impl AuthorizedBacking {
                 self.statement.certificate_pem.len()
             ));
         }
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.backer_scoped_payload,
             &self.backer_signature,
             &self.statement.backer,
             &self.statement,
         )
         .map_err(|e| format!("backing is not signed by the Ghost Key it names: {e}"))?;
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.acceptance_scoped_payload,
             &self.acceptance_signature,
             owner,
@@ -235,7 +235,7 @@ pub struct AuthorizedRetirement {
 
 impl AuthorizedRetirement {
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.scoped_payload,
             &self.signature,
             owner,
@@ -273,7 +273,7 @@ impl AuthorizedClosure {
         if self.closure.store != *owner {
             return Err("closure names a different store key than this store's owner".into());
         }
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.closure)
+        verify_exact_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.closure)
             .map_err(|e| format!("closure is not signed by the store key: {e}"))
     }
 }
@@ -285,6 +285,11 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     fn slot(&self) -> Bytes32;
     /// Whether the store owned by `owner` may hold this record.
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String>;
+    /// Whether each signed envelope the record carries is exactly the
+    /// Harvest envelope of what it signs ([`verify_exact_scoped_signature`]),
+    /// without checking any signature: a migration fold drops a record an
+    /// earlier generation kept that is not (`SignedSetV1::drop_inexact`).
+    fn exact(&self) -> bool;
     /// Which of two records for one slot is kept: the higher rank, and on
     /// equal ranks the smaller encoding. Zero for every record whose slot
     /// holds one statement for good (a backing, a retirement, a closure, a
@@ -315,6 +320,15 @@ impl SignedRecord for AuthorizedBacking {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.backer_scoped_payload, &self.statement)
+            && exact_envelope(
+                &self.acceptance_scoped_payload,
+                &BackingAcceptance {
+                    backing: self.statement.clone(),
+                },
+            )
+    }
     const WHAT: &'static str = "backing";
     const MAX_RECORDS: usize = MAX_BACKINGS;
 }
@@ -326,6 +340,9 @@ impl SignedRecord for AuthorizedRetirement {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.scoped_payload, &self.retirement)
+    }
     const WHAT: &'static str = "retirement";
     const MAX_RECORDS: usize = MAX_BACKINGS;
 }
@@ -336,6 +353,9 @@ impl SignedRecord for AuthorizedClosure {
     }
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
+    }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.scoped_payload, &self.closure)
     }
     // `verify` requires the closure to name the owner and to sit in its own
     // slot, so a store holds at most one.
@@ -485,6 +505,16 @@ impl<T: SignedRecord> SignedSetV1<T> {
         for (_, slot) in ranked.into_iter().skip(T::MAX_RECORDS) {
             self.records.remove(&slot);
         }
+    }
+
+    /// Drop every record whose envelopes are not exact
+    /// ([`SignedRecord::exact`]): for a state an earlier generation wrote,
+    /// which kept them, that a migration fold carries forward (step 2). The
+    /// record is dropped, not the state: refusing the state would discard
+    /// everything else an earlier generation held beside it. Every producer
+    /// builds the exact envelope, so no honest record is one.
+    pub fn drop_inexact(&mut self) {
+        self.records.retain(|_, record| record.exact());
     }
 
     /// The set as this generation keeps it, for a state an earlier one wrote
@@ -815,6 +845,36 @@ pub fn store_key_envelope(payload: Vec<u8>) -> Result<Vec<u8>, String> {
     }
 }
 
+/// [`verify_scoped_signature`], for a record a store holds whose content has
+/// a fixed shape (step 2): `scoped` must also be EXACTLY the Harvest envelope
+/// of `data` ([`is_exact_harvest_envelope`]).
+///
+/// The store's state has a byte bound (`store::MAX_STORE_BYTES`), and every
+/// state its caps allow must fit under it, or two valid states could merge
+/// into one the contract refuses. A record's size is then a function of its
+/// content only if its envelope is: without this a signer (the store key, a
+/// Ghost Key backing it) could pad the envelope with bytes after the CBOR item
+/// or map keys the decoder skips, and the record would still verify. Every
+/// producer builds the exact envelope: [`store_key_envelope`], and the Ghost
+/// Key vault, which encodes the same `ScopedPayload` the same way.
+pub fn verify_exact_scoped_signature<T: Serialize>(
+    scoped: &[u8],
+    signature: &[u8],
+    key: &VerifyingKey,
+    data: &T,
+) -> Result<(), String> {
+    if !exact_envelope(scoped, data) {
+        return Err("its signed payload is not exactly the Harvest envelope of the record".into());
+    }
+    verify_scoped_signature(scoped, signature, key, data)
+}
+
+/// Whether `scoped` is exactly the Harvest envelope of `data`'s encoding
+/// ([`is_exact_harvest_envelope`]).
+pub fn exact_envelope<T: Serialize>(scoped: &[u8], data: &T) -> bool {
+    crate::to_cbor(data).is_ok_and(|payload| is_exact_harvest_envelope(scoped, &payload))
+}
+
 /// Whether `scoped` is EXACTLY the envelope [`store_key_envelope`] builds
 /// around `payload`, for the canonical Harvest webapp id or a legacy one
 /// (`LEGACY_HARVEST_WEBAPP_CONTRACT_IDS`).
@@ -834,7 +894,7 @@ pub fn is_exact_harvest_envelope(scoped: &[u8], payload: &[u8]) -> bool {
 
 /// The envelope around `payload` with the webapp contract `id` (base58) as
 /// requestor. [`store_key_envelope`] is this with the canonical id.
-fn envelope_with_requestor(id: &str, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+pub(crate) fn envelope_with_requestor(id: &str, payload: Vec<u8>) -> Result<Vec<u8>, String> {
     #[cfg(feature = "ghostkey")]
     {
         use freenet_stdlib::prelude::ContractInstanceId;

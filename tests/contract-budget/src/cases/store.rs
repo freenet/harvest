@@ -346,7 +346,7 @@ impl Shop {
 
     /// [`Self::paid_order`] whose payment's transaction also pays the
     /// largest number of filler outputs that keeps the record within
-    /// `bytes` as it encodes (step 2's `store::MAX_PAID_ORDER_BYTES`): still
+    /// `bytes` as it encodes (step 2's `store::MAX_ORDER_BYTES`): still
     /// the minimal proof, as large as a big honest transaction makes it.
     fn paid_order_at(
         &self,
@@ -493,7 +493,7 @@ impl Shop {
     /// step 2) checks the record's size first, so a record this large is kept
     /// as its unpaid terms without its proof being folded: what this costs is
     /// decoding the delta and re-encoding each record to size it. A record
-    /// under `MAX_PAID_ORDER_BYTES` is the one whose proof is folded.
+    /// under `MAX_ORDER_BYTES` is the one whose proof is folded.
     fn padded_paid_order(&self, label: &str, i: u64) -> Result<AuthorizedOrder> {
         let mut record = self.paid_order(label, i, 0)?;
         let Some(OrderPaymentProof::OnChain(proof)) = record.payment_proof.take() else {
@@ -900,7 +900,7 @@ pub fn cases() -> Result<Vec<Case>> {
             .map_err(|e| anyhow!("the store after the padded delta fails verify: {e}"))?;
     }
     // (d) Step 2: every paid order at the store's byte bound for a `Paid`
-    // record (`store::MAX_PAID_ORDER_BYTES`), as big honest payments make
+    // record (`store::MAX_ORDER_BYTES`), as big honest payments make
     // them, beside the listings at theirs.
     let big = shop.at_cap_paid(
         "store/held-big",
@@ -908,7 +908,7 @@ pub fn cases() -> Result<Vec<Case>> {
         0..LISTINGS,
         1,
         0,
-        Some(harvest_common::store::MAX_PAID_ORDER_BYTES),
+        Some(harvest_common::store::MAX_ORDER_BYTES),
     )?;
     for (what, bytes) in [
         ("held store", held_bytes.len()),
@@ -1089,7 +1089,7 @@ pub fn cases() -> Result<Vec<Case>> {
             kind: Kind::Store,
             name: format!(
                 "{MAX_ORDERS} Paid orders of {} KiB + one-listing delta",
-                harvest_common::store::MAX_PAID_ORDER_BYTES / 1024
+                harvest_common::store::MAX_ORDER_BYTES / 1024
             ),
             parameters: parameters.clone(),
             held: cbor(&big),

@@ -1130,6 +1130,7 @@ fn StoreDetailsForm(
 ) -> Element {
     let mut store_name = use_signal(|| initial.store_name.clone());
     let mut description = use_signal(|| initial.description.clone());
+    let too_long = details_too_long(&store_name(), &description());
 
     rsx! {
         div { class: "details-form",
@@ -1169,10 +1170,13 @@ fn StoreDetailsForm(
                 }
             }
 
+            if let Some(why) = &too_long {
+                p { class: "text-warning", "{why}" }
+            }
             div { class: "form-actions",
                 button {
                     class: "btn btn-primary",
-                    disabled: store_name().trim().is_empty(),
+                    disabled: store_name().trim().is_empty() || too_long.is_some(),
                     onclick: move |_| {
                         on_submit.call(StoreDetails {
                             store_name: store_name().trim().to_string(),
@@ -1188,6 +1192,27 @@ fn StoreDetailsForm(
                 }
             }
         }
+    }
+}
+
+/// Why the store's details are longer than the store keeps, if they are
+/// (step 2): the store contract does not take details past
+/// `MAX_INFO_BYTES`, and these two bounds keep the largest the app writes
+/// within it. In bytes, which run to more than characters outside plain
+/// ASCII.
+fn details_too_long(store_name: &str, description: &str) -> Option<String> {
+    use harvest_common::store::{MAX_DESCRIPTION_BYTES, MAX_STORE_NAME_BYTES};
+    if store_name.trim().len() > MAX_STORE_NAME_BYTES {
+        Some(format!(
+            "That name is too long. Keep it to {MAX_STORE_NAME_BYTES} letters."
+        ))
+    } else if description.trim().len() > MAX_DESCRIPTION_BYTES {
+        Some(format!(
+            "That description is too long. Keep it to about {} letters.",
+            MAX_DESCRIPTION_BYTES / 1000 * 1000
+        ))
+    } else {
+        None
     }
 }
 
@@ -1654,6 +1679,29 @@ fn short_fingerprint(fp: &str) -> String {
     match fp.char_indices().nth(6) {
         Some((cut, _)) => format!("{}\u{2026}", &fp[..cut]),
         None => fp.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod store_details_limit_tests {
+    use harvest_common::store::{MAX_DESCRIPTION_BYTES, MAX_STORE_NAME_BYTES};
+
+    /// Step 2: the form refuses details past the bounds that keep them
+    /// within the store contract's `MAX_INFO_BYTES`, counting bytes. Red
+    /// with either check left out, or with a character count.
+    #[test]
+    fn details_past_their_byte_bounds_are_refused() {
+        let name = "n".repeat(MAX_STORE_NAME_BYTES);
+        let description = "d".repeat(MAX_DESCRIPTION_BYTES);
+        assert_eq!(super::details_too_long(&name, &description), None);
+        assert!(super::details_too_long(&format!("{name}n"), "").is_some());
+        assert!(super::details_too_long("Jam", &format!("{description}d")).is_some());
+        let accents = "\u{e9}".repeat(MAX_STORE_NAME_BYTES / 2 + 1);
+        assert!(accents.chars().count() <= MAX_STORE_NAME_BYTES);
+        assert!(
+            super::details_too_long(&accents, "").is_some(),
+            "fewer characters, more bytes"
+        );
     }
 }
 

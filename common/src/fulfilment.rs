@@ -42,7 +42,6 @@ use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::BlockAnchor;
 use serde::{Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::payment::OrderId;
 use crate::store::Bytes32;
 
@@ -75,8 +74,13 @@ pub struct AuthorizedDespatch {
 impl AuthorizedDespatch {
     /// Whether `owner`, the store's key, signed this despatch.
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.despatch)
-            .map_err(|e| format!("despatch is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.despatch,
+        )
+        .map_err(|e| format!("despatch is not signed by the store key: {e}"))
     }
 }
 
@@ -89,6 +93,9 @@ impl crate::backing::SignedRecord for AuthorizedDespatch {
     }
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
+    }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.despatch)
     }
     const WHAT: &'static str = "despatch";
     // One per order held (`StoreStateV1::normalize_fulfilment`).

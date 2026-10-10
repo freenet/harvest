@@ -499,8 +499,13 @@ pub struct AuthorizedListingStatus {
 
 impl AuthorizedListingStatus {
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.status)
-            .map_err(|e| format!("listing status is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.status,
+        )
+        .map_err(|e| format!("listing status is not signed by the store key: {e}"))
     }
 }
 

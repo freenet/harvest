@@ -396,7 +396,7 @@ budget:
 | | `get_state_delta` (co-host) | 36.4% |
 | | `get_state_delta` (new subscriber) | 33.8% |
 | | `update_state` (idempotency probe) | **175.3%, over** |
-| 256 Paid orders of 8 KiB (`MAX_PAID_ORDER_BYTES`) + one-listing delta | `update_state` | 42.5% |
+| 256 Paid orders of 8 KiB (`MAX_ORDER_BYTES`) + one-listing delta | `update_state` | 42.5% |
 | | `validate_state` (merged) | **338.1%, over** |
 | | `summarize_state` | 45.6% |
 | | `get_state_delta` (co-host) | 45.9% |
@@ -423,7 +423,7 @@ step 2). Anyone may send a store a delta of `Paid` records padded past the
 byte bound, which the store only throws away, or of copies of genuine
 records it already holds. Four things keep that cheap:
 
-* `store::paid_within_cap` judges a record by a floor on its proof's bytes
+* `store::within_order_cap` judges a record by a floor on its proof's bytes
   before encoding anything.
 * The contract refuses a delta, an incoming state, a state to validate, or
   one call's updates together past `store::MAX_STORE_BYTES` (12 MiB) on
