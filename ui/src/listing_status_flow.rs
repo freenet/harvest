@@ -111,8 +111,9 @@ pub(crate) fn availability_after_edit(
 }
 
 /// How long a listing whose photos are uploading holds its row at "Saving".
-/// The upload ends on its own well inside this (a PUT gives up after 60 s,
-/// then at most two 30 s lookups); the bound is for a drop path never taken.
+/// The upload ends on its own well inside this: its photos go up all at
+/// once, and each gives up after 60 s and at most two 30 s lookups. The
+/// bound is for a drop path never taken.
 pub(crate) const UPLOADING_WINDOW_MS: i64 = 10 * 60_000;
 
 /// A listing from the form whose photos are uploading: it is signed and
@@ -239,16 +240,23 @@ impl AppState {
     /// progress notices every page shows.
     pub(crate) fn listing_upload_lines(&self) -> Vec<String> {
         let now = now_ms();
-        self.listing_uploads
+        let mut lines: Vec<String> = Vec::new();
+        for u in self
+            .listing_uploads
             .iter()
             .filter(|u| now - u.started_ms < UPLOADING_WINDOW_MS)
-            .map(|u| {
-                format!(
-                    "Uploading the photos for \u{201c}{}\u{201d}\u{2026} It is saved once they are up.",
-                    u.title
-                )
-            })
-            .collect()
+        {
+            let line = format!(
+                "Uploading the photos for \u{201c}{}\u{201d}\u{2026} It is saved once they are up.",
+                u.title
+            );
+            // Once: the page keys its notices by their text, and two
+            // uploads of one title would say the same thing twice anyway.
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        lines
     }
 
     /// Ask the store key to sign a new availability for one listing of one of
@@ -807,6 +815,18 @@ mod tests {
         assert!(lines[0].contains("\u{201c}Mug\u{201d}"), "{lines:?}");
         let started = state.listing_uploads[0].started_ms;
         assert!(!state.listing_status_pending_at(&STORE, &id, started + UPLOADING_WINDOW_MS));
+        // Two uploads of one title say it once: the page keys notices by text.
+        let again = state.begin_listing_upload(STORE.to_vec(), None, "Bowl".into());
+        assert_eq!(state.progress_notices().len(), 2);
+        state.end_listing_upload(again);
+        // Past the window, the notice goes too.
+        for u in state.listing_uploads.iter_mut() {
+            u.started_ms -= UPLOADING_WINDOW_MS;
+        }
+        assert!(state.progress_notices().is_empty());
+        for u in state.listing_uploads.iter_mut() {
+            u.started_ms += UPLOADING_WINDOW_MS;
+        }
         state.end_listing_upload(edit);
         assert!(!state.listing_status_pending(&STORE, &id));
         state.end_listing_upload(new);
@@ -849,8 +869,16 @@ mod tests {
             ..new.clone()
         };
         let mut state = seller_state();
-        let refused = elsewhere.apply(&mut state, mug, None);
+        let refused = elsewhere.apply(&mut state, mug.clone(), None);
         assert!(refused.unwrap_err().starts_with("Cannot add the listing:"));
+        let refused = ListingTarget {
+            replaces: Some(old.clone()),
+            ..elsewhere.clone()
+        }
+        .apply(&mut state, mug, None);
+        assert!(refused
+            .unwrap_err()
+            .starts_with("Could not save the listing:"));
         assert!(state.notifications.is_empty(), "the caller says it");
         assert!(state.pending_signatures.is_empty());
 

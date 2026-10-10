@@ -279,10 +279,13 @@ pub(crate) fn ListingFormPage(
         },
         // Keyed: a jump straight from one listing's Edit page to another's
         // (or from one store's Add page to another's) must get a new form,
-        // not carry the first one's fields over.
+        // not carry the first one's fields over. Dioxus reads a key only in
+        // a list, hence the list of one.
         Some(Some((listing, availability))) => rsx! {
-            Fragment { key: "{listing.id}",
-            {back}
+            // In a one-item list: a key counts only there.
+            for form_key in std::iter::once(listing.id.to_string()) {
+            Fragment { key: "{form_key}",
+            {back.clone()}
             h2 { class: "page-h", "Edit {listing.title}" }
             ListingForm {
                 initial: Some(listing.clone()),
@@ -291,7 +294,7 @@ pub(crate) fn ListingFormPage(
                     _ => None,
                 },
                 sold_out: !availability.is_buyable(),
-                on_cancel,
+                on_cancel: on_cancel.clone(),
                 target: ListingTarget {
                     store: store_contract_id.clone(),
                     fingerprint: fingerprint.clone(),
@@ -299,20 +302,23 @@ pub(crate) fn ListingFormPage(
                 },
             }
             }
+            }
         },
         None => rsx! {
-            Fragment { key: "{add_key}",
-            {back}
+            for form_key in std::iter::once(add_key.clone()) {
+            Fragment { key: "{form_key}",
+            {back.clone()}
             h2 { class: "page-h", "Add a listing" }
             ListingForm {
                 initial: None,
                 initial_quantity: None,
-                on_cancel,
+                on_cancel: on_cancel.clone(),
                 target: ListingTarget {
                     store: store_contract_id.clone(),
                     fingerprint: fingerprint.clone(),
                     replaces: None,
                 },
+            }
             }
             }
         },

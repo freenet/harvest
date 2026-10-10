@@ -353,13 +353,19 @@ mod tests {
         );
         // An update notification for a photo stops before the re-GET that
         // every other contract's notification triggers.
+        // The arm only: up to the next response variant, so a call further
+        // down the file cannot satisfy the check below.
         let update = &src[src.find("ContractResponse::UpdateNotification {").unwrap()..];
+        let end = update
+            .find("\n        _ =>")
+            .expect("the arm is followed by the catch-all");
+        let update = &update[..end];
         let photo = update
             .find("image_ops::is_image")
             .expect("photo notifications are recognised");
         let ret = update[photo..].find("return;").unwrap() + photo;
         let regets = update
-            .find("get_contract")
+            .find("request_full_state(")
             .expect("other notifications are re-read");
         assert!(ret < regets, "and dropped before anything is re-read");
     }

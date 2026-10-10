@@ -88,6 +88,11 @@ pub fn ListingForm(
     let photos = use_signal(|| drafts_from_listing(editing.as_ref()));
     let preparing = use_signal(|| 0usize);
     let mut uploading = use_signal(|| false);
+    // Set once a press hands the listing on, and cleared only if that
+    // failed: a second click landing before the page leaves (#80) must not
+    // publish it twice. Leaving the page drops the form, so nothing else
+    // clears it.
+    let mut sent = use_signal(|| false);
     let mut photo_error = use_signal(|| None::<String>);
 
     rsx! {
@@ -163,11 +168,27 @@ pub fn ListingForm(
                         if terms().build().is_err() || parse_quantity(&quantity()).is_err() {
                             return;
                         }
-                        // Re-checked here, not only in `disabled`: two clicks
-                        // can land before the button re-renders (#80), and the
-                        // first clears the title.
                         if title().trim().is_empty() {
                             return;
+                        }
+                        // Read from the signal, not the last render: two clicks
+                        // can land before the button re-renders (#80).
+                        if sent() {
+                            return;
+                        }
+                        // An edit of a listing still being saved (its photos
+                        // uploading, or its replacement on its way) would
+                        // publish a second replacement beside the first. The
+                        // Listings row holds too; this covers a form reached
+                        // another way (Back, then Forward).
+                        if let Some(old) = &target.replaces {
+                            if crate::gateway::APP_STATE
+                                .read()
+                                .listing_status_pending(&target.store, old)
+                            {
+                                photo_error.set(Some(STILL_SAVING.to_string()));
+                                return;
+                            }
                         }
                         let Ok(count) = parse_quantity(&quantity()) else {
                             return;
@@ -196,6 +217,7 @@ pub fn ListingForm(
                                 return;
                             }
                         };
+                        sent.set(true);
                         let target = target.clone();
                         let failed_notice = target.clone();
                         // Hands the listing on, then leaves the form, or, if
@@ -214,7 +236,10 @@ pub fn ListingForm(
                             match (saved, on_screen) {
                                 (Ok(()), true) => super::router::replace(target.listings_page()),
                                 (Ok(()), false) => {}
-                                (Err(problem), true) => photo_error.set(Some(problem)),
+                                (Err(problem), true) => {
+                                    sent.set(false);
+                                    photo_error.set(Some(problem));
+                                }
                                 (Err(problem), false) => crate::gateway::APP_STATE
                                     .write()
                                     .notifications
@@ -254,6 +279,9 @@ pub fn ListingForm(
                                 *busy = false;
                             }
                             if let Err(e) = result {
+                                if let Ok(mut pressed) = sent.try_write() {
+                                    *pressed = false;
+                                }
                                 match photo_error.try_write() {
                                     Ok(mut shown) => *shown = Some(e),
                                     Err(_) => crate::gateway::APP_STATE
@@ -299,6 +327,11 @@ pub fn ListingForm(
         }
     }
 }
+
+/// Said when an edit is pressed while the listing is still being saved.
+pub(crate) const STILL_SAVING: &str =
+    "This listing is still being saved. Wait until Listings shows \
+     it, then edit it again.";
 
 /// What pressing List it hands on: the listing to publish, and the photos
 /// to upload before it is signed.

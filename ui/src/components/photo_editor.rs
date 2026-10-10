@@ -202,8 +202,9 @@ pub(crate) fn PhotoEditor(
     let next_key = use_signal(|| 1_000u64);
     let count = photos.read().len();
     let room = MAX_IMAGES_UI.saturating_sub(count);
-    // Previews of photos still on the form when it goes (Cancel, or leaving
-    // the page). Saving and Remove revoke theirs as they go.
+    // Previews of photos still on the form when it goes: Cancel, leaving
+    // the page, or the page closing it once the listing is saved. Remove
+    // revokes its photo's as it goes.
     use_drop(move || {
         #[cfg(target_arch = "wasm32")]
         for d in photos.peek().iter() {

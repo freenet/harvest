@@ -316,10 +316,19 @@ fn a_photo_change_is_a_new_listing() {
     let original = jam(listing_images(&[published(1, true)]).unwrap()).with_derived_id();
     let mut drafts = drafts_from_listing(Some(&original));
     assert_eq!(add_photo(&mut drafts, added(3)), Added::New);
-    let Submission { listing, pending } =
-        plan_submission(Some(&original), " Jam ", "", None, Vec::new(), &drafts, now).unwrap();
+    let Submission { listing, pending } = plan_submission(
+        Some(&original),
+        " Jam ",
+        " Sweet ",
+        None,
+        Vec::new(),
+        &drafts,
+        now,
+    )
+    .unwrap();
     assert_ne!(listing.id, original.id);
     assert_eq!(listing.title, "Jam", "trimmed");
+    assert_eq!(listing.description, "Sweet", "trimmed");
     assert_eq!(listing.created_at, now);
     assert_eq!(listing.id, listing.clone().with_derived_id().id);
     assert_eq!(listing.images.len(), 2);

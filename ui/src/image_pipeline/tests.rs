@@ -101,6 +101,8 @@ fn a_full_photo_over_its_limits_is_refused() {
     big.splice(at..at, std::iter::repeat_n(0u8, MAX_IMAGE_BYTES));
     assert!(harvest_image::sniff(&big).is_ok());
     assert!(prepare(&big, FIREFOX_JPEG, [0; 3]).is_err());
+    // Over the edge, `sniff` refuses first (the contract's own limit, the
+    // same 2048); `prepare`'s own edge check is the thumbnail test's.
     let edge = harvest_common::listing_image::MAX_IMAGE_EDGE;
     let wide = with_dimensions(CANVAS_JPEG, edge + 1, 100);
     assert!(prepare(&wide, FIREFOX_JPEG, [0; 3]).is_err());
