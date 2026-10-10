@@ -204,6 +204,32 @@ mod tests {
         assert!(state_with(vec![wrong]).is_err());
     }
 
+    /// A store holds one pause, so a delta may carry one: two (here a pause
+    /// and the resume after it, both genuine) are refused whole, before
+    /// either is checked, and the store is left as it was. Mutated red by
+    /// raising the bound to 2.
+    #[test]
+    fn a_delta_of_two_pauses_is_refused() {
+        let mut state = state_with(vec![signed(&store_key(), 1, true)]).unwrap();
+        let held = state.clone();
+        let why = state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(store_key().verifying_key()),
+                    pause: Some(vec![
+                        signed(&store_key(), 2, true),
+                        signed(&store_key(), 3, false),
+                    ]),
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
+        assert_eq!(state, held);
+    }
+
     /// A store never paused encodes, summarizes and deltas exactly as it did
     /// before the pause existed, so every earlier state passes the
     /// re-encoding check. Mutated red by dropping `skip_serializing_if`.

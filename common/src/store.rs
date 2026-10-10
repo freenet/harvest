@@ -2806,6 +2806,58 @@ mod order_tests {
         assert!(through_apply_delta(&held, &p, &delta).is_err());
     }
 
+    /// Step 2: a forged store info that a LATER update of the same
+    /// `update_state` call replaces is in no result, so `validate_state`
+    /// never sees it: `Unchecked::check` must, and the call is refused as
+    /// `apply_delta` refused its first update. Mutated red by skipping the
+    /// info's check.
+    #[test]
+    fn a_forged_info_a_later_update_replaces_is_still_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let info = |version: u32, forged: bool| {
+            let info = StoreInfoV1 {
+                version,
+                certificate_pem: String::new(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [0u8; 32],
+                store_name: format!("version {version}"),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            };
+            let (scoped_payload, mut signature) = sign_scoped(&seller, &info);
+            if forged {
+                signature[0] ^= 1;
+            }
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let delta = |info: AuthorizedStoreInfoV1| StoreStateV1Delta {
+            info: Some(info),
+            ..Default::default()
+        };
+        for forged in [false, true] {
+            let mut merged = parent();
+            let mut unchecked = Unchecked::default();
+            for update in [delta(info(1, forged)), delta(info(2, false))] {
+                merged.apply_update(&p, &update, &mut unchecked).unwrap();
+            }
+            assert_eq!(merged.info, info(2, false), "the later info replaced it");
+            let checked = unchecked.check(&merged);
+            if forged {
+                let why = checked.unwrap_err();
+                assert!(why.contains("store info"), "{why}");
+                assert!(through_apply_delta(&parent(), &p, &delta(info(1, true))).is_err());
+            } else {
+                checked.expect("genuine infos pass");
+            }
+        }
+    }
+
     /// Step 2, seeded: genuine and forged orders, at and past the bound,
     /// against a full store, in deltas of one to several records. Every
     /// delta the node path accepts, `apply_delta` accepts, to the same state,
