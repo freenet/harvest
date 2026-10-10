@@ -57,7 +57,6 @@ use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 
 /// How many backings one store holds.
@@ -825,7 +824,7 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
 
 /// The `ScopedPayload` envelope around `payload`, with the Harvest webapp as
 /// requestor: the same shape the Ghost Key vault signs, so
-/// [`verify_scoped_signature`] verifies a store-key signature exactly as it
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature) verifies a store-key signature exactly as it
 /// verifies a Ghost Key's.
 ///
 /// Built with `ghostkey-common`'s own type when that feature is on, which is
@@ -845,7 +844,7 @@ pub fn store_key_envelope(payload: Vec<u8>) -> Result<Vec<u8>, String> {
     }
 }
 
-/// [`verify_scoped_signature`], for a record a store holds whose content has
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature), for a record a store holds whose content has
 /// a fixed shape (step 2): `scoped` must also be EXACTLY the Harvest envelope
 /// of `data` ([`is_exact_harvest_envelope`]).
 ///
@@ -866,7 +865,16 @@ pub fn verify_exact_scoped_signature<T: Serialize>(
     if !exact_envelope(scoped, data) {
         return Err("its signed payload is not exactly the Harvest envelope of the record".into());
     }
-    verify_scoped_signature(scoped, signature, key, data)
+    // `scoped` is now byte for byte the envelope of `data` with a Harvest
+    // webapp as requestor, which is everything `verify_scoped_signature`
+    // decodes the envelope to compare: only the signature is left, and
+    // decoding and encoding again would only add cost.
+    use ed25519_dalek::Verifier;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| format!("signature must be 64 bytes, got {}", signature.len()))?;
+    key.verify(scoped, &ed25519_dalek::Signature::from_bytes(&signature))
+        .map_err(|e| format!("signature verification failed: {e}"))
 }
 
 /// Whether `scoped` is exactly the Harvest envelope of `data`'s encoding
@@ -879,7 +887,7 @@ pub fn exact_envelope<T: Serialize>(scoped: &[u8], data: &T) -> bool {
 /// around `payload`, for the canonical Harvest webapp id or a legacy one
 /// (`LEGACY_HARVEST_WEBAPP_CONTRACT_IDS`).
 ///
-/// [`verify_scoped_signature`] decodes the envelope and compares the inner
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature) decodes the envelope and compares the inner
 /// payload, which is the right check for a record whose envelope nobody
 /// keeps; it lets a signer append bytes after the CBOR item, or add a map
 /// key the decoder skips, and still verify. A record that is stored forever
@@ -2387,8 +2395,13 @@ mod tests {
         };
         let (scoped, sig) =
             sign_with_store_key(&store_key(), crate::to_cbor(&retirement).unwrap()).unwrap();
-        verify_scoped_signature(&scoped, &sig, &store_key().verifying_key(), &retirement)
-            .expect("the same verifier as every other record");
+        crate::listing::verify_scoped_signature(
+            &scoped,
+            &sig,
+            &store_key().verifying_key(),
+            &retirement,
+        )
+        .expect("the same verifier as every other record");
         // And the envelope is ghostkey-common's own type, requestor included.
         #[cfg(feature = "ghostkey")]
         {
