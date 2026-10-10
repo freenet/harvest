@@ -245,8 +245,10 @@ fn the_listing_is_published_only_after_every_upload() {
         vec![([1; 32], vec![1]), ([2; 32], vec![2])],
         |h, _| {
             calls.borrow_mut().push(h);
+            // The FIRST fails, so an upload loop that stops at a failure
+            // is caught by the count below.
             async move {
-                if h == [2; 32] {
+                if h == [1; 32] {
                     Err("refused".to_string())
                 } else {
                     Ok(())
