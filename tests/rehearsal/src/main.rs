@@ -709,7 +709,12 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     assert!(full.complaints.len() > MAX_COMPLAINTS);
 
     println!("  PUT all {} to the uncapped build ...", full.complaints.len());
-    node.put(old_container, full_bytes.clone()).await.expect("the uncapped build accepts 150");
+    // In the encoding that build reads: it predates step 2's byte strings,
+    // and decodes a complaint's order's signed payload and signature only
+    // as integer arrays (round 1 of step 2's review).
+    node.put(old_container, in_array_form(&full_bytes))
+        .await
+        .expect("the uncapped build accepts 150");
     let old_bytes = match node.get(old_id).await {
         GetOutcome::State(bytes) => bytes,
         other => panic!("the uncapped record did not read back: {other:?}"),
@@ -754,14 +759,29 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     assert_eq!(carried.owner_certificate_pem, CERT, "the certificate is carried");
 
     println!("\n  -- the uncapped record's full state as an UpdateData::State merge into this build --");
-    node.update_state(curr_key, old_bytes.clone()).await.expect("the node accepts the 150-complaint state merge");
+    // In this build's encoding, as a client of this build sends it: the
+    // contract holds its state to canonical CBOR, which the uncapped build's
+    // integer arrays are not (the fold above re-encodes the same way).
+    let old_reencoded = harvest_common::to_cbor(&old_state).unwrap();
+    // A node that validates an incoming state before merging it (freenet
+    // 0.2.142 does) refuses one over the cap; one that merges it must land
+    // on the same 146. Either way the record is the carried one.
+    let over_cap = format!("at most {MAX_COMPLAINTS} complaints");
+    let merged_in = match node.update_state(curr_key, old_reencoded).await {
+        Ok(()) => true,
+        Err(e) if e.contains(&over_cap) => {
+            println!("  refused by the node's validation of the incoming state: {e}");
+            false
+        }
+        Err(e) => panic!("the 150-complaint state merge: {e}"),
+    };
     let after_update = match node.get(curr_id).await {
         GetOutcome::State(bytes) => bytes,
         other => panic!("this build's record did not read back: {other:?}"),
     };
     assert_capped("after the state merge", &after_update, &params, &honest, &farthest);
     assert_eq!(after_update, after_put, "the merge of the full state changes nothing: the same 146");
-    println!("  identical bytes to the carried record: yes");
+    println!("  identical bytes to the carried record: yes (merged in: {merged_in})");
 
     // The same merge into a record that holds none of them yet, so the
     // contract's own `update_state` is what drops the four.
@@ -775,14 +795,22 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
         container(&current, migrate::encode_params(&params2).expect("encode"));
     let curr2_key = curr2_container.key().clone();
     let empty = harvest_common::to_cbor(&ReputationStateV1 { owner_certificate_pem: CERT.into(), complaints: Vec::new() }).unwrap();
-    node.put(curr2_container, empty).await.expect("a certificate-only record");
+    node.put(curr2_container, empty.clone()).await.expect("a certificate-only record");
     let (full2, honest2, farthest2) = over_cap_record(&fx2, CERT);
-    node.update_state(curr2_key, harvest_common::to_cbor(&full2).unwrap())
-        .await
-        .expect("the node accepts the 150-complaint state merge");
+    let merged_in2 = match node.update_state(curr2_key, harvest_common::to_cbor(&full2).unwrap()).await {
+        Ok(()) => true,
+        Err(e) if e.contains(&over_cap) => {
+            println!("  refused by the node's validation of the incoming state: {e}");
+            false
+        }
+        Err(e) => panic!("the 150-complaint state merge: {e}"),
+    };
     match node.get(curr2_id).await {
-        GetOutcome::State(bytes) => {
+        GetOutcome::State(bytes) if merged_in2 => {
             assert_capped("second store after the state merge", &bytes, &params2, &honest2, &farthest2);
+        }
+        GetOutcome::State(bytes) => {
+            assert_eq!(bytes, empty, "a refused merge leaves the certificate-only record");
         }
         other => panic!("the second record did not read back: {other:?}"),
     }
@@ -790,8 +818,9 @@ async fn scenario_reputation_cap_carried(node: &mut Node, repo: &Path) {
     println!(
         "  SCENARIO 4d PASSED: {} complaints under the uncapped build carried to this build's record as {} \
          (cap {MAX_COMPLAINTS}); all {} honest kept, the 4 farthest-dated dropped, verify OK; the full state \
-         as an UpdateData::State merge gives the same {} (and {} into a certificate-only record)",
-        full.complaints.len(), MAX_COMPLAINTS, honest.len(), MAX_COMPLAINTS, MAX_COMPLAINTS
+         as an UpdateData::State merge gives the same {} or is refused by the node, merged in: {merged_in} (into a \
+         certificate-only record, merged in: {merged_in2})",
+        full.complaints.len(), MAX_COMPLAINTS, honest.len(), MAX_COMPLAINTS
     );
 }
 
@@ -1018,7 +1047,7 @@ async fn scenario_newest_store_generation(node: &mut Node, repo: &Path, current:
         },
         ..Default::default()
     };
-    node.put(old_container, harvest_common::to_cbor(&planted).unwrap())
+    node.put(old_container, store_bytes_for(newest.generation, &planted))
         .await
         .expect("PUT at the newest superseded generation");
     let (outcome, seal) = run_probe(node, &vk, migrate::store_candidates(&vk).unwrap()).await;
@@ -1235,6 +1264,64 @@ fn two_newest(
         (e.generation, legacy_wasm_from_git(repo, artifact, &hex::encode(e.code_hash)))
     };
     [pick(gens[0]), pick(gens[1])]
+}
+
+/// The last store generation that wrote its signed records' signed payload
+/// and signature as CBOR integer arrays; step 2 made them byte strings, and
+/// a generation's contract accepts only its own encoding as canonical.
+const LAST_ARRAY_FORM_STORE_GENERATION: u32 = 27;
+
+/// A store state as the contract of `generation` writes it (the mailbox's
+/// `mailbox_bytes_for`, for the store): today's encoding with every signed
+/// record's outer byte fields as integer arrays up to
+/// [`LAST_ARRAY_FORM_STORE_GENERATION`].
+fn store_bytes_for(generation: u32, state: &StoreStateV1) -> Vec<u8> {
+    let bytes = harvest_common::to_cbor(state).unwrap();
+    if generation > LAST_ARRAY_FORM_STORE_GENERATION {
+        return bytes;
+    }
+    in_array_form(&bytes)
+}
+
+/// `bytes` with every signed record's outer signed payload and signature as
+/// CBOR integer arrays, as builds before step 2 wrote (and, decoding
+/// `Vec<u8>` as a sequence, read) them.
+fn in_array_form(bytes: &[u8]) -> Vec<u8> {
+    use ciborium::Value;
+    const FIELDS: [&str; 8] = [
+        "scoped_payload",
+        "signature",
+        "backer_scoped_payload",
+        "backer_signature",
+        "acceptance_scoped_payload",
+        "acceptance_signature",
+        "status_scoped_payload",
+        "status_signature",
+    ];
+    fn rewrite(value: Value) -> Value {
+        match value {
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let named = matches!(&k, Value::Text(t) if FIELDS.contains(&t.as_str()));
+                        let v = match v {
+                            Value::Bytes(b) if named => Value::Array(
+                                b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                            ),
+                            other => rewrite(other),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(rewrite).collect()),
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(rewrite(*inner))),
+            other => other,
+        }
+    }
+    let value: Value = harvest_common::from_cbor(bytes).unwrap();
+    harvest_common::to_cbor(&rewrite(value)).unwrap()
 }
 
 /// The last mailbox generation that wrote its message bytes as CBOR integer
@@ -1841,6 +1928,8 @@ const ENCODING_BY_GENERATION: &[(u32, Shape)] = {
         (25, Code),
         // V26: listing photos (`57979f8`, harvest#215). Still the store code.
         (26, Code),
+        // V27: harvest#229 (`48bdbab`). Still the store code.
+        (27, Code),
     ]
 };
 

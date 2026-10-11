@@ -859,17 +859,40 @@ pub(crate) fn merge_store_reporting_discard(
     side: DiscardedSide,
 ) -> FoldOutcome<StoreStateV1> {
     use freenet_scaffold::ComposableState;
-    let base = name_whole_key_owner(base, seller);
-    let owned_other = name_whole_key_owner(other.clone(), seller);
-    let other = &owned_other;
+    // Each side's listings and orders as this generation keeps them BEFORE
+    // the merge, so a record an earlier generation kept (a `Paid` on padded
+    // evidence, say) cannot outrank the other side's in it, and then be
+    // stripped after. The other side's listing statuses too, because it is
+    // the side that sends them, and a delta may carry no more than a store
+    // holds; the base's are cut by `normalize_carried` below, which keeps
+    // the same newest ones (the cut is a function of the union:
+    // `SignedSetV1::cut_to_newest`). Not the despatches yet: one side's
+    // despatch may name an order only the other side holds. And first, on
+    // both sides, what this generation's byte bounds refuse is dropped
+    // (`drop_unbounded`, step 2): on the other side, so one such record does
+    // not discard the whole side; on the base, BEFORE the merge, because a
+    // padded record there can outrank the other side's genuine one for its
+    // slot, and dropping it after would lose both.
+    let mut base = name_whole_key_owner(base, seller);
+    base.drop_unbounded();
+    base.listings.normalize();
+    base.orders.normalize();
+    let mut owned_other = name_whole_key_owner(other.clone(), seller);
+    owned_other.drop_unbounded();
+    owned_other.listings.normalize();
+    owned_other.orders.normalize();
+    owned_other.listing_statuses.normalize();
     let snapshot = base.clone();
-    let mut outcome =
-        fold_or_keep_primary("store", base, |base| base.merge(&snapshot, params, other));
-    // The scaffold's merge skips `ListingsV1::apply_delta` when the other side
-    // brings nothing new, so a base written under the old, permissive `verify`
-    // would be carried forward unsorted, and the current contract refuses that
-    // (harvest#26).
-    outcome.state.listings.normalize();
+    let mut outcome = fold_or_keep_primary("store", base, |base| {
+        base.merge(&snapshot, params, &owned_other)
+    });
+    // Both sides were held to this generation's rules before the merge
+    // (above), and the merge keeps them; once more after it costs little and
+    // guards what the scaffold's merge skips: a base written under an older
+    // `verify` would otherwise be carried forward as it was (harvest#26),
+    // and the predecessor is the BASE when the driver folds a recovered
+    // state into a local one (`merge_with_local`).
+    outcome.state.normalize_carried();
     // Nor does it touch a version-0 info, and a predecessor written before the
     // PR #82 re-review can hold unsigned content there: anything was accepted
     // at version 0. Carried forward, it would make the new contract refuse

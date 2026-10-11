@@ -885,6 +885,29 @@ pub async fn submit_listing_by_id(
     Ok(())
 }
 
+/// Publish a signed pause or resume (step 2) to one of our stores.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_store_pause_by_id(
+    store_contract_id: &[u8],
+    pause: harvest_common::store_pause::AuthorizedStorePause,
+) -> Result<(), String> {
+    use freenet_stdlib::prelude::*;
+
+    let (contract_key, _origin, owner) =
+        owned_store_key(store_contract_id, "nothing to pause").await?;
+    let delta_bytes = harvest_common::to_cbor(&harvest_common::store::StoreStateV1Delta {
+        owner: Some(owner),
+        pause: Some(vec![pause]),
+        ..Default::default()
+    })
+    .map_err(|e| format!("serialize store pause delta: {e}"))?;
+    super::update_contract(
+        &contract_key,
+        UpdateData::Delta(StateDelta::from(delta_bytes)),
+    )
+    .await
+}
+
 /// Publish a listing's availability, already signed by the store key, to one
 /// of our stores (harvest#70).
 ///
@@ -1273,6 +1296,7 @@ mod tests {
         for writer in [
             "submit_listing_by_id",
             "submit_listing_status_by_id",
+            "submit_store_pause_by_id",
             "spawn_publish_copy",
             "submit_store_info_by_id",
             "submit_despatch_by_id",
@@ -1286,7 +1310,7 @@ mod tests {
         }
         assert!(body_of("submit_settled_order_by_id").contains("settlement_store_key("));
         // One send per writer above: a new store write has to join the list.
-        assert_eq!(src.matches("super::update_contract(").count(), 8);
+        assert_eq!(src.matches("super::update_contract(").count(), 9);
     }
 
     /// Each turn of a waiting write (harvest#164): a store on its current

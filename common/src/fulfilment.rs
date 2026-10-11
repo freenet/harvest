@@ -42,7 +42,6 @@ use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::BlockAnchor;
 use serde::{Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::payment::OrderId;
 use crate::store::Bytes32;
 
@@ -66,15 +65,22 @@ pub struct AuthorizedDespatch {
     pub despatch: Despatch,
     /// CBOR `ScopedPayload` over `despatch`, as the store key signs it
     /// (`backing::store_key_envelope`).
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
 impl AuthorizedDespatch {
     /// Whether `owner`, the store's key, signed this despatch.
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.despatch)
-            .map_err(|e| format!("despatch is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.despatch,
+        )
+        .map_err(|e| format!("despatch is not signed by the store key: {e}"))
     }
 }
 
@@ -88,8 +94,22 @@ impl crate::backing::SignedRecord for AuthorizedDespatch {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.despatch)
+    }
     const WHAT: &'static str = "despatch";
+    // One per order held (`StoreStateV1::normalize_fulfilment`).
+    const MAX_RECORDS: usize = crate::store::MAX_ORDERS;
 }
+
+/// How many blocks after payment the seller has to send: about a week.
+/// Shared by the app's order stages and the seller's delegate, which drops a
+/// sent order's ship-to once its complaint window has closed.
+pub const DESPATCH_WINDOW_BLOCKS: u32 = 1008;
+
+/// How many blocks a buyer has to complain, from the later of the despatch
+/// deadline and the despatch's own anchor: about two weeks.
+pub const COMPLAINT_WINDOW_BLOCKS: u32 = 2016;
 
 /// Every despatch a store holds, one per order it still holds.
 ///

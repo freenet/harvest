@@ -256,8 +256,10 @@ pub struct StoreInfoV1 {
 pub struct AuthorizedStoreInfoV1 {
     pub info: StoreInfoV1,
     /// CBOR-serialized ScopedPayload from the ghostkey delegate's SignResult.
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
     /// Ed25519 signature over the scoped_payload bytes.
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -305,6 +307,11 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
                 Err("store info at version 0 must be empty: nothing signs it".into())
             };
         }
+        if !self.within_cap() {
+            return Err(format!(
+                "store info is past {MAX_INFO_BYTES} bytes as it encodes"
+            ));
+        }
         verify_scoped_signature(
             &self.scoped_payload,
             &self.signature,
@@ -341,20 +348,43 @@ impl freenet_scaffold::ComposableState for AuthorizedStoreInfoV1 {
         _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        if let Some(new_info) = delta {
-            if new_info.info.version <= self.info.version {
-                return Ok(()); // stale update, ignore
-            }
-            verify_scoped_signature(
-                &new_info.scoped_payload,
-                &new_info.signature,
-                owner_key(parent_state)?,
-                &new_info.info,
-            )
-            .map_err(|e| format!("store info delta signature invalid: {e}"))?;
+        if let Some(new_info) = self.admit(delta) {
+            new_info.check_signature(owner_key(parent_state)?)?;
             *self = new_info.clone();
         }
         Ok(())
+    }
+}
+
+impl AuthorizedStoreInfoV1 {
+    /// The info a merge takes from `delta`: one at a higher version than
+    /// held, within [`MAX_INFO_BYTES`]. A stale one is ignored, and so is
+    /// one past the bound (step 2): a pure function of the one record, as
+    /// `as_kept` is for orders, so the merge laws hold.
+    pub(crate) fn admit<'a>(&self, delta: &'a Option<Self>) -> Option<&'a Self> {
+        delta
+            .as_ref()
+            .filter(|new_info| new_info.info.version > self.info.version && new_info.within_cap())
+    }
+
+    /// Whether this info takes at most [`MAX_INFO_BYTES`] as it encodes.
+    /// Its strings and signed payload are a floor on that, so a padded one
+    /// is judged without encoding it.
+    pub fn within_cap(&self) -> bool {
+        let info = &self.info;
+        let floor = self.scoped_payload.len()
+            + info.certificate_pem.len()
+            + info.seller_fingerprint.len()
+            + info.store_name.len()
+            + info.description.len()
+            + info.record_public_key.as_ref().map_or(0, Vec::len);
+        floor <= MAX_INFO_BYTES
+            && crate::to_cbor(self).is_ok_and(|bytes| bytes.len() <= MAX_INFO_BYTES)
+    }
+
+    fn check_signature(&self, owner: &VerifyingKey) -> Result<(), String> {
+        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.info)
+            .map_err(|e| format!("store info delta signature invalid: {e}"))
     }
 }
 
@@ -390,11 +420,60 @@ impl ListingsV1 {
     /// whose base may be a predecessor's state written under the old,
     /// permissive `verify` (harvest#26). A stable sort keeps the first of two
     /// equal ids, which is the one already held.
+    ///
+    /// Then the caps (step 2): a listing over [`MAX_LISTING_BYTES`] is
+    /// dropped, and of the rest the [`MAX_LISTINGS`] newest are kept, by
+    /// `created_at` and then id. Both are pure functions of the set held,
+    /// and both commute with merging: the size rule looks at one listing
+    /// alone, and every listing a cut keeps outranks every one it drops, so
+    /// whatever is cut from a part is cut from any union containing it.
+    /// Nothing an order needs is lost: an order carries its own terms and
+    /// proof, and names its listing only by an opaque tag.
     pub fn normalize(&mut self) {
+        self.listings.retain(fits);
         self.listings
             .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
         self.listings.dedup_by(|a, b| a.listing.id == b.listing.id);
+        if self.listings.len() > MAX_LISTINGS {
+            let mut newest: Vec<(chrono::DateTime<chrono::Utc>, ListingId)> = self
+                .listings
+                .iter()
+                .map(|l| (l.listing.created_at, l.listing.id.clone()))
+                .collect();
+            // The id tie-break is what the stable sort of id-sorted listings
+            // gives anyway (so a mutation dropping it survives); it is
+            // written out so the order does not rest on the sort above.
+            newest.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            newest.truncate(MAX_LISTINGS);
+            let kept: std::collections::BTreeSet<ListingId> =
+                newest.into_iter().map(|(_, id)| id).collect();
+            self.listings.retain(|l| kept.contains(&l.listing.id));
+        }
     }
+}
+
+/// Whether one listing is within [`MAX_LISTING_BYTES`] as it encodes.
+fn fits(listing: &AuthorizedListing) -> bool {
+    crate::to_cbor(listing).is_ok_and(|bytes| bytes.len() <= MAX_LISTING_BYTES)
+}
+
+/// Whether `listing`, once the store key signs it and it carries
+/// `certificate_pem`, is within [`MAX_LISTING_BYTES`]: what the app checks
+/// before asking for a signature, so a listing the store would drop is
+/// never published. Exact: the signed payload is
+/// [`crate::backing::store_key_envelope`] of the listing, which is what the
+/// store key signs, and a signature is 64 bytes.
+pub fn listing_fits_once_signed(listing: &crate::listing::Listing, certificate_pem: &str) -> bool {
+    let Ok(scoped_payload) = crate::to_cbor(listing).and_then(crate::backing::store_key_envelope)
+    else {
+        return false;
+    };
+    fits(&AuthorizedListing {
+        listing: listing.clone(),
+        scoped_payload,
+        signature: vec![0u8; 64],
+        certificate_pem: certificate_pem.to_string(),
+    })
 }
 
 impl freenet_scaffold::ComposableState for ListingsV1 {
@@ -408,6 +487,20 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Result<(), String> {
+        // The caps first: they are cheap, and a state over them is refused
+        // before a single signature is checked.
+        if self.listings.len() > MAX_LISTINGS {
+            return Err(format!(
+                "store holds {} listings, the most it keeps is {MAX_LISTINGS}",
+                self.listings.len()
+            ));
+        }
+        if let Some(big) = self.listings.iter().find(|l| !fits(l)) {
+            return Err(format!(
+                "listing {} is over {MAX_LISTING_BYTES} bytes",
+                big.listing.id
+            ));
+        }
         for authorized in &self.listings {
             authorized.verify(owner_key(parent_state)?)?;
             crate::listing_image::check_listing_images(&authorized.listing)?;
@@ -423,6 +516,8 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         // new contract starts empty, and the migration fold builds its state
         // through `apply_delta`, which normalises (see below), so no state
         // this generation holds was written by the old, permissive code.
+        // And within the caps `normalize` keeps (step 2, checked above),
+        // safe for the same reason.
         for pair in self.listings.windows(2) {
             if pair[0].listing.id >= pair[1].listing.id {
                 return Err(format!(
@@ -468,35 +563,60 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
         _parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        if let Some(new_listings) = delta {
-            let mut known_ids: std::collections::HashSet<ListingId> =
-                self.listings.iter().map(|l| l.listing.id.clone()).collect();
-
-            // Collect first, push after. Verifying and pushing in one pass
-            // left a delta of [valid, invalid] with the valid listing already
-            // in `self` when the error returned -- see `OrdersV1::apply_delta`
-            // for the same defect and why the call site's habit of discarding
-            // the state on error is not a substitute for this.
-            let mut to_add = Vec::new();
-            for listing in new_listings {
-                // `insert` is false for a listing already held -- including
-                // one added by an EARLIER entry of this same delta, which the
-                // snapshot this used to take before the loop could not see, so
-                // a delta naming one listing twice stored it twice. `listings`
-                // is a plain `Vec` with no uniqueness invariant of its own, so
-                // that duplicate then survived every later merge and sort.
-                if !known_ids.insert(listing.listing.id.clone()) {
-                    continue; // already have this listing
-                }
-                listing.verify(owner_key(parent_state)?)?;
-                crate::listing_image::check_listing_images(&listing.listing)?;
-                to_add.push(listing.clone());
-            }
-            self.listings.extend(to_add);
+        let Some(new_listings) = delta else {
+            self.normalize();
+            return Ok(());
+        };
+        // Collect first, push after. Verifying and pushing in one pass left a
+        // delta of [valid, invalid] with the valid listing already in `self`
+        // when the error returned -- see `OrdersV1::apply_delta` for the same
+        // defect and why the call site's habit of discarding the state on
+        // error is not a substitute for this.
+        let fresh = self.admit(new_listings)?;
+        for listing in &fresh {
+            listing.verify(owner_key(parent_state)?)?;
+            crate::listing_image::check_listing_images(&listing.listing)?;
         }
-
-        self.normalize();
+        self.merge_unchecked(fresh);
         Ok(())
+    }
+}
+
+impl ListingsV1 {
+    /// The listings of `incoming` a merge takes: not one held, nor one the
+    /// delta already named. A delta of more than [`MAX_LISTINGS`] is refused
+    /// whole (step 2): no store holds more, so the rest are copies or
+    /// listings the cut would drop.
+    pub(crate) fn admit<'a>(
+        &self,
+        incoming: &'a [AuthorizedListing],
+    ) -> Result<Vec<&'a AuthorizedListing>, String> {
+        if incoming.len() > MAX_LISTINGS {
+            return Err(format!(
+                "a listing delta of {} records is more than a store holds ({MAX_LISTINGS})",
+                incoming.len()
+            ));
+        }
+        let mut known_ids: std::collections::HashSet<&ListingId> =
+            self.listings.iter().map(|l| &l.listing.id).collect();
+        // `insert` is false for a listing already held -- including one
+        // added by an EARLIER entry of this same delta, which the snapshot
+        // this used to take before the loop could not see, so a delta naming
+        // one listing twice stored it twice. `listings` is a plain `Vec` with
+        // no uniqueness invariant of its own, so that duplicate then survived
+        // every later merge and sort.
+        Ok(incoming
+            .iter()
+            .filter(|listing| known_ids.insert(&listing.listing.id))
+            .collect())
+    }
+
+    /// Add listings WITHOUT verifying them, then sort and cut: for a caller
+    /// that has, or that checks what was kept and what was not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked(&mut self, listings: Vec<&AuthorizedListing>) {
+        self.listings.extend(listings.into_iter().cloned());
+        self.normalize();
     }
 }
 
@@ -506,14 +626,43 @@ impl freenet_scaffold::ComposableState for ListingsV1 {
 /// A [`crate::backing::SignedSetV1`] like the backings, with one difference:
 /// two statuses for one listing resolve to the higher `revision` before the
 /// smaller encoding, so a later status supersedes an earlier one. Nothing
-/// removes a status, and a status for a listing the store does not hold is
-/// kept, since it may arrive first.
+/// removes a status by itself, and a status for a listing the store does not
+/// hold is kept, since it may arrive first.
 ///
-/// Unbounded, as the listings are. Only the store key's holder can add one,
-/// and one is kept per listing id, but a status need not name a listing the
-/// store holds, so the holder can add as many as they sign. That is their own
-/// store's state to grow, the same exposure the listings already carry.
+/// At most [`MAX_LISTING_STATUSES`], the newest by revision (step 2): see
+/// there for why that many, and `SignedSetV1::cut_to_newest` for why the cut
+/// obeys the merge laws.
 pub type ListingStatusesV1 = crate::backing::SignedSetV1<crate::listing::AuthorizedListingStatus>;
+
+/// The most listing statuses a store keeps (step 2): the
+/// `MAX_LISTING_STATUSES` with the highest revisions, the smaller listing id
+/// first between two at one revision.
+///
+/// A store holds one status per listing id, but every edit publishes a new
+/// listing and withdraws the old one, so the ids, and their statuses, grow
+/// with the edit history. Before this bound nothing stopped them, and two
+/// copies of a store near [`MAX_STORE_BYTES`] could each refuse the other's
+/// last edit.
+///
+/// # Why this many
+///
+/// Every reader of a status reads it for a listing the store holds (the
+/// UI's listing pages and `listing_status_flow`, the delegate's `settle` and
+/// light store read), and a status for a listing it cannot find is ignored.
+/// So the bound must never cut a held listing's status: if it did, a listing
+/// sold out or taken down would read as on sale again, since a listing with
+/// no status reads that way.
+///
+/// Cutting held listing X's status takes this many newer statuses on other
+/// listings. The app signs a status only for a listing the store holds, and
+/// a revision is the time it was signed, so each of those was for a listing
+/// held at some time since X's status. While X is held, fewer than
+/// [`MAX_LISTINGS`] listings are newer than it, and the older ones held since
+/// were held alongside X when its status was signed, fewer than
+/// [`MAX_LISTINGS`] again: at most 254 in all. Twice that again leaves room
+/// for clocks that disagree across a seller's devices, at about 550 bytes a
+/// status (280 KB in all).
+pub const MAX_LISTING_STATUSES: usize = 4 * MAX_LISTINGS;
 
 impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     fn slot(&self) -> Bytes32 {
@@ -522,11 +671,40 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        crate::backing::exact_envelope(&self.scoped_payload, &self.status)
+    }
     fn rank(&self) -> u64 {
         self.status.revision
     }
     const WHAT: &'static str = "listing status";
+    const MAX_RECORDS: usize = MAX_LISTING_STATUSES;
+    const CUT_TO_NEWEST: bool = true;
 }
+
+/// The most listings a store keeps (step 2): the newest, by
+/// [`ListingsV1::normalize`]. Every version of a listing counts, since an
+/// edit publishes a new listing and withdraws the old one, so the ones cut
+/// first are usually old versions already taken down.
+///
+/// Sized with [`MAX_ORDERS`], by the node's 5 s limit on one contract call:
+/// on a node, a store of 500 paid orders and 512 listings was refused on
+/// PUT one time in three and on a one-listing delta every time, while 256
+/// listings with 500 orders fitted every run (2026-10-04 wall-time matrix).
+/// 128 leaves room for listings at the per-listing bound, and for paid
+/// records at [`MAX_ORDER_BYTES`] (see [`MAX_ORDERS`]). The seller's own
+/// delegate reads the whole store on every instant-checkout decision too,
+/// within one call's budget (`tests/delegate-budget`).
+pub const MAX_LISTINGS: usize = 128;
+
+/// The most bytes one listing takes, as its signed record encodes (step 2).
+/// A larger listing is dropped by [`ListingsV1::normalize`], as an item rule,
+/// so with [`MAX_LISTINGS`] a store's listings take at most 4 MiB. A cap on
+/// the listings' TOTAL bytes would not do: cutting a ranked list where its
+/// running total passes a budget does not commute with merging (an element
+/// cut in one merge can leave room for a later one that a single merge of
+/// everything would also cut), so replicas could disagree.
+pub const MAX_LISTING_BYTES: usize = 32 * 1024;
 
 /// How many orders one store contract will hold.
 ///
@@ -535,9 +713,29 @@ impl crate::backing::SignedRecord for crate::listing::AuthorizedListingStatus {
 /// claims plus a signed chain tip -- easily hundreds of bytes to a few KB per
 /// order. Without a cap a popular store's state (and, worse, its per-heartbeat
 /// summary -- see `OrdersV1`'s `Summary`) would grow without bound. On
-/// overflow the least-relevant orders are dropped first: see
-/// `enforce_order_cap`.
-pub const MAX_ORDERS: usize = 4096;
+/// overflow the oldest orders are dropped first: see `enforce_order_cap`.
+///
+/// # Why 256
+///
+/// It is a bound on work, and has to hold for PAID orders, which cost
+/// nothing of value on signet. Every call validates every order's proof:
+/// on a node, a store of 1,000 paid orders took 3 to 4 s to PUT and 4 to 6
+/// s for a one-listing delta against the node's 5 s limit, and every PUT of
+/// 4,096 was refused. 500 fitted every run with ordinary proofs, but a paid
+/// record may take up to [`MAX_ORDER_BYTES`] (8 KiB), and with every
+/// order at that bound and [`MAX_LISTINGS`] full at 32 KiB, 384 orders took
+/// up to 3.1 s to PUT and 4.5 s for a one-listing delta, while 256 took at
+/// most 1.8 s and 2.2 s, every run (2026-10-09 wall-time runs, step 2).
+///
+/// The store is the place an order lives while it is acted on: paid, sent,
+/// and complained about (Ian, 2026-10-09: the store holds an order until
+/// its complaint window closes, and history then lives in each side's
+/// delegate). With honest traffic 256 orders outlast that window (about 21
+/// days) up to about 12 instant orders a day; under Buy-now spam (100 a
+/// day, see `enforce_order_cap`) an order rolls off after about 2.5 days,
+/// which is why the seller's and the buyer's delegates each keep their own
+/// copies.
+pub const MAX_ORDERS: usize = 256;
 
 /// Small state-change fingerprint for one order, used only to let
 /// [`OrdersV1::delta`] detect a same-rank content change (see that impl's
@@ -640,6 +838,8 @@ fn order_content_digest(record: &AuthorizedOrder) -> [u8; 32] {
 /// This is a `max` over the total order `(rank, Reverse(cbor_bytes))`, so it
 /// is associative, commutative and idempotent -- the three properties the
 /// merge tests in this module pin directly on serialized bytes.
+///
+/// Every incoming record has been through [`as_kept`] first.
 fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: AuthorizedOrder) {
     let id = incoming.order.id.clone();
     let Some(existing) = orders.get(&id) else {
@@ -719,11 +919,16 @@ fn merge_order(orders: &mut BTreeMap<OrderId, AuthorizedOrder>, incoming: Author
 /// `the_order_cap_obeys_the_merge_laws_at_the_cap`.
 ///
 /// What it costs: an old `Paid` order can now be dropped before a newer
-/// `Cancelled` one. Only the seller can sign an order, so only the seller can
-/// push old orders out, by creating more than `MAX_ORDERS` new ones. An
-/// instant-checkout answer is dated by its buyer's `requested_at`; the
-/// seller's delegate answers only one within a day of its own clock, and a
-/// seller answering by hand is refused one further off.
+/// `Cancelled` one, and before a newer unpaid one. Only the store key signs
+/// an order, but that does not mean only the seller decides how many there
+/// are: instant checkout makes the seller's delegate sign an order for any
+/// Buy now, which needs no Ghost Key and no payment, up to the delegate's
+/// limits (100 a day per store). So anyone can push old orders out, at
+/// about 100 a day: at `MAX_ORDERS` 256, a paid order can roll off about
+/// 2.5 days after it was made. An instant-checkout answer is dated by its
+/// buyer's `requested_at`; the seller's delegate answers only one within a
+/// day of its own clock, and a seller answering by hand is refused one
+/// further off.
 fn enforce_order_cap(orders: &mut BTreeMap<OrderId, AuthorizedOrder>) {
     if orders.len() <= MAX_ORDERS {
         return;
@@ -839,6 +1044,16 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
             record
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {id} invalid: {e}"))?;
+            let kept = match record.status {
+                crate::payment::OrderStatus::Paid => paid_minimally(record),
+                _ => within_order_cap(record),
+            };
+            if !kept {
+                return Err(format!(
+                    "order {id} is past {MAX_ORDER_BYTES} bytes, or Paid on evidence that is \
+                     not the minimal proof"
+                ));
+            }
         }
         Ok(())
     }
@@ -913,6 +1128,7 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         let Some(incoming) = delta else {
             return Ok(());
         };
+        let incoming = self.admit(incoming)?;
         // Verify the WHOLE delta before merging any of it. Verifying and
         // merging in one pass left a delta of [valid, invalid] with the valid
         // record already folded into `self` when the error returned, so a
@@ -920,16 +1136,281 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
         // records from a delta it had been told to reject. The contract's
         // `update_state` happens to discard the mutated value on error, but
         // that is a property of that call site, not of this function.
-        for record in incoming {
+        for record in &incoming {
             record
                 .verify(owner_key(parent_state)?)
                 .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))?;
         }
-        for record in incoming {
-            merge_order(&mut self.orders, record.clone());
+        self.merge_unchecked(incoming);
+        Ok(())
+    }
+}
+
+impl OrdersV1 {
+    /// The records of `incoming` a merge has to look at, each as the store
+    /// keeps it: a padded `Paid` is its unpaid terms from here on
+    /// (`as_kept`), and unpaid terms past `MAX_ORDER_BYTES` are left out
+    /// (`kept`). One the store already holds as it is, or that came
+    /// earlier in this delta, changes nothing and is left out.
+    ///
+    /// No honest delta carries more orders than a store holds (a whole
+    /// store's is `MAX_ORDERS`); a longer one is copies, and is refused whole
+    /// (review round 4 of step 2: 400 copies of one paid record cost more
+    /// than twice a call's budget).
+    pub(crate) fn admit(
+        &self,
+        incoming: &[AuthorizedOrder],
+    ) -> Result<Vec<AuthorizedOrder>, String> {
+        if incoming.len() > MAX_ORDERS {
+            return Err(format!(
+                "an order delta of {} records is more than a store holds ({MAX_ORDERS})",
+                incoming.len()
+            ));
+        }
+        let mut fresh: Vec<AuthorizedOrder> = Vec::with_capacity(incoming.len());
+        for record in incoming.iter().cloned().filter_map(kept) {
+            if self.orders.get(&record.order.id) != Some(&record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Merge records WITHOUT verifying them, then cut to [`MAX_ORDERS`]: for
+    /// a caller that has, or that checks what was kept and what was not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked(&mut self, records: Vec<AuthorizedOrder>) {
+        for record in records {
+            merge_order(&mut self.orders, record);
         }
         enforce_order_cap(&mut self.orders);
-        Ok(())
+    }
+}
+
+impl OrdersV1 {
+    /// Every record as the store keeps it ([`as_kept`]), and at most
+    /// [`MAX_ORDERS`] of them (`enforce_order_cap`): for a state written
+    /// before step 2, which a migration fold carries forward without passing
+    /// it through `apply_delta` (the scaffold skips it when the other side
+    /// brings no new order).
+    pub fn normalize(&mut self) {
+        let held = std::mem::take(&mut self.orders);
+        self.orders = held
+            .into_iter()
+            .filter_map(|(id, record)| Some((id, kept(record)?)))
+            .collect();
+        enforce_order_cap(&mut self.orders);
+    }
+}
+
+/// The most bytes a store's state, or one update to it (a delta, or a whole
+/// state to merge), may take as it encodes (step 2): [`AT_CAPS_BYTES`]. The
+/// contract refuses a larger one on its length, before reading any of it: a
+/// delta anyone may send, padded with records the store would only throw
+/// away, costs no more to refuse than its length check.
+///
+/// It must be at least the largest state the caps allow, and it is exactly
+/// that, with no slack, because [`AT_CAPS_BYTES`] is derived rather than
+/// measured: each record at its largest legal content, each byte-capped
+/// record at its cap, and the frame worked out field by field. If it were less,
+/// two valid states could merge into one `validate_state` refuses, and the
+/// replicas holding them would never converge (review round 4 of step 2).
+/// So every part of a store is capped in bytes, not only in count, and
+/// this is computed from those caps. Nothing honest is past it: the largest
+/// delta there is, a new subscriber's whole store, is the state itself. More
+/// would only be room for padding: a padded delta's cost on a node grows
+/// with its bytes, outside the contract too (the node took about 1.2 s to
+/// hand a 17 MB delta to it), which is why the earlier 16 and 12 MiB bounds
+/// were too high (the step-2 wall-time runs).
+pub const MAX_STORE_BYTES: usize = AT_CAPS_BYTES;
+
+/// The largest state the caps allow, as it encodes: each part at its count
+/// cap, every record at its largest (step 2). Counted part by part, an
+/// upper bound rather than a reachable state: the backings, their
+/// retirements and their wrapped copies are each counted full, though they
+/// share `MAX_BACKINGS` Ghost Keys. Built record by record, at the largest
+/// content each field can legally hold, by
+/// `at_caps_tests::a_store_at_every_cap_encodes_within_at_caps_bytes`.
+///
+/// Listings, orders and the store's details are bounded by their own byte
+/// caps. Every other record has a fixed shape, and its signed envelope must
+/// be exactly the Harvest envelope of the record
+/// (`backing::verify_exact_scoped_signature`), so its size is a function of
+/// its content; the `*_RECORD_BYTES` figures below are the largest each can
+/// take, checked by `at_caps_tests::each_kind_at_its_largest_is_within_its_bound`.
+pub const AT_CAPS_BYTES: usize = STATE_FRAME_BYTES
+    + MAX_INFO_BYTES
+    + MAX_LISTINGS * MAX_LISTING_BYTES
+    + MAX_ORDERS * (ORDER_KEY_BYTES + MAX_ORDER_BYTES)
+    + crate::backing::MAX_BACKINGS * (SLOT_KEY_BYTES + BACKING_RECORD_BYTES)
+    + crate::backing::MAX_BACKINGS * (SLOT_KEY_BYTES + RETIREMENT_RECORD_BYTES)
+    + crate::backing::MAX_BACKINGS
+        * crate::custody::MAX_SCOPES_PER_BACKER
+        * (SLOT_KEY_BYTES + COPY_RECORD_BYTES)
+    + MAX_ORDERS * (SLOT_KEY_BYTES + DESPATCH_RECORD_BYTES)
+    + MAX_LISTING_STATUSES * (SLOT_KEY_BYTES + STATUS_RECORD_BYTES)
+    + (SLOT_KEY_BYTES + CLOSURE_RECORD_BYTES)
+    + (SLOT_KEY_BYTES + PAUSE_RECORD_BYTES);
+
+/// The state's own frame, everything outside the records counted above,
+/// derived: the top-level map's header (1 byte) and its 11 field names (96
+/// bytes with their headers: `owner` 6, `info` 5, `listings` 9, `orders` 7,
+/// `backings` 9, `retirements` 12, `closed` 7, `copies` 7, `fulfilment` 11,
+/// `listing_statuses` 17, `pause` 6); the owner's key (34); the listings'
+/// wrapper (a 1-byte map header, `listings` 9, an array header of at most 3:
+/// 13); the orders' wrapper (1 + `orders` 7 + a map header of at most 3:
+/// 11); and seven signed sets' wrappers (1 + `records` 8 + 3: 12 each, 84).
+/// 239 bytes in all, rounded up. The store details are counted whole in
+/// [`MAX_INFO_BYTES`]. Cross-check: the at-caps store in
+/// `at_caps_tests` has a frame of 232 bytes.
+const STATE_FRAME_BYTES: usize = 256;
+/// An order's key in the order map: an [`OrderId`], 32 integers.
+const ORDER_KEY_BYTES: usize = 2 + 32 * 2;
+/// A signed-set record's slot key: a [`Bytes32`], one byte string.
+const SLOT_KEY_BYTES: usize = 2 + 32;
+/// The largest of each fixed-shape record, as it encodes.
+const BACKING_RECORD_BYTES: usize = 21_794;
+const RETIREMENT_RECORD_BYTES: usize = 322;
+const COPY_RECORD_BYTES: usize = 886;
+const DESPATCH_RECORD_BYTES: usize = 600;
+const STATUS_RECORD_BYTES: usize = 589;
+const CLOSURE_RECORD_BYTES: usize = 316;
+const PAUSE_RECORD_BYTES: usize = 468;
+
+/// The longest store name the app publishes, in bytes (step 2): the store
+/// details form refuses a longer one, so the largest details the app writes
+/// stay within [`MAX_INFO_BYTES`].
+pub const MAX_STORE_NAME_BYTES: usize = 200;
+
+/// The longest store description the app publishes, in bytes (step 2): the
+/// details form refuses a longer one, and the UI's markdown renderer shows
+/// no more (its `MAX_SOURCE_BYTES` is this).
+pub const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+
+/// The most bytes a store's details ([`AuthorizedStoreInfoV1`]) may take as
+/// they encode (step 2): one past it is not taken by a merge, and `verify`
+/// refuses a state holding one. Above the largest the app writes, a
+/// [`MAX_DESCRIPTION_BYTES`] description with a 4 KiB certificate and a
+/// [`MAX_STORE_NAME_BYTES`] name, which encodes to about 65 KB:
+/// the description is in it twice, once as text and once inside the signed
+/// payload as an array of integers
+/// (`the_largest_honest_store_info_is_within_the_bound`).
+pub const MAX_INFO_BYTES: usize = 72 * 1024;
+
+/// The most bytes an order record may take, as it encodes (step 2): a
+/// `Paid` record past it is kept as its unpaid terms ([`as_kept`]), and so is
+/// any other record carrying a status; unpaid terms past it are not kept at
+/// all, and `verify` refuses a state holding one. Every order the store
+/// holds is within it, which is what lets [`AT_CAPS_BYTES`] count orders as
+/// `MAX_ORDERS` of these. Honest unpaid terms are far smaller
+/// (`the_largest_honest_unpaid_order_is_within_the_bound`).
+///
+/// A minimal proof carries only the claims a payment needs, but each claim
+/// carries its whole transaction, so a minimal proof is still as large as
+/// the transactions behind it: 32 needed outpoints of 64 KB transactions
+/// each come to the 256 KiB `MAX_PROOF_CLAIM_BYTES` allows, and on signet
+/// such transactions cost nothing. Sized by measurement (step 2's wall-time
+/// runs): with 500 paid orders at 16, 32 or 64 KiB and `MAX_LISTINGS`
+/// listings at theirs, the node's calls ran past its time limit; at 8 KiB
+/// they fitted, and `MAX_ORDERS` was then lowered to keep every call within
+/// about 2.5 s. An ordinary payment fits: a segwit spend of 20 inputs, or a
+/// legacy one of 9 (`the_paid_byte_bound_admits_ordinary_payments`). Before mainnet (harvest#134): an exchange's
+/// batched withdrawal straight to an order's address is a legitimate payment
+/// whose transaction can pass it; the store then keeps the order unpaid and
+/// the seller's and buyer's own copies hold it as paid.
+pub const MAX_ORDER_BYTES: usize = 8 * 1024;
+
+/// A record as the store keeps it (step 2): a `Paid` record whose payment
+/// proof is not the canonical minimal one
+/// ([`crate::payment::verify_minimal_proof`], the proof a complaint must
+/// carry), or any record with a status that takes more than
+/// [`MAX_ORDER_BYTES`] as it encodes (a `PaymentReversed` padded with copies
+/// of its claims, a cancel padded by the buyer who signs it), is kept as its
+/// unpaid terms, the seller-signed order anyone could publish; every other
+/// record as it is. Unpaid terms past the bound are then not kept at all
+/// ([`kept`]).
+///
+/// # Why
+///
+/// Whoever publishes `Paid` first chooses its evidence, and the verifier
+/// accepts any valid claims up to `MAX_PROOF_CLAIM_BYTES` (256 KiB): about
+/// 200 padded orders would fill a store to freenet-core's 50 MiB state limit.
+/// A minimal proof carries only the claims the payment needs, and the byte
+/// bound caps what those claims' transactions may add.
+///
+/// # Why kept as unpaid rather than refused
+///
+/// It is a pure function of the one record, and idempotent, applied before
+/// `merge_order`'s `max`, so merging stays commutative, associative and
+/// idempotent. Refusing the delta would refuse every listing and order
+/// beside it, and a migration fold would discard a whole earlier generation
+/// holding one padded record. Any tab that sees the payment publishes the
+/// minimal `Paid` again (`AppState::settled_orders`), which then wins on
+/// rank. `PaymentReversed` is left as it is: its evidence carries a
+/// retraction, which no minimal proof can (and nothing produces one yet).
+pub fn as_kept(record: AuthorizedOrder) -> AuthorizedOrder {
+    use crate::payment::OrderStatus;
+    let keeps_status = match record.status {
+        OrderStatus::AwaitingPayment => true,
+        OrderStatus::Paid => paid_minimally(&record),
+        OrderStatus::PaymentReversed | OrderStatus::Cancelled => within_order_cap(&record),
+    };
+    if keeps_status {
+        return record;
+    }
+    AuthorizedOrder {
+        status: OrderStatus::AwaitingPayment,
+        payment_proof: None,
+        status_scoped_payload: None,
+        status_signature: None,
+        ..record
+    }
+}
+
+/// [`as_kept`], and `None` for unpaid terms past [`MAX_ORDER_BYTES`], which
+/// the store does not keep: a pure function of the one record, so dropping it
+/// keeps the merge laws as `as_kept` does.
+pub fn kept(record: AuthorizedOrder) -> Option<AuthorizedOrder> {
+    Some(as_kept(record)).filter(within_order_cap)
+}
+
+/// Whether a `Paid` record is one the store keeps as paid: the canonical
+/// minimal proof, within [`MAX_ORDER_BYTES`].
+fn paid_minimally(record: &AuthorizedOrder) -> bool {
+    within_order_cap(record)
+        && record
+            .payment_proof
+            .as_ref()
+            .is_some_and(|proof| crate::payment::verify_minimal_proof(&record.order, proof).is_ok())
+}
+
+/// Whether a record takes at most [`MAX_ORDER_BYTES`] as it encodes.
+///
+/// A proof's signed bodies and signatures, and the record's own signed
+/// payloads, are a floor on the record's size (each of their bytes takes at
+/// least one as it encodes), so a record past the bound by that count is
+/// judged without encoding it: a padded record anyone may send costs nothing
+/// more to throw away than reading it did.
+pub fn within_order_cap(record: &AuthorizedOrder) -> bool {
+    let payloads =
+        record.scoped_payload.len() + record.status_scoped_payload.as_ref().map_or(0, Vec::len);
+    if proof_bytes_at_least(record).saturating_add(payloads) > MAX_ORDER_BYTES {
+        return false;
+    }
+    crate::to_cbor(record).is_ok_and(|bytes| bytes.len() <= MAX_ORDER_BYTES)
+}
+
+/// A floor on the bytes `record`'s payment proof takes as it encodes: the
+/// lengths of its claims' and tip's signed bodies and signatures.
+fn proof_bytes_at_least(record: &AuthorizedOrder) -> usize {
+    match &record.payment_proof {
+        Some(crate::payment::OrderPaymentProof::OnChain(proof)) => proof
+            .claims
+            .iter()
+            .map(|c| c.body_cbor.len() + c.signature.len())
+            .sum::<usize>()
+            .saturating_add(proof.tip.body_cbor.len() + proof.tip.signature.len()),
+        _ => 0,
     }
 }
 
@@ -939,7 +1420,11 @@ impl freenet_scaffold::ComposableState for OrdersV1 {
 /// owner can hold nothing that needs a signature -- which is everything but
 /// the empty default.
 pub(crate) fn owner_key(parent: &StoreStateV1) -> Result<&VerifyingKey, String> {
-    parent.owner.as_ref().ok_or_else(|| {
+    owner_of(&parent.owner)
+}
+
+fn owner_of(owner: &Option<VerifyingKey>) -> Result<&VerifyingKey, String> {
+    owner.as_ref().ok_or_else(|| {
         "this store has no owner yet, so nothing in it can be verified: a store's first \
          signed record has to name the key that signed it"
             .to_string()
@@ -1123,6 +1608,11 @@ pub struct StoreStateV1 {
     /// state holding none encodes exactly as it did before they existed.
     #[serde(default, skip_serializing_if = "ListingStatusesV1::is_empty")]
     pub listing_statuses: ListingStatusesV1,
+    /// The seller's pause, as the store key last signed it (step 2; see
+    /// [`crate::store_pause`]). Empty, or one record. Skipped when empty, so
+    /// a state never paused encodes exactly as before it existed.
+    #[serde(default, skip_serializing_if = "crate::store_pause::PauseV1::is_empty")]
+    pub pause: crate::store_pause::PauseV1,
 }
 
 /// What a peer tells another it already holds. See [`StoreStateV1::delta`].
@@ -1149,6 +1639,8 @@ pub struct StoreStateV1Summary {
     pub fulfilment: <crate::fulfilment::FulfilmentV1 as ComposableState>::Summary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listing_statuses: <ListingStatusesV1 as ComposableState>::Summary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pause: <crate::store_pause::PauseV1 as ComposableState>::Summary,
 }
 
 /// An update to a store: one `Option` per part, plus the owner whose records
@@ -1182,6 +1674,8 @@ pub struct StoreStateV1Delta {
     pub fulfilment: Option<<crate::fulfilment::FulfilmentV1 as ComposableState>::Delta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listing_statuses: Option<<ListingStatusesV1 as ComposableState>::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<<crate::store_pause::PauseV1 as ComposableState>::Delta>,
 }
 
 impl StoreStateV1 {
@@ -1199,6 +1693,13 @@ impl StoreStateV1 {
             || !self.copies.is_empty()
             || !self.fulfilment.is_empty()
             || !self.listing_statuses.is_empty()
+            || !self.pause.is_empty()
+    }
+
+    /// Whether the seller has paused the store (and not resumed it). A
+    /// closed store is closed whatever this says.
+    pub fn paused(&self) -> bool {
+        crate::store_pause::is_paused(&self.pause)
     }
 
     /// What a reader should take a listing's availability to be: the status
@@ -1387,35 +1888,252 @@ impl StoreStateV1 {
     }
 
     /// Apply a delta's parts under the owner already in `self`, all or
-    /// nothing.
+    /// nothing. With `unchecked`, a record is merged without being verified,
+    /// and is noted there instead: see [`Self::apply_update`].
     fn apply_parts(
         &mut self,
         parameters: &StoreParameters,
         delta: &StoreStateV1Delta,
+        unchecked: Option<&mut Unchecked>,
     ) -> Result<(), String> {
         let parent = self.owner_only();
         let mut next = self.clone();
-        next.info.apply_delta(&parent, parameters, &delta.info)?;
-        next.listings
-            .apply_delta(&parent, parameters, &delta.listings)?;
-        next.orders
-            .apply_delta(&parent, parameters, &delta.orders)?;
-        next.backings
-            .apply_delta(&parent, parameters, &delta.backings)?;
-        next.retirements
-            .apply_delta(&parent, parameters, &delta.retirements)?;
-        next.closed
-            .apply_delta(&parent, parameters, &delta.closed)?;
-        next.copies
-            .apply_delta(&parent, parameters, &delta.copies)?;
-        next.fulfilment
-            .apply_delta(&parent, parameters, &delta.fulfilment)?;
-        next.listing_statuses
-            .apply_delta(&parent, parameters, &delta.listing_statuses)?;
+        let Some(unchecked) = unchecked else {
+            next.info.apply_delta(&parent, parameters, &delta.info)?;
+            next.listings
+                .apply_delta(&parent, parameters, &delta.listings)?;
+            next.orders
+                .apply_delta(&parent, parameters, &delta.orders)?;
+            next.backings
+                .apply_delta(&parent, parameters, &delta.backings)?;
+            next.retirements
+                .apply_delta(&parent, parameters, &delta.retirements)?;
+            next.closed
+                .apply_delta(&parent, parameters, &delta.closed)?;
+            next.copies
+                .apply_delta(&parent, parameters, &delta.copies)?;
+            next.fulfilment
+                .apply_delta(&parent, parameters, &delta.fulfilment)?;
+            next.listing_statuses
+                .apply_delta(&parent, parameters, &delta.listing_statuses)?;
+            next.pause.apply_delta(&parent, parameters, &delta.pause)?;
+            next.normalize_backings();
+            next.normalize_fulfilment();
+            *self = next;
+            return Ok(());
+        };
+        // The same merge, each record that `apply_delta` would verify noted
+        // instead, with the owner it would be verified against.
+        let owner = self.owner;
+        if let Some(info) = next.info.admit(&delta.info).cloned() {
+            next.info = info.clone();
+            unchecked.note(move |merged| {
+                if merged.info == info {
+                    return Ok(());
+                }
+                info.check_signature(owner_of(&owner)?)
+            });
+        }
+        if let Some(incoming) = &delta.listings {
+            let fresh = next.listings.admit(incoming)?;
+            for listing in &fresh {
+                let listing = (*listing).clone();
+                unchecked.note(move |merged| {
+                    if merged.listings.listings.contains(&listing) {
+                        return Ok(());
+                    }
+                    listing.verify(owner_of(&owner)?)?;
+                    crate::listing_image::check_listing_images(&listing.listing)
+                });
+            }
+            next.listings.merge_unchecked(fresh);
+        }
+        if let Some(incoming) = &delta.orders {
+            let fresh = next.orders.admit(incoming)?;
+            for record in &fresh {
+                let record = record.clone();
+                unchecked.note(move |merged| {
+                    if merged.orders.orders.get(&record.order.id) == Some(&record) {
+                        return Ok(());
+                    }
+                    record
+                        .verify(owner_of(&owner)?)
+                        .map_err(|e| format!("order {} delta invalid: {e}", record.order.id))
+                });
+            }
+            next.orders.merge_unchecked(fresh);
+        }
+        take_unchecked(&mut next.backings, &delta.backings, owner, unchecked, |s| {
+            &s.backings
+        })?;
+        take_unchecked(
+            &mut next.retirements,
+            &delta.retirements,
+            owner,
+            unchecked,
+            |s| &s.retirements,
+        )?;
+        take_unchecked(&mut next.closed, &delta.closed, owner, unchecked, |s| {
+            &s.closed
+        })?;
+        take_unchecked(&mut next.copies, &delta.copies, owner, unchecked, |s| {
+            &s.copies
+        })?;
+        take_unchecked(
+            &mut next.fulfilment,
+            &delta.fulfilment,
+            owner,
+            unchecked,
+            |s| &s.fulfilment,
+        )?;
+        take_unchecked(
+            &mut next.listing_statuses,
+            &delta.listing_statuses,
+            owner,
+            unchecked,
+            |s| &s.listing_statuses,
+        )?;
+        take_unchecked(&mut next.pause, &delta.pause, owner, unchecked, |s| {
+            &s.pause
+        })?;
         next.normalize_backings();
         next.normalize_fulfilment();
         *self = next;
         Ok(())
+    }
+
+    /// Apply a delta, deciding first whose records the store holds. All or
+    /// nothing: on an error `self` is unchanged.
+    fn apply_with(
+        &mut self,
+        parameters: &StoreParameters,
+        delta: &StoreStateV1Delta,
+        unchecked: Option<&mut Unchecked>,
+    ) -> Result<(), String> {
+        let Some(incoming) = delta.owner else {
+            // No owner named: the records are verified against the owner
+            // already held, and against nobody if there is none, which fails.
+            return self.apply_parts(parameters, delta, unchecked);
+        };
+        if !parameters.admits(&incoming) {
+            return Err(format!(
+                "an update names owner {}, which does not begin with this store's code {}",
+                bs58::encode(incoming.as_bytes()).into_string(),
+                parameters.code()
+            ));
+        }
+        match self.owner {
+            Some(held) if held == incoming => self.apply_parts(parameters, delta, unchecked),
+            // The owner held outranks the one this delta speaks for, so its
+            // records are another key's and are not ours to take. Not an
+            // error: an error is not a merge, and the result has to be the
+            // same whichever way round two peers exchange their states.
+            Some(held) if outranks(&held, &incoming) => Ok(()),
+            // Nobody holds the address, or the incoming owner outranks the
+            // one who does: start again from nothing under the incoming owner.
+            _ => {
+                let mut claimed = Self {
+                    owner: Some(incoming),
+                    ..Default::default()
+                };
+                claimed.apply_parts(parameters, delta, unchecked)?;
+                if !claimed.holds_signed_content() {
+                    return Err("an update that claims a store must carry something its \
+                                owner signed"
+                        .into());
+                }
+                *self = claimed;
+                Ok(())
+            }
+        }
+    }
+
+    /// [`ComposableState::apply_delta`] for the store contract's
+    /// `update_state`, which costs half as much (step 2): a record is merged
+    /// without being verified, and noted in `unchecked`, which the caller
+    /// must check against the state it ends with ([`Unchecked::check`]).
+    ///
+    /// # Why the result is the same
+    ///
+    /// The node keeps a merged state only after the contract's
+    /// `validate_state` passes on it, and that verifies every record the
+    /// state holds (freenet-core: `contract_ops.rs` and `executor_impl.rs`
+    /// call `validate_state` on the result of every `update_state` before
+    /// committing it; its `.claude/rules/contracts.md`, "WHEN updating
+    /// contract state", step 3). So `apply_delta` verified each record that
+    /// lands twice, once as it arrived and once in the result: half of what
+    /// a new subscriber's whole-store delta cost on a node (the step-2 wall
+    /// time runs).
+    ///
+    /// [`Unchecked::check`] verifies every noted record the final state does
+    /// NOT hold as it came: one that lost its slot, was cut by a bound, or
+    /// was replaced by a later update. `validate_state` verifies the rest.
+    /// So every record `apply_delta` would have verified is verified, by one
+    /// or the other, and an update is accepted exactly when it was before. A
+    /// record the merge throws away still has to be checked: a forged order
+    /// that wins its slot and is then cut by the order bound would otherwise
+    /// take a genuine one with it.
+    ///
+    /// Everything else -- the app, the delegate, the tests -- keeps calling
+    /// `apply_delta`, which verifies everything itself.
+    pub fn apply_update(
+        &mut self,
+        parameters: &StoreParameters,
+        delta: &StoreStateV1Delta,
+        unchecked: &mut Unchecked,
+    ) -> Result<(), String> {
+        self.apply_with(parameters, delta, Some(unchecked))
+    }
+
+    /// [`ComposableState::merge`] the way [`Self::apply_update`] applies a
+    /// delta.
+    pub fn merge_update(
+        &mut self,
+        parameters: &StoreParameters,
+        other: &Self,
+        unchecked: &mut Unchecked,
+    ) -> Result<(), String> {
+        let summary = self.summarize(self, parameters);
+        match other.delta(other, parameters, &summary) {
+            Some(delta) => self.apply_update(parameters, &delta, unchecked),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop what an earlier generation kept that this one's byte bounds
+    /// refuse (step 2): a signed record whose envelope is not exactly the
+    /// Harvest envelope of the record (`SignedSetV1::drop_inexact`), and
+    /// store details past [`MAX_INFO_BYTES`], which become "no details
+    /// published" until the seller publishes again. (Orders past
+    /// [`MAX_ORDER_BYTES`] and listings past [`MAX_LISTING_BYTES`] are their
+    /// own parts' `normalize`.) For a migration fold, on each side before the
+    /// merge: each record is dropped, never the state, so one such record
+    /// does not discard everything an earlier generation held beside it.
+    pub fn drop_unbounded(&mut self) {
+        self.backings.drop_inexact();
+        self.retirements.drop_inexact();
+        self.closed.drop_inexact();
+        self.copies.drop_inexact();
+        self.fulfilment.drop_inexact();
+        self.listing_statuses.drop_inexact();
+        self.pause.drop_inexact();
+        if !self.info.within_cap() {
+            self.info = Default::default();
+        }
+    }
+
+    /// The whole state as this generation keeps it, for a state an earlier
+    /// generation wrote that a migration fold carries forward: the listings
+    /// sorted and capped, the orders as kept and capped, the listing
+    /// statuses capped, and a despatch for a cut order cut with it. Each is
+    /// what `apply_delta` does to what it touches; the fold's merge skips the
+    /// parts the other side brings nothing new for. (Step 2 changed no other
+    /// cap.)
+    pub fn normalize_carried(&mut self) {
+        self.listings.normalize();
+        self.orders.normalize();
+        self.listing_statuses.normalize();
+        self.normalize_fulfilment();
     }
 }
 
@@ -1493,6 +2211,7 @@ impl ComposableState for StoreStateV1 {
         }
         self.copies.verify(&parent, parameters)?;
         self.listing_statuses.verify(&parent, parameters)?;
+        self.pause.verify(&parent, parameters)?;
         self.backings.verify(&parent, parameters)?;
         self.retirements.verify(&parent, parameters)?;
         self.closed.verify(&parent, parameters)?;
@@ -1529,6 +2248,7 @@ impl ComposableState for StoreStateV1 {
             copies: self.copies.summarize(&parent, parameters),
             fulfilment: self.fulfilment.summarize(&parent, parameters),
             listing_statuses: self.listing_statuses.summarize(&parent, parameters),
+            pause: self.pause.summarize(&parent, parameters),
         }
     }
 
@@ -1576,6 +2296,7 @@ impl ComposableState for StoreStateV1 {
                 parameters,
                 &base.listing_statuses,
             ),
+            pause: self.pause.delta(&parent, parameters, &base.pause),
         };
         if delta.info.is_none()
             && delta.listings.is_none()
@@ -1586,6 +2307,7 @@ impl ComposableState for StoreStateV1 {
             && delta.copies.is_none()
             && delta.fulfilment.is_none()
             && delta.listing_statuses.is_none()
+            && delta.pause.is_none()
         {
             None
         } else {
@@ -1602,46 +2324,90 @@ impl ComposableState for StoreStateV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
-        let Some(delta) = delta else {
-            return Ok(());
-        };
-        let Some(incoming) = delta.owner else {
-            // No owner named: the records are verified against the owner
-            // already held, and against nobody if there is none, which fails.
-            return self.apply_parts(parameters, delta);
-        };
-        if !parameters.admits(&incoming) {
-            return Err(format!(
-                "an update names owner {}, which does not begin with this store's code {}",
-                bs58::encode(incoming.as_bytes()).into_string(),
-                parameters.code()
-            ));
-        }
-        match self.owner {
-            Some(held) if held == incoming => self.apply_parts(parameters, delta),
-            // The owner held outranks the one this delta speaks for, so its
-            // records are another key's and are not ours to take. Not an
-            // error: an error is not a merge, and the result has to be the
-            // same whichever way round two peers exchange their states.
-            Some(held) if outranks(&held, &incoming) => Ok(()),
-            // Nobody holds the address, or the incoming owner outranks the
-            // one who does: start again from nothing under the incoming owner.
-            _ => {
-                let mut claimed = Self {
-                    owner: Some(incoming),
-                    ..Default::default()
-                };
-                claimed.apply_parts(parameters, delta)?;
-                if !claimed.holds_signed_content() {
-                    return Err("an update that claims a store must carry something its \
-                                owner signed"
-                        .into());
-                }
-                *self = claimed;
-                Ok(())
-            }
+        match delta {
+            Some(delta) => self.apply_with(parameters, delta, None),
+            None => Ok(()),
         }
     }
+}
+
+/// The records an update merged without verifying them
+/// ([`StoreStateV1::apply_update`]), each with how to tell whether the final
+/// state holds it as it came and how to verify it if not.
+#[derive(Default)]
+pub struct Unchecked(Vec<Check>);
+
+/// One noted record's check against the final state.
+type Check = Box<dyn FnOnce(&StoreStateV1) -> Result<(), String>>;
+
+impl Unchecked {
+    fn note(&mut self, check: impl FnOnce(&StoreStateV1) -> Result<(), String> + 'static) {
+        self.0.push(Box::new(check));
+    }
+
+    /// Verify every noted record `merged` does not hold as it came. The
+    /// records it does hold are left to `validate_state`, which the caller
+    /// must be sure runs on `merged` before anything keeps it.
+    pub fn check(self, merged: &StoreStateV1) -> Result<(), String> {
+        self.0.into_iter().try_for_each(|check| check(merged))
+    }
+}
+
+/// One signed-set part of [`StoreStateV1::apply_parts`] with its checks
+/// noted, not run: `held_in` finds the part in the final state.
+fn take_unchecked<T: crate::backing::SignedRecord + 'static>(
+    set: &mut SignedSetV1<T>,
+    incoming: &Option<Vec<T>>,
+    owner: Option<VerifyingKey>,
+    unchecked: &mut Unchecked,
+    held_in: fn(&StoreStateV1) -> &SignedSetV1<T>,
+) -> Result<(), String> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let fresh = set.admit(incoming)?;
+    for record in &fresh {
+        let record = (*record).clone();
+        unchecked.note(move |merged| {
+            if held_in(merged).records.get(&record.slot()) == Some(&record) {
+                return Ok(());
+            }
+            record.verify_for(owner_of(&owner)?)
+        });
+    }
+    set.merge_unchecked(fresh);
+    Ok(())
+}
+
+/// A delta the way the store contract's `update_state` and then the node
+/// apply it (step 2): [`StoreStateV1::apply_update`], its
+/// [`Unchecked::check`], then `validate_state`'s `verify` on the result.
+#[cfg(test)]
+fn through_the_node(
+    base: &StoreStateV1,
+    parameters: &StoreParameters,
+    delta: &StoreStateV1Delta,
+) -> Result<StoreStateV1, String> {
+    let mut state = base.clone();
+    let mut unchecked = Unchecked::default();
+    state.apply_update(parameters, delta, &mut unchecked)?;
+    unchecked.check(&state)?;
+    state.verify(&state, parameters)?;
+    Ok(state)
+}
+
+/// The same delta through `apply_delta`, which verifies as it merges, then
+/// `verify` on the result: what the node did before step 2.
+#[cfg(test)]
+fn through_apply_delta(
+    base: &StoreStateV1,
+    parameters: &StoreParameters,
+    delta: &StoreStateV1Delta,
+) -> Result<StoreStateV1, String> {
+    let mut state = base.clone();
+    state.apply_delta(base, parameters, &Some(delta.clone()))?;
+    state.verify(&state, parameters)?;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -1847,6 +2613,508 @@ mod order_tests {
         let tip = SignedTipEntry::sign(bridge, &tip_body).unwrap();
 
         OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// [`make_payment_proof`] whose transaction also pays filler outputs
+    /// until it is at least `bytes` long: still the minimal proof (one
+    /// claim, the one needed), and as large as a big honest transaction
+    /// makes it.
+    fn make_big_payment_proof(
+        order: &Order,
+        bridge: &SigningKey,
+        bytes: usize,
+    ) -> OrderPaymentProof {
+        use freenet_bitcoin_common::spv::testing::{build_tx, mine, EASIEST_BITS};
+        use freenet_bitcoin_common::spv::SpvProof;
+        use freenet_bitcoin_common::Txid;
+        let mut outputs = vec![(order.amount_sats, order.payment_script_pubkey.clone())];
+        // Up to `bytes`, but never past the 64 KiB a bridge's evidence
+        // allows one transaction.
+        // Fewer than 0xfd outputs: `build_tx` writes the count as one byte.
+        while outputs.len() < 0xfc && build_tx(&outputs).len() < bytes {
+            let mut next = outputs.clone();
+            next.push((546, vec![0x6a; 250]));
+            if build_tx(&next).len() > 64 * 1024 {
+                break;
+            }
+            outputs = next;
+        }
+        let raw_tx = build_tx(&outputs);
+        let txid = Txid(sha2_d(&raw_tx));
+        let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+        let block_hash = BlockHash(sha2_d(&header.0));
+        let anchor = BlockAnchor {
+            height: 100,
+            hash: block_hash,
+        };
+        let claim = SignedClaim::sign(
+            bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch: Vec::new(),
+                        tx_index: 0,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let tip = SignedTipEntry::sign(
+            bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height: 100 + order.required_confirmations - 1,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        OrderPaymentProof::on_chain(vec![claim], tip)
+    }
+
+    /// Bitcoin's double SHA-256.
+    fn sha2_d(bytes: &[u8]) -> [u8; 32] {
+        freenet_bitcoin_common::spv::testing::sha256d_pub(bytes)
+    }
+
+    /// A raw, witness-stripped transaction with `inputs` inputs, each with a
+    /// `script_sig` of the given length (0 for segwit, about 107 for a
+    /// legacy P2PKH signature), paying the order and a P2WPKH change.
+    fn tx_with_inputs(order: &Order, inputs: usize, script_sig: usize) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&2u32.to_le_bytes());
+        t.push(inputs as u8);
+        for i in 0..inputs {
+            t.extend_from_slice(&[i as u8 + 1; 32]);
+            t.extend_from_slice(&0u32.to_le_bytes());
+            t.push(script_sig as u8);
+            t.extend(std::iter::repeat_n(0x30u8, script_sig));
+            t.extend_from_slice(&0xffff_fffdu32.to_le_bytes());
+        }
+        let change: Vec<u8> = [vec![0x00, 0x14], vec![0x77; 20]].concat();
+        t.push(2);
+        for (value, script) in [
+            (order.amount_sats, order.payment_script_pubkey.clone()),
+            (1_234_567u64, change),
+        ] {
+            t.extend_from_slice(&value.to_le_bytes());
+            t.push(script.len() as u8);
+            t.extend_from_slice(&script);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t
+    }
+
+    /// A `Paid` record on the minimal proof whose one claim carries `raw_tx`.
+    fn paid_on_tx(
+        seller: &SigningKey,
+        bridge: &SigningKey,
+        order: &Order,
+        raw_tx: Vec<u8>,
+    ) -> AuthorizedOrder {
+        use freenet_bitcoin_common::spv::testing::{mine, sha256d_pub, EASIEST_BITS};
+        use freenet_bitcoin_common::spv::SpvProof;
+        use freenet_bitcoin_common::Txid;
+        let txid = Txid(sha256d_pub(&raw_tx));
+        let merkle_branch: Vec<[u8; 32]> = (0..12u8).map(|d| [d + 5; 32]).collect();
+        let root =
+            freenet_bitcoin_common::spv::merkle_root_from_branch(&txid, &merkle_branch, 1).unwrap();
+        let header = mine([7u8; 32], root, 1_700_000_000, EASIEST_BITS);
+        let anchor = BlockAnchor {
+            height: 100,
+            hash: BlockHash(sha256d_pub(&header.0)),
+        };
+        let claim = SignedClaim::sign(
+            bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch,
+                        tx_index: 1,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let tip = SignedTipEntry::sign(
+            bridge,
+            &TipEntryBody {
+                network: order.network,
+                anchor: BlockAnchor {
+                    height: 100 + order.required_confirmations - 1,
+                    hash: BlockHash([9u8; 32]),
+                },
+                prev_hash: BlockHash([8u8; 32]),
+                block_time: 1_700_000_000,
+                tx_count: 1,
+                median_time: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        make_authorized_order(
+            seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(OrderPaymentProof::on_chain(vec![claim], tip)),
+        )
+    }
+
+    /// Step 2: what `MAX_ORDER_BYTES` admits of honest payments. The
+    /// minimal `Paid` record for a payment whose transaction has 1, 2, 5,
+    /// 10 or 20 inputs (two outputs, a 12-deep Merkle branch: a block of a
+    /// few thousand transactions), segwit (the witness is not part of the
+    /// evidence) and legacy P2PKH. Printed with `--nocapture`; asserted: a
+    /// segwit payment of 20 inputs and a legacy one of 9 are kept paid.
+    /// Measured at 8 KiB (2026-10-09): segwit 3.5 KB at 1 input, 4.5 KB at
+    /// 20 (about 52 bytes an input, so about 89 inputs fit); legacy 4.0 KB
+    /// at 1, 8.3 KB at 10.
+    #[test]
+    fn the_paid_byte_bound_admits_ordinary_payments() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let order = make_order("sizes", 1_700_000_000, &[0x00, 0x14, 0xcc, 0xcc]);
+        let size = |inputs: usize, script_sig: usize| {
+            let record = paid_on_tx(
+                &seller,
+                &bridge,
+                &order,
+                tx_with_inputs(&order, inputs, script_sig),
+            );
+            crate::payment::verify_payment_proof(&order, record.payment_proof.as_ref().unwrap())
+                .expect("a genuine proof");
+            let len = crate::to_cbor(&record).unwrap().len();
+            // The floor `within_order_cap` judges by first never passes the
+            // record's real size, or an honest record would be stripped
+            // without being measured.
+            assert!(super::proof_bytes_at_least(&record) <= len);
+            assert_eq!(within_order_cap(&record), len <= MAX_ORDER_BYTES);
+            len
+        };
+        for inputs in [1usize, 2, 5, 10, 20] {
+            eprintln!(
+                "PAID-SIZE inputs {inputs}: segwit {} bytes, legacy {} bytes (bound {MAX_ORDER_BYTES})",
+                size(inputs, 0),
+                size(inputs, 107)
+            );
+        }
+        assert!(size(20, 0) <= MAX_ORDER_BYTES);
+        assert!(size(9, 107) <= MAX_ORDER_BYTES);
+    }
+
+    /// Review round 4 of step 2 (codex, code-first): copies of a record
+    /// the store holds, or repeated within a delta, change nothing and are
+    /// not verified again, so replaying a genuine record costs no signature
+    /// checks; and a delta carrying more orders than a store holds is
+    /// refused whole. The result is the same as the delta with each record
+    /// once. (The cost is pinned in `tests/contract-budget`'s replay rows.)
+    #[test]
+    fn copies_change_nothing_and_a_delta_past_the_cap_is_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let unpaid = |n: i64| {
+            make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("copy-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xaa, n as u8],
+                ),
+                OrderStatus::AwaitingPayment,
+                None,
+            )
+        };
+        let mut held = OrdersV1::default();
+        held.apply_delta(&parent(), &p, &Some(vec![unpaid(1)]))
+            .unwrap();
+        let mut once = held.clone();
+        once.apply_delta(&parent(), &p, &Some(vec![unpaid(2)]))
+            .unwrap();
+        let mut copies = held.clone();
+        copies
+            .apply_delta(
+                &parent(),
+                &p,
+                &Some(vec![unpaid(1), unpaid(2), unpaid(1), unpaid(2), unpaid(2)]),
+            )
+            .unwrap();
+        assert_eq!(copies, once);
+        let why = held
+            .apply_delta(&parent(), &p, &Some(vec![unpaid(1); MAX_ORDERS + 1]))
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
+    }
+
+    /// Step 2: the contract's `update_state` leaves a record the result
+    /// holds to `validate_state`, and verifies one it does not. A forged
+    /// order the order bound cuts on arrival is in no result, so only the
+    /// second check sees it, and the update is refused as `apply_delta`
+    /// refused it. Mutated red by skipping `Unchecked::check`.
+    #[test]
+    fn a_forged_order_the_cut_drops_is_still_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let unpaid = |n: i64| {
+            make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("cut-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xbb, (n % 251) as u8, (n / 251) as u8],
+                ),
+                OrderStatus::AwaitingPayment,
+                None,
+            )
+        };
+        let mut held = parent();
+        held.apply_delta(
+            &parent(),
+            &p,
+            &Some(StoreStateV1Delta {
+                orders: Some((1..=MAX_ORDERS as i64).map(unpaid).collect()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        // Older than every order held, so the bound cuts it at once.
+        let mut forged = unpaid(0);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            orders: Some(vec![forged.clone()]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged.apply_update(&p, &delta, &mut unchecked).unwrap();
+        assert!(!merged.orders.orders.contains_key(&forged.order.id));
+        assert_eq!(merged, held, "the cut record changed nothing");
+        let why = unchecked.check(&merged).unwrap_err();
+        assert!(why.contains("delta invalid"), "{why}");
+        assert!(through_the_node(&held, &p, &delta).is_err());
+        assert!(through_apply_delta(&held, &p, &delta).is_err());
+
+        // One the result holds is left to `validate_state`, which refuses it.
+        let mut forged_cancel = make_authorized_order(
+            &seller,
+            held.orders.orders.values().next().unwrap().order.clone(),
+            OrderStatus::Cancelled,
+            None,
+        );
+        forged_cancel.status_signature.as_mut().unwrap()[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            orders: Some(vec![forged_cancel]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged.apply_update(&p, &delta, &mut unchecked).unwrap();
+        unchecked
+            .check(&merged)
+            .expect("held as it came: left to validate");
+        assert!(merged.verify(&merged, &p).is_err());
+        assert!(through_apply_delta(&held, &p, &delta).is_err());
+    }
+
+    /// Step 2: a forged store info that a LATER update of the same
+    /// `update_state` call replaces is in no result, so `validate_state`
+    /// never sees it: `Unchecked::check` must, and the call is refused as
+    /// `apply_delta` refused its first update. Mutated red by skipping the
+    /// info's check.
+    #[test]
+    fn a_forged_info_a_later_update_replaces_is_still_refused() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let info = |version: u32, forged: bool| {
+            let info = StoreInfoV1 {
+                version,
+                certificate_pem: String::new(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [0u8; 32],
+                store_name: format!("version {version}"),
+                description: String::new(),
+                encryption_public_key: None,
+                record_public_key: None,
+            };
+            let (scoped_payload, mut signature) = sign_scoped(&seller, &info);
+            if forged {
+                signature[0] ^= 1;
+            }
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let delta = |info: AuthorizedStoreInfoV1| StoreStateV1Delta {
+            info: Some(info),
+            ..Default::default()
+        };
+        for forged in [false, true] {
+            let mut merged = parent();
+            let mut unchecked = Unchecked::default();
+            for update in [delta(info(1, forged)), delta(info(2, false))] {
+                merged.apply_update(&p, &update, &mut unchecked).unwrap();
+            }
+            assert_eq!(merged.info, info(2, false), "the later info replaced it");
+            let checked = unchecked.check(&merged);
+            if forged {
+                let why = checked.unwrap_err();
+                assert!(why.contains("store info"), "{why}");
+                assert!(through_apply_delta(&parent(), &p, &delta(info(1, true))).is_err());
+            } else {
+                checked.expect("genuine infos pass");
+            }
+        }
+    }
+
+    /// Step 2, seeded: genuine and forged orders, at and past the bound,
+    /// against a full store, in deltas of one to several records. Every
+    /// delta the node path accepts, `apply_delta` accepts, to the same state,
+    /// and every one it refuses, `apply_delta` refuses. Both outcomes occur,
+    /// and so does a refusal only `Unchecked::check` makes.
+    #[test]
+    fn the_node_path_accepts_exactly_what_apply_delta_accepts_for_orders() {
+        let seller = seller_key();
+        let p = params(&seller);
+        let order = |n: i64, status: OrderStatus, forged: bool| {
+            let mut record = make_authorized_order(
+                &seller,
+                make_order(
+                    &format!("eq-{n}"),
+                    1_700_000_000 + n,
+                    &[0x00, 0x14, 0xcc, (n % 251) as u8, (n / 251) as u8],
+                ),
+                status,
+                None,
+            );
+            if forged {
+                match record.status_signature.as_mut() {
+                    Some(signature) => signature[0] ^= 1,
+                    None => record.signature[0] ^= 1,
+                }
+            }
+            record
+        };
+        let mut held = parent();
+        held.apply_delta(
+            &parent(),
+            &p,
+            &Some(StoreStateV1Delta {
+                orders: Some(
+                    (100..100 + MAX_ORDERS as i64)
+                        .map(|n| order(n, OrderStatus::AwaitingPayment, false))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let mut pool = Vec::new();
+        // Older than all held (cut), among them, and newer (kept).
+        for n in [0, 1, 150, 151, 200, 400, 401] {
+            for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+                for forged in [false, true] {
+                    pool.push(order(n, status, forged));
+                }
+            }
+        }
+        let mut rng = crate::merge_laws::Rng::new(0x5_7e9);
+        let (mut accepted, mut refused, mut by_check) = (0, 0, 0);
+        for round in 0..300 {
+            let records = rng.subset(&pool, 1 + round % 4);
+            let delta = StoreStateV1Delta {
+                orders: Some(records),
+                ..Default::default()
+            };
+            let node = through_the_node(&held, &p, &delta);
+            let checked = through_apply_delta(&held, &p, &delta);
+            match (&node, &checked) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b);
+                    accepted += 1;
+                }
+                (Err(_), Err(_)) => refused += 1,
+                _ => panic!("the paths disagree on {delta:?}: {node:?} against {checked:?}"),
+            }
+            let mut merged = held.clone();
+            let mut unchecked = Unchecked::default();
+            if merged.apply_update(&p, &delta, &mut unchecked).is_ok()
+                && unchecked.check(&merged).is_err()
+            {
+                by_check += 1;
+            }
+        }
+        assert!(
+            accepted > 0 && refused > 0 && by_check > 0,
+            "{accepted} {refused} {by_check}"
+        );
+    }
+
+    /// Step 2: a `Paid` record on the minimal proof but past
+    /// `MAX_ORDER_BYTES` is kept as its unpaid terms, and a state
+    /// holding one does not verify; one just under it is kept paid. Mutated
+    /// red by dropping the byte bound.
+    #[test]
+    fn a_paid_record_past_the_byte_bound_is_kept_unpaid() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let order = make_order("big", 1_700_000_000, &[0x00, 0x14, 0xbb, 0xbb]);
+        let big = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(make_big_payment_proof(&order, &bridge, MAX_ORDER_BYTES)),
+        );
+        let small = make_authorized_order(
+            &seller,
+            order.clone(),
+            OrderStatus::Paid,
+            Some(make_big_payment_proof(
+                &order,
+                &bridge,
+                // A claim's transaction encodes at about four bytes a byte
+                // in the record: an integer array inside the bridge's
+                // signed body, itself an integer array (freenet-bitcoin's
+                // encoding).
+                MAX_ORDER_BYTES / 8,
+            )),
+        );
+        let proof = big.payment_proof.as_ref().unwrap();
+        crate::payment::verify_minimal_proof(&order, proof).expect("still the minimal proof");
+        crate::payment::verify_payment_proof(&order, proof).expect("a genuine proof");
+        assert!(crate::to_cbor(&big).unwrap().len() > MAX_ORDER_BYTES);
+        assert!(crate::to_cbor(&small).unwrap().len() <= MAX_ORDER_BYTES);
+        assert_eq!(as_kept(big.clone()).status, OrderStatus::AwaitingPayment);
+        assert_eq!(as_kept(small.clone()), small);
+        assert!(orders_of([(order.id.clone(), big)])
+            .verify(&parent(), &p)
+            .is_err());
+        assert!(orders_of([(order.id.clone(), small)])
+            .verify(&parent(), &p)
+            .is_ok());
     }
 
     /// A valid, bridge-signed `ScannedTo` claim for this order's script.
@@ -3784,22 +5052,35 @@ mod order_tests {
             "the attack works at an exact rank tie; anything else is a different bug"
         );
 
-        // Both are individually valid -- the attacker has broken no rule.
+        // Step 2: a state holding the padded record does not verify, and a
+        // padded record that arrives is kept as its unpaid terms
+        // (`as_kept`), whichever way round the two meet.
         let honest_state = orders_of([(order.id.clone(), honest.clone())]);
         let padded_state = orders_of([(order.id.clone(), padded.clone())]);
         assert!(honest_state.verify(&parent(), &p).is_ok());
         assert!(
-            padded_state.verify(&parent(), &p).is_ok(),
-            "the padded record must still verify -- that is what makes this an \
-             attack rather than a rejected update"
+            padded_state.verify(&parent(), &p).is_err(),
+            "a store does not hold Paid on padded evidence"
+        );
+        assert_eq!(
+            as_kept(padded.clone()),
+            make_authorized_order(&seller, order.clone(), OrderStatus::AwaitingPayment, None),
+            "kept as its unpaid terms"
         );
 
-        // Whichever way round they meet, the compact record is what survives.
         let mut honest_then_padded = honest_state.clone();
         honest_then_padded
             .merge(&parent(), &p, &padded_state)
             .unwrap();
-        let mut padded_then_honest = padded_state.clone();
+        let mut padded_then_honest = OrdersV1::default();
+        padded_then_honest
+            .merge(&parent(), &p, &padded_state)
+            .unwrap();
+        assert_eq!(
+            padded_then_honest.orders[&order.id].status,
+            OrderStatus::AwaitingPayment,
+            "a padded Paid arriving first is held unpaid"
+        );
         padded_then_honest
             .merge(&parent(), &p, &honest_state)
             .unwrap();
@@ -3812,8 +5093,102 @@ mod order_tests {
         assert_eq!(
             crate::to_cbor(&padded_then_honest.orders[&order.id]).unwrap(),
             honest_bytes,
-            "and it must not survive merely by having arrived first"
+            "and the minimal one replaces the unpaid terms it was kept as"
         );
+        assert!(padded_then_honest.verify(&parent(), &p).is_ok());
+    }
+
+    /// Step 2: the minimal-proof rule keeps the merge laws. States reached
+    /// by merging deltas that mix, for the same orders, the unpaid terms, a
+    /// minimal `Paid`, a `Paid` padded in two different ways and a
+    /// cancellation: merging them in any order and grouping gives the same
+    /// bytes, every result verifies, and no result holds a padded `Paid`.
+    /// Mutated red by keeping a padded `Paid` in `apply_delta`.
+    #[test]
+    fn the_minimal_proof_rule_obeys_the_merge_laws() {
+        let seller = seller_key();
+        let bridge = bridge_key();
+        let p = params(&seller);
+        let mut versions: Vec<AuthorizedOrder> = Vec::new();
+        for n in 0..4u8 {
+            let order = make_order(
+                &format!("buyer-{n}"),
+                1_700_000_000 + i64::from(n),
+                &[0x00, 0x14, n, 0xbb],
+            );
+            let minimal = make_payment_proof(&order, &bridge, 5);
+            let mut padded = minimal.clone();
+            on_chain_mut(&mut padded)
+                .claims
+                .push(scanned_to_claim(&order, &bridge, 1));
+            let mut padded_more = padded.clone();
+            on_chain_mut(&mut padded_more)
+                .claims
+                .push(scanned_to_claim(&order, &bridge, 2));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::AwaitingPayment,
+                None,
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(minimal),
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(padded),
+            ));
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(padded_more),
+            ));
+            // Minimal, but past the byte bound.
+            versions.push(make_authorized_order(
+                &seller,
+                order.clone(),
+                OrderStatus::Paid,
+                Some(make_big_payment_proof(&order, &bridge, MAX_ORDER_BYTES)),
+            ));
+        }
+        let merge = |a: &OrdersV1, b: &OrdersV1| {
+            let mut out = a.clone();
+            out.merge(&parent(), &p, b).expect("merges");
+            out
+        };
+        let mut rng = crate::merge_laws::Rng::new(0x5ec0d);
+        let mut states = vec![OrdersV1::default()];
+        for _ in 0..16 {
+            let mut delta = OrdersV1::default();
+            for _ in 0..1 + rng.below(5) {
+                let v = versions[rng.below(versions.len())].clone();
+                delta.orders.insert(v.order.id.clone(), v);
+            }
+            // Held only as the store keeps it: through `apply_delta`.
+            let mut state = OrdersV1::default();
+            state
+                .apply_delta(&parent(), &p, &Some(delta.orders.into_values().collect()))
+                .expect("applies");
+            states.push(state);
+        }
+        for s in &states {
+            s.verify(&parent(), &p).expect("every state verifies");
+        }
+        assert!(
+            states
+                .iter()
+                .any(|s| s.orders.values().any(|o| o.status == OrderStatus::Paid)),
+            "a minimal Paid is held somewhere"
+        );
+        crate::merge_laws::assert_laws(&states, 300, &mut rng, merge, |s| {
+            crate::to_cbor(s).unwrap()
+        });
     }
 
     /// A field the status does not use must be REJECTED, not merely ignored.
@@ -5492,7 +6867,7 @@ mod listing_status_tests {
     //! harvest#70: a listing's availability, signed by the store key, the
     //! highest revision kept.
     use super::*;
-    use crate::backing::sign_with_store_key;
+    use crate::backing::{sign_with_store_key, SignedRecord};
     use crate::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
     use crate::merge_laws::{assert_laws, Rng};
     use ed25519_dalek::SigningKey;
@@ -5795,6 +7170,184 @@ mod listing_status_tests {
         }
         assert_laws(&states, 300, &mut rng, merged, bytes);
     }
+
+    /// A status on listing `n`, for the bound's tests: more listings than
+    /// one byte names.
+    fn status_on(key: &SigningKey, n: u16, revision: u64) -> AuthorizedListingStatus {
+        let mut id = [0u8; 32];
+        id[..2].copy_from_slice(&n.to_be_bytes());
+        let status = ListingStatus {
+            listing: ListingId(id),
+            revision,
+            availability: ListingAvailability::Withdrawn,
+        };
+        let (scoped_payload, signature) =
+            sign_with_store_key(key, crate::to_cbor(&status).unwrap()).expect("a store record");
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    }
+
+    /// Step 2: a store keeps its `MAX_LISTING_STATUSES` newest statuses,
+    /// the smaller listing first at one revision; a delta carrying more is
+    /// refused whole, and so is a state holding more, before a signature is
+    /// checked. Mutated red by dropping the cut, and by ranking it oldest
+    /// first.
+    #[test]
+    fn a_store_keeps_its_newest_statuses() {
+        let key = store_key();
+        let full: Vec<_> = (0..MAX_LISTING_STATUSES as u16)
+            .map(|n| status_on(&key, n, 10 + u64::from(n)))
+            .collect();
+        let mut state = state_with(full.clone());
+        assert_eq!(state.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        // One newer: the oldest (listing 0) goes. One at the oldest's
+        // revision on a larger listing: it goes itself.
+        let newer = status_on(&key, 9_000, 1_000_000);
+        let tied = status_on(&key, 9_001, 11);
+        state
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(key.verifying_key()),
+                    listing_statuses: Some(vec![newer.clone(), tied.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let held = &state.listing_statuses.records;
+        assert_eq!(held.len(), MAX_LISTING_STATUSES);
+        assert!(held.contains_key(&newer.slot()));
+        assert!(!held.contains_key(&full[0].slot()), "the oldest is cut");
+        assert!(
+            held.contains_key(&full[1].slot()),
+            "revision 11, the smaller listing"
+        );
+        assert!(
+            !held.contains_key(&tied.slot()),
+            "revision 11, the larger listing"
+        );
+
+        let mut too_many = full.clone();
+        too_many.push(newer);
+        let why = StoreStateV1::default()
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params(),
+                &Some(StoreStateV1Delta {
+                    owner: Some(key.verifying_key()),
+                    listing_statuses: Some(too_many.clone()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
+
+        let mut over = state.clone();
+        let mut forged = status_on(&key, 9_002, 1);
+        forged.signature[0] ^= 1;
+        over.listing_statuses.records.insert(forged.slot(), forged);
+        let why = over.verify(&over, &params()).unwrap_err();
+        assert!(why.contains("the most it keeps"), "{why}");
+    }
+
+    /// Step 2: the bound obeys the merge laws on bytes, over sets whose
+    /// unions cross it, with slots whose revisions differ between sides (a
+    /// merge can raise a slot's rank, unlike the order cap's). At the
+    /// set's own merge, which `apply_delta` runs once every record has
+    /// verified: the statuses here are unsigned so a union can be large.
+    #[test]
+    fn the_status_bound_obeys_the_merge_laws() {
+        let unsigned = |n: u16, revision: u64| {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            AuthorizedListingStatus {
+                status: ListingStatus {
+                    listing: ListingId(id),
+                    revision,
+                    availability: ListingAvailability::SoldOut,
+                },
+                scoped_payload: vec![],
+                signature: vec![],
+            }
+        };
+        let mut rng = Rng::new(0x5_7a7);
+        let ids = (MAX_LISTING_STATUSES + MAX_LISTING_STATUSES / 2) as u16;
+        let mut sets = vec![ListingStatusesV1::default()];
+        for _ in 0..12 {
+            let mut set = ListingStatusesV1::default();
+            let picks: Vec<AuthorizedListingStatus> = (0..MAX_LISTING_STATUSES)
+                .map(|_| unsigned(rng.below(ids as usize) as u16, rng.below(40) as u64))
+                .collect();
+            set.merge_unchecked(&picks);
+            sets.push(set);
+        }
+        let merge = |a: &ListingStatusesV1, b: &ListingStatusesV1| {
+            let mut out = a.clone();
+            out.merge_unchecked(b.records.values());
+            out
+        };
+        assert_laws(&sets, 300, &mut rng, merge, |set: &ListingStatusesV1| {
+            crate::to_cbor(set).expect("encode")
+        });
+        let crossed = merge(&sets[1], &sets[2]);
+        assert_eq!(
+            crossed.records.len(),
+            MAX_LISTING_STATUSES,
+            "the unions cross the bound"
+        );
+    }
+
+    /// Step 2: a forged status the bound cuts on arrival is in no result, so
+    /// only `Unchecked::check` sees it; the node path refuses it as
+    /// `apply_delta` did. Mutated red by skipping the check.
+    #[test]
+    fn a_forged_status_the_cut_drops_is_still_refused() {
+        let key = store_key();
+        let held = state_with(
+            (0..MAX_LISTING_STATUSES as u16)
+                .map(|n| status_on(&key, n, 10 + u64::from(n)))
+                .collect(),
+        );
+        let mut forged = status_on(&key, 9_000, 1);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listing_statuses: Some(vec![forged]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged
+            .apply_update(&params(), &delta, &mut unchecked)
+            .unwrap();
+        assert_eq!(merged, held);
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params(), &delta).is_err());
+        assert!(through_apply_delta(&held, &params(), &delta).is_err());
+
+        // One for a listing the store holds a NEWER status for: it loses its
+        // slot, the slot still holds the genuine status, and the check must
+        // look at the record, not the slot. Red with the check judging by
+        // slot alone.
+        let mut stale = status_on(&key, 5, 1);
+        stale.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listing_statuses: Some(vec![stale]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged
+            .apply_update(&params(), &delta, &mut unchecked)
+            .unwrap();
+        assert_eq!(merged, held, "the held status keeps its slot");
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params(), &delta).is_err());
+        assert!(through_apply_delta(&held, &params(), &delta).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -5944,5 +7497,1351 @@ mod one_order_per_request_tests {
         let mut probe = o.clone();
         probe.id = crate::payment::OrderId([0; 32]);
         assert_eq!(crate::payment::OrderId::from_terms(&probe), o.id);
+    }
+}
+
+#[cfg(test)]
+mod listing_cap_tests {
+    //! Step 2: a store keeps its `MAX_LISTINGS` newest listings, none over
+    //! `MAX_LISTING_BYTES`, as a pure function of the listings it holds.
+    use super::*;
+    use crate::merge_laws::{assert_laws, Rng};
+    use crate::test_orders::{paid, sign_scoped, store_key};
+
+    /// Listing `n`, created at `at` seconds, with `pad` bytes of description.
+    /// Signed by the fixture store key when `signed`.
+    fn listing(n: u32, at: i64, pad: usize, signed: bool) -> AuthorizedListing {
+        let listing = crate::listing::Listing {
+            images: Vec::new(),
+            checkout: None,
+            choices: Vec::new(),
+            id: ListingId([0u8; 32]),
+            title: format!("Listing {n}"),
+            description: "d".repeat(pad),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000 + at, 0).unwrap(),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = if signed {
+            sign_scoped(&store_key(), &listing)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        AuthorizedListing {
+            listing,
+            scoped_payload,
+            signature,
+            certificate_pem: String::new(),
+        }
+    }
+
+    fn held(listings: Vec<AuthorizedListing>) -> ListingsV1 {
+        let mut set = ListingsV1 { listings };
+        set.normalize();
+        set
+    }
+
+    /// Past the cap the newest are kept, ties broken by id; a listing over
+    /// the byte bound is dropped wherever it sits. Mutated red by keeping
+    /// the oldest, by reversing the tie-break, and by dropping the size
+    /// rule. Dropping the written-out tie-break survives, equivalently: the
+    /// stable sort of id-sorted listings gives the same order.
+    #[test]
+    fn the_newest_listings_are_kept_and_an_oversized_one_never_is() {
+        // MAX_LISTINGS + 41, two to a second, so the cut falls between two
+        // listings of one second (the 41 oldest go: 20 whole seconds and
+        // one of the 21st's pair). With an even count it fell between
+        // seconds, and the tie-break was never exercised (round 1 of step
+        // 2's review).
+        let all: Vec<_> = (0..(MAX_LISTINGS as u32 + 41))
+            .map(|n| listing(n, i64::from(n / 2), 0, false))
+            .collect();
+        let kept = held(all.clone());
+        assert_eq!(kept.listings.len(), MAX_LISTINGS);
+        let mut want: Vec<_> = all
+            .iter()
+            .map(|l| (l.listing.created_at, l.listing.id.clone()))
+            .collect();
+        want.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let want: BTreeSet<_> = want
+            .into_iter()
+            .take(MAX_LISTINGS)
+            .map(|(_, id)| id)
+            .collect();
+        let got: BTreeSet<_> = kept.listings.iter().map(|l| l.listing.id.clone()).collect();
+        assert_eq!(got, want);
+
+        let big = listing(9_999, 1_000_000, MAX_LISTING_BYTES, false);
+        let just = {
+            // The largest description that still fits.
+            let mut pad = MAX_LISTING_BYTES - 400;
+            assert!(
+                crate::to_cbor(&listing(9_998, 1_000_000, pad, false))
+                    .unwrap()
+                    .len()
+                    <= MAX_LISTING_BYTES
+            );
+            while crate::to_cbor(&listing(9_998, 1_000_000, pad + 1, false))
+                .unwrap()
+                .len()
+                <= MAX_LISTING_BYTES
+            {
+                pad += 1;
+            }
+            listing(9_998, 1_000_000, pad, false)
+        };
+        let kept = held(vec![big.clone(), just.clone()]);
+        assert_eq!(kept.listings, vec![just], "the one at the bound stays");
+    }
+
+    /// Review round 2 of step 2 (code-first): a state over either cap is
+    /// refused for the cap before a single signature is checked. Mutated red
+    /// by checking the signatures first.
+    #[test]
+    fn a_state_over_the_caps_is_refused_before_its_signatures_are_checked() {
+        let parent = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        let params = StoreParameters::new(store_key().verifying_key());
+        let mut over: Vec<_> = (0..(MAX_LISTINGS as u32 + 1))
+            .map(|n| listing(n, i64::from(n), 0, false))
+            .collect();
+        over.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        let why = ListingsV1 { listings: over }
+            .verify(&parent, &params)
+            .unwrap_err();
+        assert!(why.contains("the most it keeps"), "{why}");
+        let big = ListingsV1 {
+            listings: vec![listing(1, 0, MAX_LISTING_BYTES, false)],
+        };
+        let why = big.verify(&parent, &params).unwrap_err();
+        assert!(why.contains("bytes"), "{why}");
+    }
+
+    /// The cut is a pure function of the listings held, so merging in any
+    /// order and grouping gives the same bytes: seeded merge laws over
+    /// states that each sit near the cap and together cross it, with
+    /// oversized listings and tied times in the pool. Merging is what
+    /// `apply_delta` does with a delta of the other's listings (signatures
+    /// are checked there, not here). Mutated red by making the cut depend on
+    /// arrival order (keeping what was held first).
+    #[test]
+    fn merging_states_that_cross_the_cap_obeys_the_merge_laws() {
+        let mut pool: Vec<_> = (0..(MAX_LISTINGS as u32 * 3 / 2))
+            // Ties: listings `n` and `n + MAX_LISTINGS / 2` share a time.
+            .map(|n| listing(n, i64::from(n % (MAX_LISTINGS as u32 / 2)), 0, false))
+            .collect();
+        for n in 0..8 {
+            pool.push(listing(50_000 + n, 10_000, MAX_LISTING_BYTES, false));
+        }
+        let mut rng = Rng::new(0x5_12);
+        let mut states = vec![held(Vec::new())];
+        for _ in 0..12 {
+            // A window of 3/4 of the cap up to just under it, at a random
+            // offset, wrapping, so any two states overlap in part and most
+            // unions cross.
+            let len = MAX_LISTINGS * 3 / 4 + rng.below(MAX_LISTINGS / 4 - 1);
+            let at = rng.below(pool.len());
+            let picked = (0..len)
+                .map(|i| pool[(at + i) % pool.len()].clone())
+                .collect();
+            states.push(ListingsV1 { listings: picked });
+        }
+        for s in &mut states {
+            s.normalize();
+        }
+        assert!(states.iter().all(|s| s.listings.len() <= MAX_LISTINGS));
+        let merge = |a: &ListingsV1, b: &ListingsV1| {
+            let mut out = a.clone();
+            out.listings.extend(b.listings.iter().cloned());
+            out.normalize();
+            out
+        };
+        assert!(
+            states.iter().any(|a| states.iter().any(|b| {
+                let mut union: BTreeSet<_> =
+                    a.listings.iter().map(|l| l.listing.id.clone()).collect();
+                union.extend(b.listings.iter().map(|l| l.listing.id.clone()));
+                union.len() > MAX_LISTINGS
+            })),
+            "the sweep crosses the cap"
+        );
+        assert_laws(&states, 200, &mut rng, merge, |s| {
+            crate::to_cbor(s).unwrap()
+        });
+    }
+
+    /// Through the store's own merge, with signatures checked: three
+    /// signed states that together cross the cap merge to the same store
+    /// whichever way round, and a state over either cap does not verify.
+    #[test]
+    fn the_store_merge_cuts_the_same_way_round_and_verify_holds_the_cap() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let state = |range: std::ops::Range<u32>| {
+            let mut s = StoreStateV1 {
+                owner: Some(store_key().verifying_key()),
+                ..Default::default()
+            };
+            // In deltas of at most `MAX_LISTINGS`, the most one carries.
+            let all: Vec<_> = range.map(|n| listing(n, i64::from(n), 0, true)).collect();
+            for chunk in all.chunks(MAX_LISTINGS) {
+                s.apply_delta(
+                    &StoreStateV1::default(),
+                    &params,
+                    &Some(StoreStateV1Delta {
+                        owner: Some(store_key().verifying_key()),
+                        listings: Some(chunk.to_vec()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("applies");
+            }
+            s
+        };
+        let (a, b, c) = (state(0..300), state(200..500), state(450..560));
+        let merged = |x: &StoreStateV1, y: &StoreStateV1| {
+            let mut out = x.clone();
+            out.merge(&x.clone(), &params, y).expect("merge");
+            out
+        };
+        let one = merged(&merged(&a, &b), &c);
+        let two = merged(&a, &merged(&c, &b));
+        assert_eq!(crate::to_cbor(&one).unwrap(), crate::to_cbor(&two).unwrap());
+        assert_eq!(one.listings.listings.len(), MAX_LISTINGS);
+        assert!(one.verify(&StoreStateV1::default(), &params).is_ok());
+
+        let mut over = one.clone();
+        over.listings.listings.push(listing(70_000, 0, 0, true));
+        over.listings
+            .listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        assert!(over.verify(&StoreStateV1::default(), &params).is_err());
+        let mut big = a.clone();
+        big.listings
+            .listings
+            .push(listing(70_001, 0, MAX_LISTING_BYTES, true));
+        big.listings
+            .listings
+            .sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+        assert!(big.verify(&StoreStateV1::default(), &params).is_err());
+    }
+
+    /// Step 2: a forged listing the cap cuts on arrival is in no result, so
+    /// only `Unchecked::check` sees it, and the node path refuses it as
+    /// `apply_delta` does; a delta of more listings than a store holds is
+    /// refused whole. Red with the check skipped, and with the count bound
+    /// dropped from `ListingsV1::admit`.
+    #[test]
+    fn a_forged_listing_the_cut_drops_is_still_refused() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let mut held = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        held.apply_delta(
+            &StoreStateV1::default(),
+            &params,
+            &Some(StoreStateV1Delta {
+                owner: Some(store_key().verifying_key()),
+                listings: Some(
+                    (0..MAX_LISTINGS as u32)
+                        .map(|n| listing(n, 100 + i64::from(n), 0, true))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .expect("applies");
+        // Older than every listing held, so the cap cuts it at once.
+        let mut forged = listing(9_000, 0, 0, true);
+        forged.signature[0] ^= 1;
+        let delta = StoreStateV1Delta {
+            listings: Some(vec![forged]),
+            ..Default::default()
+        };
+        let mut merged = held.clone();
+        let mut unchecked = Unchecked::default();
+        merged
+            .apply_update(&params, &delta, &mut unchecked)
+            .unwrap();
+        assert_eq!(merged, held, "the cut listing changed nothing");
+        assert!(unchecked.check(&merged).is_err());
+        assert!(through_the_node(&held, &params, &delta).is_err());
+        assert!(through_apply_delta(&held, &params, &delta).is_err());
+
+        let too_many = StoreStateV1Delta {
+            listings: Some(
+                (0..=MAX_LISTINGS as u32)
+                    .map(|n| listing(20_000 + n, 1_000 + i64::from(n), 0, true))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let why = held
+            .clone()
+            .apply_delta(&held, &params, &Some(too_many))
+            .unwrap_err();
+        assert!(why.contains("more than a store holds"), "{why}");
+    }
+
+    /// An open order outlives its listing: once the listing an order was
+    /// made for is cut, the order is still held, still verifies with its
+    /// payment proof, and the store still verifies. An order names its
+    /// listing only by an opaque tag and carries its own terms. Red if the
+    /// cut ever reaches into the orders, or if verifying an order needed
+    /// its listing.
+    #[test]
+    fn an_order_outlives_its_cut_listing() {
+        let params = StoreParameters::new(store_key().verifying_key());
+        let oldest = listing(0, -1_000, 0, true);
+        let mut order = paid(1);
+        order.order.listing_tag = Some(oldest.listing.id.0);
+        order.order.id = crate::payment::OrderId::from_terms(&order.order);
+        // Re-sign the terms with the tag in them.
+        order = crate::test_orders::authorized(
+            &store_key(),
+            order.order,
+            crate::payment::OrderStatus::Paid,
+        );
+        let mut first = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        first
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params,
+                &Some(StoreStateV1Delta {
+                    owner: Some(store_key().verifying_key()),
+                    listings: Some(vec![oldest.clone()]),
+                    orders: Some(vec![order.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+        let newer: Vec<_> = (1..=MAX_LISTINGS as u32)
+            .map(|n| listing(n, i64::from(n), 0, true))
+            .collect();
+        first
+            .apply_delta(
+                &StoreStateV1::default(),
+                &params,
+                &Some(StoreStateV1Delta {
+                    listings: Some(newer),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+        assert!(
+            !first
+                .listings
+                .listings
+                .iter()
+                .any(|l| l.listing.id == oldest.listing.id),
+            "the order's listing was cut"
+        );
+        let kept = first
+            .orders
+            .orders
+            .get(&order.order.id)
+            .expect("the order stays");
+        assert_eq!(kept, &order);
+        assert!(kept.verify_terms(&store_key().verifying_key()).is_ok());
+        assert!(crate::payment::verify_payment_proof(
+            &kept.order,
+            kept.payment_proof.as_ref().expect("a proof")
+        )
+        .is_ok());
+        assert!(first.verify(&StoreStateV1::default(), &params).is_ok());
+    }
+}
+
+/// Step 2 (harvest#230): every signed record the store holds writes its
+/// signed payload and signature as CBOR byte strings (`serde_bytes`), which
+/// a store at its order cap carried as arrays of integers, about twice the
+/// bytes and one decode call per byte. The bytes signed are unchanged: only
+/// the outer field's encoding moved. A state written by an earlier
+/// generation still decodes, and its re-encoding is what the migration fold
+/// forwards (the contract accepts only its own canonical encoding).
+#[cfg(test)]
+mod byte_string_encoding_tests {
+    use super::*;
+    use crate::backing::{
+        AuthorizedBacking, AuthorizedClosure, AuthorizedRetirement, BackingStatement, Retirement,
+        StoreClosure,
+    };
+    use crate::earlier_encoding;
+
+    /// Bytes both sides of 24, where the integer-array form goes from one
+    /// byte an element to two.
+    fn bytes(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(11).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A store holding one of every signed record, every byte field filled.
+    /// Unsigned: what is tested is the encoding, not the signatures.
+    fn every_record() -> StoreStateV1 {
+        let owner = crate::test_orders::store_key().verifying_key();
+        let backer = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let mut order = crate::test_orders::paid(1);
+        order.status_scoped_payload = Some(bytes(1, 90));
+        order.status_signature = Some(bytes(2, 64));
+        let mut state = StoreStateV1 {
+            owner: Some(owner),
+            info: AuthorizedStoreInfoV1 {
+                info: StoreInfoV1 {
+                    version: 1,
+                    certificate_pem: String::new(),
+                    seller_fingerprint: String::new(),
+                    reputation_contract_id: [9; 32],
+                    store_name: "Shop".into(),
+                    description: String::new(),
+                    encryption_public_key: None,
+                    // Inside the signed details: stays an integer array.
+                    record_public_key: Some(bytes(24, 40)),
+                },
+                scoped_payload: bytes(3, 120),
+                signature: bytes(4, 64),
+            },
+            ..Default::default()
+        };
+        state.listings.listings.push(AuthorizedListing {
+            listing: crate::listing::Listing {
+                images: Vec::new(),
+                checkout: None,
+                choices: Vec::new(),
+                id: ListingId([0; 32]),
+                title: "Jam".into(),
+                description: String::new(),
+                kind: crate::listing::ListingKind::Sale,
+                price: None,
+                created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            }
+            .with_derived_id(),
+            scoped_payload: bytes(5, 200),
+            signature: bytes(6, 64),
+            certificate_pem: String::new(),
+        });
+        state
+            .orders
+            .orders
+            .insert(order.order.id.clone(), order.clone());
+        let slot = Bytes32(backer.to_bytes());
+        state.backings.records.insert(
+            slot,
+            AuthorizedBacking {
+                statement: BackingStatement {
+                    store: owner,
+                    backer,
+                    certificate_pem: String::new(),
+                    network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+                    block: freenet_bitcoin_common::BlockAnchor {
+                        height: 1,
+                        hash: freenet_bitcoin_common::BlockHash([7; 32]),
+                    },
+                },
+                backer_scoped_payload: bytes(7, 80),
+                backer_signature: bytes(8, 64),
+                acceptance_scoped_payload: bytes(9, 80),
+                acceptance_signature: bytes(10, 64),
+            },
+        );
+        state.retirements.records.insert(
+            slot,
+            AuthorizedRetirement {
+                retirement: Retirement { backer },
+                scoped_payload: bytes(11, 60),
+                signature: bytes(12, 64),
+            },
+        );
+        state.closed.records.insert(
+            Bytes32(owner.to_bytes()),
+            AuthorizedClosure {
+                closure: StoreClosure { store: owner },
+                scoped_payload: bytes(13, 60),
+                signature: bytes(14, 64),
+            },
+        );
+        state.copies.records.insert(
+            Bytes32([0x21; 32]),
+            crate::custody::AuthorizedCopy {
+                copy: crate::custody::StoreKeyCopy {
+                    store: owner,
+                    backer,
+                    scope: crate::custody::WrapScope([3; 32]),
+                    wrapped: crate::custody::WrappedStoreKey {
+                        scheme: crate::custody::SCHEME_V1,
+                        ciphertext: bytes(15, crate::custody::WRAPPED_LEN_V1),
+                    },
+                },
+                scoped_payload: bytes(16, 100),
+                signature: bytes(17, 64),
+            },
+        );
+        state.fulfilment.records.insert(
+            Bytes32(order.order.id.0),
+            crate::fulfilment::AuthorizedDespatch {
+                despatch: crate::fulfilment::Despatch {
+                    order_id: order.order.id.clone(),
+                    anchor: freenet_bitcoin_common::BlockAnchor {
+                        height: 2,
+                        hash: freenet_bitcoin_common::BlockHash([8; 32]),
+                    },
+                },
+                scoped_payload: bytes(18, 70),
+                signature: bytes(19, 64),
+            },
+        );
+        state.listing_statuses.records.insert(
+            Bytes32([0x31; 32]),
+            crate::listing::AuthorizedListingStatus {
+                status: crate::listing::ListingStatus {
+                    listing: ListingId([0x31; 32]),
+                    revision: 1,
+                    availability: crate::listing::ListingAvailability::SoldOut,
+                },
+                scoped_payload: bytes(20, 70),
+                signature: bytes(21, 64),
+            },
+        );
+        state.pause.records.insert(
+            Bytes32(owner.to_bytes()),
+            crate::store_pause::AuthorizedStorePause {
+                pause: crate::store_pause::StorePause::new(owner, 1, true),
+                scoped_payload: bytes(22, 70),
+                signature: bytes(23, 64),
+            },
+        );
+        state
+    }
+
+    /// A state written before step 2 decodes, record for record. Red if any
+    /// field loses the dual read.
+    #[test]
+    fn an_earlier_generations_store_still_decodes() {
+        let state = every_record();
+        let earlier = earlier_encoding::of(&crate::to_cbor(&state).unwrap());
+        let decoded: StoreStateV1 = crate::from_cbor(&earlier).expect("decodes");
+        assert_eq!(decoded, state);
+    }
+
+    /// Every outer byte field of every record is written as a byte string:
+    /// 24 of them in this store. Red if any one `#[serde(with =
+    /// "serde_bytes")]` is removed.
+    #[test]
+    fn every_records_byte_fields_are_byte_strings() {
+        let state = every_record();
+        let today = crate::to_cbor(&state).unwrap();
+        assert_eq!(earlier_encoding::byte_string_fields(&today), 24);
+        let earlier = earlier_encoding::of(&today);
+        assert!(
+            today.len() < earlier.len(),
+            "{} vs {}",
+            today.len(),
+            earlier.len()
+        );
+    }
+
+    /// The earlier bytes are not canonical today, and their re-encoding is:
+    /// the contract refuses the earlier bytes as they are, and the
+    /// migration fold forwards the state re-encoded.
+    #[test]
+    fn an_earlier_encoding_is_not_canonical_and_its_re_encoding_is() {
+        let state = every_record();
+        let earlier = earlier_encoding::of(&crate::to_cbor(&state).unwrap());
+        let decoded: StoreStateV1 = crate::from_cbor(&earlier).unwrap();
+        assert!(!crate::is_canonical_cbor(&decoded, &earlier));
+        assert!(crate::is_canonical_cbor(
+            &decoded,
+            &crate::to_cbor(&decoded).unwrap()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod at_caps_tests {
+    //! Step 2: [`AT_CAPS_BYTES`] is an upper bound on every state the caps
+    //! allow, built record by record at the largest content each field can
+    //! legally hold, NOT from a fixture of what the app writes.
+    //!
+    //! Every byte array a record carries as integers is filled with values
+    //! of 24 or more, which take two bytes each where smaller ones take one;
+    //! every integer is at its type's maximum; every `Option` is `Some`;
+    //! every enum is at its longest variant; every signed envelope is the
+    //! longest the store accepts (`backing::is_exact_harvest_envelope`'s
+    //! webapp ids). Records whose bytes are capped (listings, orders, the
+    //! store's details) are padded to exactly their cap. Signatures are 64
+    //! bytes as every one must be; whether they verify does not change a
+    //! record's size, so these are not signed.
+    use super::*;
+    use crate::backing::{
+        AuthorizedBacking, AuthorizedClosure, AuthorizedRetirement, BackingStatement, Retirement,
+        StoreClosure, MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
+    };
+    use crate::custody::{
+        AuthorizedCopy, StoreKeyCopy, WrapScope, WrappedStoreKey, MAX_SCOPES_PER_BACKER, SCHEME_V1,
+    };
+    use crate::fulfilment::{AuthorizedDespatch, Despatch};
+    use crate::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    use crate::payment::OrderId;
+    use crate::store_pause::{AuthorizedStorePause, StorePause};
+    use ed25519_dalek::SigningKey;
+    use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor, BlockHash};
+
+    /// 32 bytes, each of 24 or more (two bytes each as a CBOR integer),
+    /// distinct for distinct `n`.
+    fn wide(n: u32) -> [u8; 32] {
+        let mut bytes = [0xffu8; 32];
+        for (i, b) in n.to_be_bytes().iter().enumerate() {
+            // 24 + a base-200 digit: always 24 or more, and one-to-one.
+            bytes[i * 2] = 24 + (b % 200);
+            bytes[i * 2 + 1] = 24 + (b / 200);
+        }
+        bytes
+    }
+
+    /// The `n`th key whose 32 bytes are each 24 or more, so that it takes
+    /// the most bytes inside an envelope, where the signed payload is an
+    /// array of integers. About one key in 23 is.
+    fn key(n: u32) -> ed25519_dalek::VerifyingKey {
+        static KEYS: std::sync::OnceLock<Vec<ed25519_dalek::VerifyingKey>> =
+            std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            (0u32..)
+                .map(|i| {
+                    let mut seed = [0x5au8; 32];
+                    seed[..4].copy_from_slice(&i.to_le_bytes());
+                    SigningKey::from_bytes(&seed).verifying_key()
+                })
+                .filter(|k| k.as_bytes().iter().all(|b| *b >= 24))
+                .take(MAX_BACKINGS + 1)
+                .collect()
+        })[n as usize]
+    }
+
+    /// The longest envelope the store accepts around `data`.
+    fn envelope<T: Serialize>(data: &T) -> Vec<u8> {
+        let payload = crate::to_cbor(data).unwrap();
+        std::iter::once(crate::HARVEST_WEBAPP_CONTRACT_ID)
+            .chain(crate::LEGACY_HARVEST_WEBAPP_CONTRACT_IDS.iter().copied())
+            .map(|id| crate::backing::envelope_with_requestor(id, payload.clone()).unwrap())
+            .max_by_key(Vec::len)
+            .unwrap()
+    }
+
+    fn anchor() -> BlockAnchor {
+        BlockAnchor {
+            height: u32::MAX,
+            hash: BlockHash([0xff; 32]),
+        }
+    }
+
+    /// The longest network name.
+    const NETWORK: BitcoinNetwork = BitcoinNetwork::Testnet4;
+
+    fn status(n: u32) -> AuthorizedListingStatus {
+        let status = ListingStatus {
+            listing: ListingId(wide(n)),
+            revision: u64::MAX,
+            availability: ListingAvailability::Available {
+                quantity: Some(u32::MAX),
+            },
+        };
+        AuthorizedListingStatus {
+            scoped_payload: envelope(&status),
+            signature: vec![0xff; 64],
+            status,
+        }
+    }
+
+    fn pause(owner: ed25519_dalek::VerifyingKey) -> AuthorizedStorePause {
+        let mut pause = StorePause::new(owner, u64::MAX, true);
+        pause.revision = u64::MAX;
+        AuthorizedStorePause {
+            scoped_payload: envelope(&pause),
+            signature: vec![0xff; 64],
+            pause,
+        }
+    }
+
+    fn closure(owner: ed25519_dalek::VerifyingKey) -> AuthorizedClosure {
+        let closure = StoreClosure { store: owner };
+        AuthorizedClosure {
+            scoped_payload: envelope(&closure),
+            signature: vec![0xff; 64],
+            closure,
+        }
+    }
+
+    fn retirement(n: u32) -> AuthorizedRetirement {
+        let retirement = Retirement { backer: key(n) };
+        AuthorizedRetirement {
+            scoped_payload: envelope(&retirement),
+            signature: vec![0xff; 64],
+            retirement,
+        }
+    }
+
+    fn despatch(n: u32) -> AuthorizedDespatch {
+        let despatch = Despatch {
+            order_id: OrderId(wide(n)),
+            anchor: anchor(),
+        };
+        AuthorizedDespatch {
+            scoped_payload: envelope(&despatch),
+            signature: vec![0xff; 64],
+            despatch,
+        }
+    }
+
+    fn copy(owner: ed25519_dalek::VerifyingKey, backer: u32, scope: u32) -> AuthorizedCopy {
+        let copy = StoreKeyCopy {
+            store: owner,
+            backer: key(backer),
+            scope: WrapScope(wide(scope)),
+            wrapped: WrappedStoreKey {
+                scheme: SCHEME_V1,
+                ciphertext: vec![0xff; crate::custody::WRAPPED_LEN_V1],
+            },
+        };
+        AuthorizedCopy {
+            scoped_payload: envelope(&copy),
+            signature: vec![0xff; 64],
+            copy,
+        }
+    }
+
+    fn backing(owner: ed25519_dalek::VerifyingKey, n: u32) -> AuthorizedBacking {
+        let statement = BackingStatement {
+            store: owner,
+            backer: key(n),
+            // Every byte two as an integer inside the envelopes.
+            certificate_pem: "z".repeat(MAX_CERTIFICATE_PEM_BYTES),
+            network: NETWORK,
+            block: anchor(),
+        };
+        AuthorizedBacking {
+            backer_scoped_payload: envelope(&statement),
+            backer_signature: vec![0xff; 64],
+            acceptance_scoped_payload: envelope(&crate::backing::BackingAcceptance {
+                backing: statement.clone(),
+            }),
+            acceptance_signature: vec![0xff; 64],
+            statement,
+        }
+    }
+
+    /// `record` with `pad` grown until it encodes to as close under `cap`
+    /// as a byte string's length header allows.
+    fn padded_to<T: Serialize + Clone>(record: &T, cap: usize, pad: impl Fn(&mut T, usize)) -> T {
+        let mut n = cap.saturating_sub(crate::to_cbor(record).unwrap().len());
+        loop {
+            let mut grown = record.clone();
+            pad(&mut grown, n);
+            if crate::to_cbor(&grown).unwrap().len() <= cap {
+                return grown;
+            }
+            n -= 1;
+        }
+    }
+
+    fn listing(n: u32) -> AuthorizedListing {
+        let listing = crate::listing::Listing {
+            images: Vec::new(),
+            checkout: None,
+            choices: Vec::new(),
+            id: ListingId(wide(n)),
+            title: "t".into(),
+            description: String::new(),
+            kind: crate::listing::ListingKind::Sale,
+            price: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        let record = AuthorizedListing {
+            listing,
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+            certificate_pem: String::new(),
+        };
+        padded_to(&record, MAX_LISTING_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    fn order(n: u32) -> AuthorizedOrder {
+        let mut order = crate::test_orders::order(0);
+        order.id = OrderId(wide(n));
+        let record = AuthorizedOrder {
+            order,
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+            status: crate::payment::OrderStatus::Cancelled,
+            payment_proof: None,
+            status_scoped_payload: Some(Vec::new()),
+            status_signature: Some(vec![0xff; 64]),
+        };
+        padded_to(&record, MAX_ORDER_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    fn info() -> AuthorizedStoreInfoV1 {
+        let record = AuthorizedStoreInfoV1 {
+            info: StoreInfoV1 {
+                version: u32::MAX,
+                certificate_pem: String::new(),
+                seller_fingerprint: String::new(),
+                reputation_contract_id: [0xff; 32],
+                store_name: String::new(),
+                description: String::new(),
+                encryption_public_key: Some([0xff; 32]),
+                record_public_key: None,
+            },
+            scoped_payload: Vec::new(),
+            signature: vec![0xff; 64],
+        };
+        padded_to(&record, MAX_INFO_BYTES, |r, n| {
+            r.scoped_payload = vec![0xff; n];
+        })
+    }
+
+    /// Each fixed-shape record at its largest is within the figure
+    /// `AT_CAPS_BYTES` counts it at. Red with any of those figures lowered
+    /// past the record.
+    #[test]
+    fn each_kind_at_its_largest_is_within_its_bound() {
+        let owner = key(0);
+        let len = |bytes: Result<Vec<u8>, String>| bytes.unwrap().len();
+        for (what, bytes, bound) in [
+            (
+                "backing",
+                len(crate::to_cbor(&backing(owner, 1))),
+                BACKING_RECORD_BYTES,
+            ),
+            (
+                "retirement",
+                len(crate::to_cbor(&retirement(1))),
+                RETIREMENT_RECORD_BYTES,
+            ),
+            (
+                "wrapped copy",
+                len(crate::to_cbor(&copy(owner, 1, 1))),
+                COPY_RECORD_BYTES,
+            ),
+            (
+                "despatch",
+                len(crate::to_cbor(&despatch(1))),
+                DESPATCH_RECORD_BYTES,
+            ),
+            (
+                "listing status",
+                len(crate::to_cbor(&status(1))),
+                STATUS_RECORD_BYTES,
+            ),
+            (
+                "closure",
+                len(crate::to_cbor(&closure(owner))),
+                CLOSURE_RECORD_BYTES,
+            ),
+            (
+                "pause",
+                len(crate::to_cbor(&pause(owner))),
+                PAUSE_RECORD_BYTES,
+            ),
+            (
+                "an order key",
+                len(crate::to_cbor(&OrderId(wide(1)))),
+                ORDER_KEY_BYTES,
+            ),
+            (
+                "a slot key",
+                len(crate::to_cbor(&Bytes32(wide(1)))),
+                SLOT_KEY_BYTES,
+            ),
+        ] {
+            println!("{what}: {bytes} bytes, counted at {bound}");
+            assert!(bytes <= bound, "{what}: {bytes} bytes, counted at {bound}");
+        }
+    }
+
+    /// A store with every part at its count cap and every record at its
+    /// largest encodes within `AT_CAPS_BYTES`, and so within
+    /// `MAX_STORE_BYTES`. Red with any part's figure in `AT_CAPS_BYTES`
+    /// lowered by more than the slack the others leave.
+    #[test]
+    fn a_store_at_every_cap_encodes_within_at_caps_bytes() {
+        let owner = key(0);
+        let mut state = StoreStateV1 {
+            owner: Some(owner),
+            info: info(),
+            ..Default::default()
+        };
+        state.listings.listings = (0..MAX_LISTINGS as u32).map(listing).collect();
+        state.orders.orders = (0..MAX_ORDERS as u32)
+            .map(|n| (OrderId(wide(n)), order(n)))
+            .collect();
+        for n in 0..MAX_BACKINGS as u32 {
+            let b = backing(owner, n + 1);
+            state
+                .backings
+                .records
+                .insert(Bytes32(key(n + 1).to_bytes()), b);
+            let r = retirement(n + 1);
+            state
+                .retirements
+                .records
+                .insert(Bytes32(key(n + 1).to_bytes()), r);
+            for scope in 0..MAX_SCOPES_PER_BACKER as u32 {
+                let c = copy(owner, n + 1, scope);
+                use crate::backing::SignedRecord;
+                state.copies.records.insert(c.slot(), c);
+            }
+        }
+        for n in 0..MAX_ORDERS as u32 {
+            state
+                .fulfilment
+                .records
+                .insert(Bytes32(wide(n)), despatch(n));
+        }
+        for n in 0..MAX_LISTING_STATUSES as u32 {
+            state
+                .listing_statuses
+                .records
+                .insert(Bytes32(wide(n)), status(n));
+        }
+        state
+            .closed
+            .records
+            .insert(Bytes32(owner.to_bytes()), closure(owner));
+        state
+            .pause
+            .records
+            .insert(Bytes32(owner.to_bytes()), pause(owner));
+
+        // Every part of the state is filled above. Naming them all here
+        // means a part added later fails to compile until it is counted.
+        let StoreStateV1 {
+            owner: _,
+            info: _,
+            listings: _,
+            orders: _,
+            backings: _,
+            retirements: _,
+            closed: _,
+            copies: _,
+            fulfilment: _,
+            listing_statuses: _,
+            pause: _,
+        } = &state;
+        assert_eq!(
+            state.copies.records.len(),
+            MAX_BACKINGS * MAX_SCOPES_PER_BACKER
+        );
+        assert_eq!(state.orders.orders.len(), MAX_ORDERS);
+        assert_eq!(state.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        let bytes = crate::to_cbor(&state).unwrap().len();
+        println!("a store at every cap: {bytes} bytes; AT_CAPS_BYTES {AT_CAPS_BYTES}");
+        assert!(bytes <= AT_CAPS_BYTES, "{bytes} > {AT_CAPS_BYTES}");
+    }
+
+    /// The largest unpaid order the app writes, cancelled (its terms and a
+    /// status envelope), is within `MAX_ORDER_BYTES`. An order's terms carry
+    /// no text a buyer types: the address and note go to the seller's
+    /// delegate encrypted, never into the store. What varies is the
+    /// fingerprints (base58 of 32 bytes, at most 44 characters), the payment
+    /// address and script (here at the longest bech32 allows, 90 characters
+    /// and a 42-byte witness program), and the bridges the app trusts (one).
+    /// Everything else at its largest. A `Paid` record's room for its proof
+    /// is `the_paid_byte_bound_admits_ordinary_payments`.
+    #[test]
+    fn the_largest_honest_unpaid_order_is_within_the_bound() {
+        use crate::payment::{Order, OrderStatus};
+        use crate::test_orders::{sign_scoped, store_key};
+        let order = Order {
+            request_id: Some([0xff; 32]),
+            id: OrderId([0u8; 32]),
+            buyer_fingerprint: "z".repeat(44),
+            seller_fingerprint: "z".repeat(44),
+            amount_sats: u64::MAX,
+            network: NETWORK,
+            payment_script_pubkey: vec![0xff; 42],
+            payment_hash: Some([0xff; 32]),
+            payment_address: "z".repeat(90),
+            required_confirmations: u32::MAX,
+            trusted_bridges: vec![freenet_bitcoin_common::BridgeId([0xff; 32])],
+            bitcoin_address_code_hash: Some([0xff; 32]),
+            anchor: Some(anchor()),
+            order_binding: Some([0xff; 32]),
+            listing_tag: Some([0xff; 32]),
+            buyer_receipt_key: Some([0xff; 32]),
+            created_at: chrono::DateTime::from_timestamp(4_000_000_000, 999_999_999).unwrap(),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &order);
+        let (status_scoped, status_signature) =
+            sign_scoped(&store_key(), &(order.id.clone(), OrderStatus::Cancelled));
+        let record = AuthorizedOrder {
+            order,
+            scoped_payload,
+            signature,
+            status: OrderStatus::Cancelled,
+            payment_proof: None,
+            status_scoped_payload: Some(status_scoped),
+            status_signature: Some(status_signature),
+        };
+        let bytes = crate::to_cbor(&record).unwrap().len();
+        println!("the largest honest unpaid order: {bytes} bytes of {MAX_ORDER_BYTES}");
+        assert!(bytes <= MAX_ORDER_BYTES / 2, "{bytes}");
+        assert_eq!(kept(record.clone()), Some(record));
+    }
+
+    /// The largest store details the app writes are within
+    /// `MAX_INFO_BYTES`: a `MAX_STORE_NAME_BYTES` name and a
+    /// `MAX_DESCRIPTION_BYTES` description (the details form refuses longer,
+    /// `my_store::details_too_long`), the Ghost Key certificate at the most a
+    /// backing may carry, and a legacy record key (an RSA-2048 public key,
+    /// 270 bytes). Text is in it twice, once as text and once, two bytes a
+    /// character, inside the signed payload.
+    #[test]
+    fn the_largest_honest_store_info_is_within_the_bound() {
+        use crate::test_orders::{sign_scoped, store_key};
+        let info = StoreInfoV1 {
+            version: u32::MAX,
+            certificate_pem: "z".repeat(MAX_CERTIFICATE_PEM_BYTES),
+            seller_fingerprint: "z".repeat(44),
+            reputation_contract_id: [0xff; 32],
+            store_name: "z".repeat(MAX_STORE_NAME_BYTES),
+            description: "z".repeat(MAX_DESCRIPTION_BYTES),
+            encryption_public_key: Some([0xff; 32]),
+            record_public_key: Some(vec![0xff; 270]),
+        };
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &info);
+        let record = AuthorizedStoreInfoV1 {
+            info,
+            scoped_payload,
+            signature,
+        };
+        let bytes = crate::to_cbor(&record).unwrap().len();
+        println!("the largest honest store details: {bytes} bytes of {MAX_INFO_BYTES}");
+        assert!(record.within_cap(), "{bytes}");
+    }
+
+    /// Every fixed-shape record a store holds is refused when its signed
+    /// envelope carries a byte more than the exact Harvest envelope of the
+    /// record, though the signature over it is genuine; the exact one
+    /// verifies. One record of each kind, each through the producer the app
+    /// uses (`sign_with_store_key`; for a backing's Ghost Key half, the same
+    /// envelope the vault builds). Red with any one kind's check back to
+    /// `verify_scoped_signature`.
+    #[test]
+    fn a_padded_envelope_is_refused_for_every_fixed_shape_record() {
+        use crate::backing::{sign_with_store_key, store_key_envelope, BackingAcceptance};
+        use ed25519_dalek::Signer;
+        let owner_key = crate::test_orders::store_key();
+        let owner = owner_key.verifying_key();
+        let backer_key = SigningKey::from_bytes(&[0x33; 32]);
+        let sign =
+            |data: &dyn erased::Encode| sign_with_store_key(&owner_key, data.cbor()).unwrap();
+        let pad = |key: &SigningKey, scoped: &[u8]| {
+            let mut padded = scoped.to_vec();
+            padded.push(0);
+            let signature = key.sign(&padded).to_bytes().to_vec();
+            (padded, signature)
+        };
+        let mut checked = 0;
+        let mut check = |what: &str, exact: Result<(), String>, padded: Result<(), String>| {
+            exact.unwrap_or_else(|e| panic!("{what}: the exact envelope is refused: {e}"));
+            let why = padded.expect_err(what);
+            assert!(why.contains("exactly"), "{what}: {why}");
+            checked += 1;
+        };
+
+        let status = ListingStatus {
+            listing: ListingId([7; 32]),
+            revision: 3,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (scoped_payload, signature) = sign(&status);
+        let record = AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedListingStatus {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check(
+            "listing status",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+
+        let pause = StorePause::new(owner, 5, true);
+        let (scoped_payload, signature) = sign(&pause);
+        let record = AuthorizedStorePause {
+            pause,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedStorePause {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("pause", record.verify(&owner), padded.verify(&owner));
+
+        let closure = StoreClosure { store: owner };
+        let (scoped_payload, signature) = sign(&closure);
+        let record = AuthorizedClosure {
+            closure,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedClosure {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("closure", record.verify(&owner), padded.verify(&owner));
+
+        let retirement = Retirement {
+            backer: backer_key.verifying_key(),
+        };
+        let (scoped_payload, signature) = sign(&retirement);
+        let record = AuthorizedRetirement {
+            retirement,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedRetirement {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("retirement", record.verify(&owner), padded.verify(&owner));
+
+        let despatch = Despatch {
+            order_id: OrderId([9; 32]),
+            anchor: anchor(),
+        };
+        let (scoped_payload, signature) = sign(&despatch);
+        let record = AuthorizedDespatch {
+            despatch,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedDespatch {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("despatch", record.verify(&owner), padded.verify(&owner));
+
+        let copy = StoreKeyCopy {
+            store: owner,
+            backer: backer_key.verifying_key(),
+            scope: WrapScope([4; 32]),
+            wrapped: WrappedStoreKey {
+                scheme: SCHEME_V1,
+                ciphertext: vec![5; crate::custody::WRAPPED_LEN_V1],
+            },
+        };
+        let (scoped_payload, signature) = sign(&copy);
+        let record = AuthorizedCopy {
+            copy,
+            scoped_payload,
+            signature,
+        };
+        let (scoped_payload, signature) = pad(&owner_key, &record.scoped_payload);
+        let padded = AuthorizedCopy {
+            scoped_payload,
+            signature,
+            ..record.clone()
+        };
+        check("wrapped copy", record.verify(&owner), padded.verify(&owner));
+
+        let statement = BackingStatement {
+            store: owner,
+            backer: backer_key.verifying_key(),
+            certificate_pem: "cert".into(),
+            network: BitcoinNetwork::Signet,
+            block: anchor(),
+        };
+        let backer_scoped = store_key_envelope(crate::to_cbor(&statement).unwrap()).unwrap();
+        let backer_signature = backer_key.sign(&backer_scoped).to_bytes().to_vec();
+        let (acceptance_scoped, acceptance_signature) = sign(&BackingAcceptance {
+            backing: statement.clone(),
+        });
+        let record = AuthorizedBacking {
+            statement,
+            backer_scoped_payload: backer_scoped,
+            backer_signature,
+            acceptance_scoped_payload: acceptance_scoped,
+            acceptance_signature,
+        };
+        let (scoped, signature) = pad(&backer_key, &record.backer_scoped_payload);
+        let padded = AuthorizedBacking {
+            backer_scoped_payload: scoped,
+            backer_signature: signature,
+            ..record.clone()
+        };
+        check(
+            "backing (the Ghost Key's half)",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+        let (scoped, signature) = pad(&owner_key, &record.acceptance_scoped_payload);
+        let padded = AuthorizedBacking {
+            acceptance_scoped_payload: scoped,
+            acceptance_signature: signature,
+            ..record.clone()
+        };
+        check(
+            "backing (the store key's half)",
+            record.verify(&owner),
+            padded.verify(&owner),
+        );
+        assert_eq!(checked, 8);
+    }
+
+    /// `sign_with_store_key` takes a record's CBOR; this lets one closure
+    /// sign records of every type.
+    mod erased {
+        pub trait Encode {
+            fn cbor(&self) -> Vec<u8>;
+        }
+        impl<T: serde::Serialize> Encode for T {
+            fn cbor(&self) -> Vec<u8> {
+                crate::to_cbor(self).unwrap()
+            }
+        }
+    }
+
+    /// Step 2: every order record is within `MAX_ORDER_BYTES`. A cancel the
+    /// buyer padded past it is kept as the order's unpaid terms, and so is a
+    /// reversal padded with copies of its claims; unpaid terms past it are
+    /// not kept at all, and a state holding any record past it does not
+    /// verify. Red with the cap applied to `Paid` only, as it was.
+    #[test]
+    fn every_order_record_is_held_to_the_byte_bound() {
+        use crate::payment::OrderStatus;
+        use crate::test_orders::{order, sign_scoped, store_key};
+        let terms = order(1);
+        let (scoped_payload, signature) = sign_scoped(&store_key(), &terms);
+        let unpaid = AuthorizedOrder {
+            order: terms.clone(),
+            scoped_payload,
+            signature,
+            status: OrderStatus::AwaitingPayment,
+            payment_proof: None,
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        let (status_scoped, status_signature) =
+            sign_scoped(&store_key(), &(terms.id.clone(), OrderStatus::Cancelled));
+        let cancel = AuthorizedOrder {
+            status: OrderStatus::Cancelled,
+            status_scoped_payload: Some(status_scoped),
+            status_signature: Some(status_signature),
+            ..unpaid.clone()
+        };
+        assert_eq!(kept(cancel.clone()), Some(cancel.clone()));
+        // Padded and signed again: genuine signatures over padded envelopes,
+        // which `verify_scoped_signature` accepts.
+        use ed25519_dalek::Signer;
+        let resign = |bytes: &[u8]| store_key().sign(bytes).to_bytes().to_vec();
+        let mut padded_cancel = cancel.clone();
+        let status_payload = padded_cancel.status_scoped_payload.as_mut().unwrap();
+        status_payload.resize(MAX_ORDER_BYTES, 0);
+        padded_cancel.status_signature = Some(resign(status_payload));
+        assert_eq!(kept(padded_cancel.clone()), Some(unpaid.clone()));
+        let reversed = AuthorizedOrder {
+            status: OrderStatus::PaymentReversed,
+            payment_proof: Some(crate::test_orders::proof(&terms, 1)),
+            status_scoped_payload: None,
+            status_signature: None,
+            ..unpaid.clone()
+        };
+        assert_eq!(
+            as_kept(reversed.clone()),
+            reversed,
+            "within the bound, kept"
+        );
+        let mut padded_unpaid = unpaid.clone();
+        padded_unpaid.scoped_payload.resize(MAX_ORDER_BYTES, 0);
+        padded_unpaid.signature = resign(&padded_unpaid.scoped_payload);
+        assert_eq!(kept(padded_unpaid.clone()), None);
+
+        let owner = Some(store_key().verifying_key());
+        let parent = StoreStateV1 {
+            owner,
+            ..Default::default()
+        };
+        let p = StoreParameters::new(store_key().verifying_key());
+        for (what, record) in [("cancel", padded_cancel), ("unpaid", padded_unpaid)] {
+            let mut held = OrdersV1::default();
+            held.orders.insert(record.order.id.clone(), record);
+            let why = held.verify(&parent, &p).unwrap_err();
+            assert!(why.contains("past"), "{what}: {why}");
+        }
+        let mut held = OrdersV1::default();
+        held.orders.insert(cancel.order.id.clone(), cancel);
+        held.verify(&parent, &p).expect("within the bound");
+    }
+
+    /// Step 2: store details past `MAX_INFO_BYTES` are not taken by a merge
+    /// and do not verify; the same details within it are. Red with the
+    /// bound dropped from `admit` or from `verify`.
+    #[test]
+    fn store_details_past_the_byte_bound_are_not_taken() {
+        use crate::test_orders::{sign_scoped, store_key};
+        let details = |description: usize| {
+            let info = StoreInfoV1 {
+                version: 2,
+                certificate_pem: String::new(),
+                seller_fingerprint: "fp".into(),
+                reputation_contract_id: [0u8; 32],
+                store_name: "Jam".into(),
+                description: "d".repeat(description),
+                encryption_public_key: None,
+                record_public_key: None,
+            };
+            let (scoped_payload, signature) = sign_scoped(&store_key(), &info);
+            AuthorizedStoreInfoV1 {
+                info,
+                scoped_payload,
+                signature,
+            }
+        };
+        let parent = StoreStateV1 {
+            owner: Some(store_key().verifying_key()),
+            ..Default::default()
+        };
+        let p = StoreParameters::new(store_key().verifying_key());
+        let small = details(100);
+        let big = details(MAX_INFO_BYTES / 3);
+        assert!(crate::to_cbor(&big).unwrap().len() > MAX_INFO_BYTES);
+        let mut held = AuthorizedStoreInfoV1::default();
+        held.apply_delta(&parent, &p, &Some(big.clone())).unwrap();
+        assert_eq!(
+            held,
+            AuthorizedStoreInfoV1::default(),
+            "past the bound, not taken"
+        );
+        assert!(big.verify(&parent, &p).unwrap_err().contains("past"));
+        held.apply_delta(&parent, &p, &Some(small.clone())).unwrap();
+        assert_eq!(held, small);
+        small.verify(&parent, &p).expect("within the bound");
     }
 }

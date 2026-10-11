@@ -163,7 +163,8 @@ pub struct Heartbeat {
 /// whether to come back, not which of the seller's checks failed.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotTakingReason {
-    /// The seller paused the whole store. Reserved: nothing sends it yet.
+    /// The seller paused the whole store (step 2: the store's own pause
+    /// record, `store_pause`).
     Paused,
     /// The store is closed for good, or is not this seller's.
     ClosedForGood,

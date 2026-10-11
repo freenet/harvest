@@ -347,6 +347,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#226; moves only because it links
                 // drop glue for the mailbox's `EncryptedMessage`.
                 "8e95714fed08fb474e6ce75de1408ce1d3437f6a58eed22e583bb9e39da95a45",
+                // V27, from `git show 48bdbab:ui/public/contracts/store_contract.wasm`,
+                // the generation harvest#229 shipped. Superseded by step 2
+                // (the pause, the listing caps, byte strings).
+                "35a455559d4f9980f4b22bb8a684a2478de932df3eae613bb7c2f35cba6af68f",
             ],
         ),
         (
@@ -426,6 +430,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "86d20b95428ae8d7b648598c7b8b3d75c0aeabdf72da0fca0e042ca30bfd9c94",
+                // V21, from `git show 57979f8:ui/public/contracts/reputation_contract.wasm`,
+                // unchanged through #229. Superseded by step 2: a complaint's
+                // order writes its signed payload and signature as byte strings.
+                "eab59c4e99867d21bce8fdcf7856321380fc92f22f5bbb62bbcbb1932b1bfc8c",
             ],
         ),
         (
@@ -497,6 +505,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by harvest#226: the message bytes became CBOR
                 // byte strings (a state-encoding change the fold reads).
                 "64fd7bfe4a33571a2161eb5e8c0cc3f2455c44248052b619675641fc67b2579f",
+                // V21, from `git show 48bdbab:ui/public/contracts/mailbox_contract.wasm`.
+                // Superseded by step 2; moves only because `harvest-common`
+                // is compiled into it.
+                "365266a2b37947e5e56506bd6d774412e1161368ef040855b034219c00c89127",
             ],
         ),
         (
@@ -530,6 +542,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
                 // Superseded by listing photos; moves only because
                 // `harvest-common` is compiled into it.
                 "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a",
+                // V8, from `git show 57979f8:ui/public/contracts/index_contract.wasm`,
+                // unchanged through #229. Superseded by step 2; moves only
+                // because `harvest-common` is compiled into it.
+                "44bcc983a6e6c21896f3cd72aa086ec8832cffcd2085a6ce28630250d4fe8abc",
             ],
         ),
     ];
@@ -677,6 +693,10 @@ fn the_recorded_hashes_are_the_ones_derived_from_git_history() {
             // the generation harvest#221 shipped. Superseded by harvest#226;
             // its mailbox decoder reads the byte-string encoding too.
             "e00d7e5686c6494209c2a826df7b28966b346208374a68610209a93e5be4e8c9".to_string(),
+            // V33, from `git show 48bdbab:ui/public/contracts/harvest_delegate.wasm`,
+            // the generation harvest#229 shipped. Superseded by step 2 (the
+            // purchases backup, the pause, the lighter store read).
+            "350dfcec6d297f75063fc842c160f360d50849fbbaa9ba3ad5fc2360300d28d6".to_string(),
         ],
     );
 }
@@ -1214,6 +1234,8 @@ const PUBLISHED_UNDER: &[(u32, StoreParamShape)] = {
         (25, Code),
         // V26: listing photos (`57979f8`). Still the store code.
         (26, Code),
+        // V27: harvest#229 (`48bdbab`). Still the store code.
+        (27, Code),
     ]
 };
 
@@ -3111,6 +3133,88 @@ fn rsa_generation_parameter_bytes_are_pinned() {
     );
 }
 
+/// `bytes` as a generation before step 2 wrote them (harvest#227): each
+/// signed record's signed payload and signature as an array of integers
+/// rather than a byte string.
+fn in_the_earlier_encoding(bytes: &[u8]) -> Vec<u8> {
+    use ciborium::Value;
+    const FIELDS: [&str; 8] = [
+        "scoped_payload",
+        "signature",
+        "backer_scoped_payload",
+        "backer_signature",
+        "acceptance_scoped_payload",
+        "acceptance_signature",
+        "status_scoped_payload",
+        "status_signature",
+    ];
+    fn rewrite(value: Value) -> Value {
+        match value {
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let named = matches!(&k, Value::Text(t) if FIELDS.contains(&t.as_str()));
+                        let v = match v {
+                            Value::Bytes(b) if named => Value::Array(
+                                b.into_iter().map(|x| Value::Integer(x.into())).collect(),
+                            ),
+                            other => rewrite(other),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.into_iter().map(rewrite).collect()),
+            Value::Tag(t, inner) => Value::Tag(t, Box::new(rewrite(*inner))),
+            other => other,
+        }
+    }
+    let value: Value = harvest_common::from_cbor(bytes).unwrap();
+    harvest_common::to_cbor(&rewrite(value)).unwrap()
+}
+
+/// Step 2 (harvest#227): a predecessor store holds its records' signed
+/// payloads and signatures as integer arrays. The fold decodes it, merges
+/// it, and forwards the state in this generation's encoding, the only one
+/// the current contract accepts as canonical. Red if the store loses the
+/// dual read, or if the fold forwards what it was handed.
+#[test]
+fn a_predecessor_store_in_the_earlier_encoding_is_folded_and_forwarded_re_encoded() {
+    let ops = store_ops();
+    let older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    let raw = in_the_earlier_encoding(&store_bytes(&older));
+    assert_ne!(raw, store_bytes(&older), "the earlier form differs");
+    let recovered = ops
+        .decode(&raw)
+        .expect("the probe decodes a predecessor's encoding");
+    let folded = ops.merge_with_local(recovered, &store_with(&[signed_listing("Plum")]));
+    assert_eq!(folded.listings.listings.len(), 3);
+    let forwarded = harvest_common::to_cbor(&folded).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&folded, &forwarded));
+    assert!(
+        in_the_earlier_encoding(&forwarded).len() > forwarded.len(),
+        "forwarded with byte strings, not the integer arrays it arrived in"
+    );
+}
+
+/// The frozen complaint (`tests/fixtures/reputation-state-complaint-v1.cbor`,
+/// written before step 2 with integer arrays) is decoded by the reputation
+/// fold and forwards canonically in today's encoding, so a complaint made
+/// before step 2 survives the re-key (`docs/complaint-threat-model.md`
+/// section 8). Red if the order inside a complaint loses the dual read.
+#[test]
+fn a_complaint_made_before_step_2_is_carried_across() {
+    let ops = ReputationOps {
+        params: reputation_params(&store_vk()),
+    };
+    let raw = include_bytes!("../../../tests/fixtures/reputation-state-complaint-v1.cbor");
+    let recovered = ops.decode(raw).expect("decodes");
+    assert_eq!(recovered.complaints.len(), 1);
+    let forwarded = harvest_common::to_cbor(&recovered).unwrap();
+    assert!(harvest_common::is_canonical_cbor(&recovered, &forwarded));
+    assert_eq!(in_the_earlier_encoding(&forwarded), raw.to_vec());
+}
 /// harvest#226: a predecessor mailbox (V20 and earlier) holds its message
 /// bytes as CBOR integer arrays. The fold must decode it, merge it, and
 /// forward a state in this generation's encoding, which is the only one the
@@ -3166,4 +3270,458 @@ fn a_predecessor_mailbox_in_the_earlier_encoding_is_folded_and_forwarded_re_enco
         forwarded.windows(8).any(|w| w == run),
         "forwarded in the byte-string form, not the integer arrays it arrived in"
     );
+}
+
+/// An order signed by [`seller`] the way the store contract checks one,
+/// made `secs` seconds after an epoch.
+fn signed_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
+    use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderStatus};
+    let order = Order {
+        request_id: None,
+        id: OrderId([0u8; 32]),
+        buyer_fingerprint: String::new(),
+        seller_fingerprint: String::new(),
+        amount_sats: 1_000,
+        network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+        payment_script_pubkey: vec![0u8; 22],
+        payment_hash: None,
+        payment_address: String::new(),
+        required_confirmations: 1,
+        trusted_bridges: Vec::new(),
+        bitcoin_address_code_hash: None,
+        anchor: None,
+        order_binding: None,
+        listing_tag: None,
+        buyer_receipt_key: None,
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("timestamp"),
+    }
+    .with_derived_id();
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&order).expect("serialize order"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("serialize scoped payload");
+    let signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+    AuthorizedOrder {
+        order,
+        scoped_payload,
+        signature,
+        status: OrderStatus::AwaitingPayment,
+        payment_proof: None,
+        status_scoped_payload: None,
+        status_signature: None,
+    }
+}
+
+/// Review round 3 of step 2 (the merge-law generator): each side is held to
+/// this generation's rules BEFORE the fold merges them, so a `Paid` on
+/// padded evidence an earlier generation kept cannot outrank the other
+/// side's cancellation of the same order inside the merge and then be
+/// stripped to unpaid after it, losing the cancellation, whichever side
+/// the predecessor is on. Red with either side's normalisation before the
+/// merge dropped.
+#[test]
+fn a_padded_paid_in_the_predecessor_does_not_hide_a_cancellation() {
+    use harvest_common::payment::OrderStatus;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    let padded = padded_paid_order(5);
+    older
+        .orders
+        .orders
+        .insert(padded.order.id.clone(), padded.clone());
+    let mut cancelled = signed_order(5);
+    cancelled.status = OrderStatus::Cancelled;
+    let message = (cancelled.order.id.clone(), OrderStatus::Cancelled);
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&message).expect("encode"),
+    };
+    let scoped = harvest_common::to_cbor(&scoped).expect("encode");
+    cancelled.status_signature = Some(seller().sign(&scoped).to_bytes().to_vec());
+    cancelled.status_scoped_payload = Some(scoped);
+    cancelled
+        .verify(&seller_vk())
+        .expect("precondition: the seller's cancellation");
+    let mut local = store_with(&[signed_listing("Plum")]);
+    local
+        .orders
+        .orders
+        .insert(cancelled.order.id.clone(), cancelled.clone());
+    // The predecessor as the base (`merge_with_local`), and as the other
+    // side (`merge_generations(newer, older)`).
+    for (shape, folded) in [
+        (
+            "merge_with_local",
+            store_ops().merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations",
+            store_ops().merge_generations(local.clone(), older),
+        ),
+    ] {
+        assert_eq!(
+            folded.orders.orders[&cancelled.order.id].status,
+            OrderStatus::Cancelled,
+            "{shape}"
+        );
+    }
+}
+
+/// Step 2 lowers the order cap from 4096 to `MAX_ORDERS` (256). A
+/// predecessor generation that holds 4096 orders is folded, not refused: the
+/// fold keeps the newest `MAX_ORDERS` by `created_at` and carries every one
+/// of its listings, and the result is a state this generation's contract
+/// accepts. Red if the fold refused the generation wholesale (its listings
+/// lost with its orders), or if it kept more orders than the cap.
+#[test]
+fn a_predecessor_with_4096_orders_is_folded_to_the_cap_with_its_listings() {
+    use harvest_common::store::MAX_ORDERS;
+    let mut older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    for i in 0..4096i64 {
+        let order = signed_order(i);
+        older.orders.orders.insert(order.order.id.clone(), order);
+    }
+    assert_eq!(older.orders.orders.len(), 4096);
+    let local = store_with(&[signed_listing("Plum")]);
+    let folded = merge_store_reporting_discard(
+        local,
+        &older,
+        &store_ops().params,
+        &seller_vk(),
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded, "the generation is folded, not refused");
+    let state = folded.state;
+    assert_eq!(state.listings.listings.len(), 3, "every listing is carried");
+    assert_eq!(state.orders.orders.len(), MAX_ORDERS);
+    let oldest_kept = state
+        .orders
+        .orders
+        .values()
+        .map(|o| o.order.created_at.timestamp())
+        .min()
+        .expect("orders");
+    assert_eq!(
+        oldest_kept,
+        1_700_000_000 + 4096 - MAX_ORDERS as i64,
+        "the newest are kept"
+    );
+    use freenet_scaffold::ComposableState;
+    state
+        .verify(&state, &store_ops().params)
+        .expect("this generation accepts the folded state");
+}
+
+/// The same cap with the predecessor where the driver puts it: the BASE of
+/// `merge_with_local` (a recovered state folded into the local one) and of
+/// `merge_generations(older, ..)`, where the scaffold's merge skips the
+/// orders' `apply_delta` when the other side brings no new order. Its
+/// oldest order carries a despatch, which must go with it. Red with the cap
+/// left out of `OrdersV1::normalize` (300 orders forwarded, refused by this
+/// generation's `verify`), or the despatch's cut left out of the fold.
+#[test]
+fn a_predecessor_over_the_order_cap_is_capped_whichever_side_it_is_on() {
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::SignedRecord;
+    use harvest_common::store::MAX_ORDERS;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    for i in 0..300i64 {
+        let order = signed_order(i);
+        older.orders.orders.insert(order.order.id.clone(), order);
+    }
+    let oldest = signed_order(0);
+    let despatch = harvest_common::fulfilment::Despatch {
+        order_id: oldest.order.id.clone(),
+        anchor: freenet_bitcoin_common::BlockAnchor {
+            height: 100,
+            hash: freenet_bitcoin_common::BlockHash([1u8; 32]),
+        },
+    };
+    let scoped = ghostkey_common::ScopedPayload {
+        requestor: ghostkey_common::SignatureRequestor::WebApp(
+            harvest_common::HARVEST_WEBAPP_CONTRACT_ID
+                .parse::<ContractInstanceId>()
+                .expect("canonical webapp id"),
+        ),
+        payload: harvest_common::to_cbor(&despatch).expect("encode"),
+    };
+    let scoped_payload = harvest_common::to_cbor(&scoped).expect("encode");
+    let despatch = harvest_common::fulfilment::AuthorizedDespatch {
+        despatch,
+        signature: seller().sign(&scoped_payload).to_bytes().to_vec(),
+        scoped_payload,
+    };
+    despatch
+        .verify(&seller_vk())
+        .expect("precondition: the seller's");
+    older.fulfilment.records.insert(despatch.slot(), despatch);
+    let ops = store_ops();
+    let empty = StoreStateV1::default();
+    let local = store_with(&[signed_listing("Plum")]);
+    for (shape, state) in [
+        (
+            "merge_with_local(older, empty)",
+            ops.merge_with_local(older.clone(), &empty),
+        ),
+        (
+            "merge_with_local(older, local)",
+            ops.merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations(older, empty)",
+            ops.merge_generations(older.clone(), empty.clone()),
+        ),
+        (
+            "merge_generations(empty, older)",
+            ops.merge_generations(empty.clone(), older.clone()),
+        ),
+    ] {
+        assert_eq!(state.orders.orders.len(), MAX_ORDERS, "{shape}");
+        assert!(
+            !state.orders.orders.contains_key(&oldest.order.id),
+            "{shape}: the oldest goes"
+        );
+        assert!(
+            state.fulfilment.records.is_empty(),
+            "{shape}: its despatch goes with it"
+        );
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
+/// Step 2: an earlier generation kept every listing status (they were
+/// uncapped), so one can hold more than `MAX_LISTING_STATUSES`, more than a
+/// delta of this generation may carry. Whichever side of the fold it is on,
+/// its newest 512 are carried and the result is a state this generation
+/// accepts. Red with `listing_statuses.normalize()` left out of the fold or
+/// of `normalize_carried`.
+#[test]
+fn a_predecessor_over_the_status_bound_is_cut_to_its_newest_whichever_side_it_is_on() {
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::{sign_with_store_key, SignedRecord};
+    use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    use harvest_common::store::MAX_LISTING_STATUSES;
+    let mut older = store_with(&[signed_listing("Jam")]);
+    let status = |n: u32| {
+        let status = ListingStatus {
+            listing: ListingId(*blake3::hash(format!("status/{n}").as_bytes()).as_bytes()),
+            revision: 1_000 + u64::from(n),
+            availability: ListingAvailability::Withdrawn,
+        };
+        let (scoped_payload, signature) =
+            sign_with_store_key(&seller(), harvest_common::to_cbor(&status).expect("encode"))
+                .expect("a store record");
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    for n in 0..600 {
+        let s = status(n);
+        older.listing_statuses.records.insert(s.slot(), s);
+    }
+    let oldest_kept = status(600 - MAX_LISTING_STATUSES as u32).slot();
+    let newest_cut = status(600 - MAX_LISTING_STATUSES as u32 - 1).slot();
+    let ops = store_ops();
+    let empty = StoreStateV1::default();
+    let local = store_with(&[signed_listing("Plum")]);
+    for (shape, state) in [
+        (
+            "merge_with_local(older, empty)",
+            ops.merge_with_local(older.clone(), &empty),
+        ),
+        (
+            "merge_with_local(older, local)",
+            ops.merge_with_local(older.clone(), &local),
+        ),
+        (
+            "merge_generations(older, empty)",
+            ops.merge_generations(older.clone(), empty.clone()),
+        ),
+        (
+            "merge_generations(empty, older)",
+            ops.merge_generations(empty.clone(), older.clone()),
+        ),
+    ] {
+        let held = &state.listing_statuses.records;
+        assert_eq!(held.len(), MAX_LISTING_STATUSES, "{shape}");
+        assert!(
+            held.contains_key(&oldest_kept),
+            "{shape}: the newest are kept"
+        );
+        assert!(!held.contains_key(&newest_cut), "{shape}: the oldest go");
+        assert!(
+            state
+                .listings
+                .listings
+                .iter()
+                .any(|l| l.listing.title == "Jam"),
+            "{shape}: its listing is carried"
+        );
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
+/// Step 2: an earlier generation kept a record whose signed envelope was
+/// padded (it checked only the payload inside), which this generation
+/// refuses. Whichever side of the fold it is on, that record is dropped and
+/// everything else is carried, and a genuine record for the same slot on
+/// the other side is kept though the padded one outranks it. Red with
+/// `drop_unbounded` left out on either side.
+#[test]
+fn a_predecessors_padded_record_is_dropped_and_the_rest_carried() {
+    use ed25519_dalek::Signer;
+    use freenet_scaffold::ComposableState;
+    use harvest_common::backing::{sign_with_store_key, SignedRecord};
+    use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
+    let status = |revision: u64, padded: bool| {
+        let status = ListingStatus {
+            listing: ListingId([0x42; 32]),
+            revision,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (mut scoped_payload, mut signature) =
+            sign_with_store_key(&seller(), harvest_common::to_cbor(&status).expect("encode"))
+                .expect("a store record");
+        if padded {
+            scoped_payload.extend_from_slice(&[0; 64]);
+            signature = seller().sign(&scoped_payload).to_bytes().to_vec();
+        }
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    let padded = status(9, true);
+    let genuine = status(5, false);
+    let mut older = store_with(&[signed_listing("Jam")]);
+    older.listing_statuses.records.insert(padded.slot(), padded);
+    let mut newer = store_with(&[signed_listing("Plum")]);
+    newer
+        .listing_statuses
+        .records
+        .insert(genuine.slot(), genuine.clone());
+    let ops = store_ops();
+    for (shape, state) in [
+        (
+            "merge_with_local(older, newer)",
+            ops.merge_with_local(older.clone(), &newer),
+        ),
+        (
+            "merge_with_local(newer, older)",
+            ops.merge_with_local(newer.clone(), &older),
+        ),
+        (
+            "merge_generations(older, newer)",
+            ops.merge_generations(older.clone(), newer.clone()),
+        ),
+        (
+            "merge_generations(newer, older)",
+            ops.merge_generations(newer.clone(), older.clone()),
+        ),
+    ] {
+        assert_eq!(
+            state.listing_statuses.records.get(&genuine.slot()),
+            Some(&genuine),
+            "{shape}: the genuine status is kept, the padded one dropped"
+        );
+        for title in ["Jam", "Plum"] {
+            assert!(
+                state
+                    .listings
+                    .listings
+                    .iter()
+                    .any(|l| l.listing.title == title),
+                "{shape}: {title} is carried"
+            );
+        }
+        state
+            .verify(&state, &ops.params)
+            .unwrap_or_else(|e| panic!("{shape}: this generation refuses the fold: {e}"));
+    }
+}
+
+/// [`signed_order`] marked `Paid` on evidence that is not the minimal proof
+/// (here none that could be: no claims), as an earlier generation kept a
+/// padded one.
+fn padded_paid_order(secs: i64) -> harvest_common::payment::AuthorizedOrder {
+    use freenet_bitcoin_common::{BlockAnchor, BlockHash, SignedTipEntry, TipEntryBody};
+    let mut order = signed_order(secs);
+    let tip = SignedTipEntry::sign(
+        &SigningKey::from_bytes(&[9u8; 32]),
+        &TipEntryBody {
+            network: freenet_bitcoin_common::BitcoinNetwork::Signet,
+            anchor: BlockAnchor {
+                height: 100,
+                hash: BlockHash([1u8; 32]),
+            },
+            prev_hash: BlockHash([2u8; 32]),
+            block_time: 1_700_000_000,
+            tx_count: 1,
+            median_time: 1_700_000_000,
+        },
+    )
+    .expect("sign the tip");
+    order.status = harvest_common::payment::OrderStatus::Paid;
+    order.payment_proof = Some(harvest_common::payment::OrderPaymentProof::on_chain(
+        Vec::new(),
+        tip,
+    ));
+    order
+}
+
+/// Step 2: a generation that holds a `Paid` on padded evidence (anything
+/// but the minimal proof) is folded, not refused: the order is carried as
+/// its unpaid terms, on either side of the fold, its listings with it, and
+/// the result is a state this generation's contract accepts. Red if the
+/// store refused such a record in `apply_delta` (the predecessor would be
+/// discarded whole), or if the fold did not normalise the local side.
+#[test]
+fn a_predecessor_with_a_padded_paid_order_is_folded_with_its_listings() {
+    use harvest_common::payment::OrderStatus;
+    let mut older = store_with(&[signed_listing("Jam"), signed_listing("Fig")]);
+    let theirs = padded_paid_order(1);
+    older
+        .orders
+        .orders
+        .insert(theirs.order.id.clone(), theirs.clone());
+    let mut local = store_with(&[signed_listing("Plum")]);
+    let ours = padded_paid_order(2);
+    local
+        .orders
+        .orders
+        .insert(ours.order.id.clone(), ours.clone());
+    let folded = merge_store_reporting_discard(
+        local,
+        &older,
+        &store_ops().params,
+        &seller_vk(),
+        DiscardedSide::Predecessor,
+    );
+    assert!(!folded.discarded, "the generation is folded, not refused");
+    let state = folded.state;
+    assert_eq!(state.listings.listings.len(), 3, "every listing is carried");
+    for id in [&theirs.order.id, &ours.order.id] {
+        let held = &state.orders.orders[id];
+        assert_eq!(held.status, OrderStatus::AwaitingPayment);
+        assert!(held.payment_proof.is_none());
+    }
+    use freenet_scaffold::ComposableState;
+    state
+        .verify(&state, &store_ops().params)
+        .expect("this generation accepts the folded state");
 }

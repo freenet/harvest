@@ -126,11 +126,16 @@ pub(crate) const CURSOR_ACTIVE_KEY: &[u8] = b"harvest:bitcoin:cursor-active:v1";
 /// How far the pending key's scan has got ([`Cursor`]). As above.
 pub(crate) const CURSOR_PENDING_KEY: &[u8] = b"harvest:bitcoin:cursor-pending:v1";
 
-/// The most entries the list holds: what one seller can have published
-/// at once, [`crate::store_keys::MAX_STORE_KEYS`] stores of
-/// [`harvest_common::store::MAX_ORDERS`] orders.
-pub(crate) const MAX_HELD: usize =
-    crate::store_keys::MAX_STORE_KEYS * harvest_common::store::MAX_ORDERS;
+/// The most entries the list holds: [`crate::store_keys::MAX_STORE_KEYS`]
+/// stores of [`PUBLISHED_PER_STORE`] scripts.
+pub(crate) const MAX_HELD: usize = crate::store_keys::MAX_STORE_KEYS * PUBLISHED_PER_STORE;
+
+/// How many published scripts the list allows for each store. It bounds the
+/// list's churn, not what one store shows: it was the store's order cap
+/// (4096) until step 2 lowered that to 256, and is kept where it was, so a
+/// script a store has pruned stays remembered for as long as before
+/// (split-investigation section 4).
+pub(crate) const PUBLISHED_PER_STORE: usize = 4096;
 
 pub(crate) type Digest = [u8; 16];
 

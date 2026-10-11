@@ -127,6 +127,9 @@ fails the run on any difference.
 | `ExportSecrets` | the migration export with the state above, after every instant-checkout step because it disarms instant checkout. The harness checks it carries at least as many entries as were seeded, and every seeded instant-checkout ledger by key |
 | a seller's published scripts, after the export (the payment key does not look at it), each run from the same secrets (the key active, and the one script the foreign-script step above sent already held: since #216 a script sent with `DeriveOrderAddress` is kept like any other): sent as `AddPublishedScripts` requests of `MAX_SCRIPTS_PER_REQUEST` (4096), then `SetPaymentXpub` (with `resume` when asked again) or `DeriveOrderAddress`, repeated while the delegate answers `CATCHING_UP_PREFIX`. One full store contiguous from the counter, driven to the end; every store full (64 x 4096 = `MAX_HELD`), 64 additions each measured and then ONE scan call; one full store with its scripts `PUBLISHED_INDEX_GAP` apart, 32 calls | no address is handed out, and no key made active, until the counter is past every published script the delegate holds; every match pushes the scan's give-up point `PUBLISHED_INDEX_GAP` further, so the scan is cut into budgets (`FLOOR_SCAN_BUDGET`). The harness requires the scan's cursor (in the refusal, `{counter}/{cursor}`) to move on with every call and the final count, or the address handed out, to be one past the last script. The 64-store input is real: one delegate holds one payment key for every store, and the web app sends every owned store's scripts. The spaced run takes about 1,400 calls to finish; 32 show its per-call bound. The scripts are derived by the delegate's own `bip32.rs`, compiled into the harness and checked against the delegate's next ten addresses. A delegate without `AddPublishedScripts` (V29) is sent the scripts with the request, as its web app did |
 | a new device: a key that is not the active one, entered after its store's 4096 scripts are sent; then a stale resume | the new key's scan runs in the pending slot while the active key goes on: after one call the harness checks the new key is pending beside the active one, and at the end that it is active at count 4096 with the pending slot emptied. Then tab A's new key part-way, tab B enters another key, and tab A's `resume` must be refused with `KEY_SUPERSEDED_PREFIX` and change nothing. Not on V29, which has no pending slot |
+| instant checkout's decide again, on the same store of `MAX_ORDERS` paid orders (256 now; 500 for a while in step 2; 4096 before) with the rest of `MAX_LISTINGS` (128; 512 before) filled, at the store's caps (`MAX_LISTINGS`, each at `MAX_LISTING_BYTES` with every field the listing form offers at its largest and the description padded to the bound); and again with 10,000 listing statuses | step 2: the worst store the listing caps allow, and a long edit history, which nothing caps (one status per listing version ever published). The harness prints the description a full-field listing has left at the bound |
+| `ExportPurchasesBackup`, every page in turn, with every kept conversation and kept purchase at its cap; then `ImportPurchasesBackup` of 16 paid purchases this node does not hold | step 2's purchases backup: a page of about 256 KiB of records, and a chunk of `BACKUP_IMPORT_ITEMS`, each purchase checked as a fresh keep is (the costly case). The harness checks the pages together hold every conversation and purchase, and that every imported item answers `Imported`; the state is put back after |
+| the seller's book (`seller_orders`, three secrets per store key: `unpaid`, `open`, `done`) at its caps: `MAX_SELLER_UNPAID_KEPT` (128) unpaid, `MAX_SELLER_UNSENT_KEPT` (512) paid and unsent, `MAX_SELLER_SENT_KEPT` (1024) sent, every request's texts at `MAX_KEPT_REQUEST_TEXT` (2 KiB); `KeepSellerOrders` of `SELLER_ORDERS_PER_CALL` (48) sent orders; `ListSellerOrders` page by page; then every unpaid order marked paid, as store notifications mark them, and a heartbeat wake-up | the book is a store key's own copy of its orders, so an order the store has rolled off is not lost. Each writer touches only its stage, so instant checkout and a store notification never decode the large ones; the tab's calls and the wake-up's `sweep` (one book per wake) are the only ones that move orders on, and decode `open` and `done` only if something has to move. The harness checks the keep answers `Ok`, the pages reach the end, and the wake-up moved orders out of `unpaid` |
 
 ## Calibration
 
@@ -282,7 +285,7 @@ feeding the full 262,144 costs at most 15% a request. Instant checkout reads
 a store in one light pass and feeds its scripts once.
 
 The calls to watch each grow with a collection: instant checkout's decide
-against a full store of 4,096 paid orders (about 85%), a wake-up moving the
+against a full store (about 50% at today's 256 paid orders; 85% at the former 4,096), a wake-up moving the
 payment counter's catch-up on (about 76%), `KeepPurchase` into a full store
 and `ListKeptPurchases (1024)` (about 74%), and the slow-plaintext mailbox
 run, its retry read and the wake-up with full watch delegations (about
@@ -292,6 +295,19 @@ budget is itself a fifth of the node's 5 s limit, taken at the slowest rate
 measured with the node's engine. Until 2026-10-02 decide was held to 70% of
 an older budget that was 30% too generous (see Calibration); that ceiling
 is gone.
+
+The step-2 calls over that guideline are the seller's book's wake-up at
+its caps (table below): moving 256 paid orders on (64.2%), and the same 256
+with the paid stage full (66.5%). They are accepted because each is the most
+one wake-up can ever do (`unpaid` holds at most 128 unpaid orders and 128
+paid ones waiting for room) and is out of reach of ordinary traffic. The
+first needs 128 orders paid between two wake-ups (5 minutes apart), more
+than a whole day of instant checkout (`auto_invoice::MAX_PER_DAY`, 100 a
+store), on top of 128 already waiting, which needs 512 paid orders not yet
+sent. The second needs the 512 too, and recurs each wake-up while they stay
+unsent. Both can come near only when this node was offline while a day's
+orders were paid, or with manual invoices on top; even then they are within
+the budget.
 
 **The next re-key (harvest#198 lane, branch `fix/delegate-rekey-batch2`)**
 moves one row: `DeriveConversationKeys` for 512 peers, store key and Ghost
@@ -357,12 +373,11 @@ delegation it reads for).
     are not marked read and are reopened on every notification.
   * `ImportMigratedSecret` of the RSA key (`harvest:rsa_pk:*`, which
     parses an RSA key; the ledger import is driven above),
-    `ExportBuyerConversation`
-    and `ImportBuyerConversation`, and the migration markers
+    `ImportBuyerConversation` (an old one-conversation backup string), and the migration markers
     (`GetMigrationMarker`, `SetMigrationMarker`, `GetPredecessorMarker`,
     `RecordPredecessorMarker`).
   * `GetRsaPublicKey`, `SetStoreArchived`, `ForgetBuyerConversation`,
-    `MarkConversationBackedUp`.
+    `MarkBackedUp`.
   * The Bitcoin delegate's `Watch`, `Unwatch`, `ListWatched`,
     `AssociateOrder`, `ConfigureBridge`, `GetBridge`, `GetPaymentXpub`.
   * `CreateListing`, which is a stub.
@@ -388,3 +403,62 @@ delegation it reads for).
   then the ones at risk.
 * **Anything but one call.** The node's limit is per call. A flow that makes
   many calls is bounded per call, not in total.
+
+**Step 2 (`feat/store-pause-one-backup`, delegate `3db9c759…` after merging
+#229)** moves these rows, one run of the harness. These figures, and every
+row above that says 4,096 paid orders, were measured at the former caps
+(4,096 orders, 512 listings); step 2 then lowered them to 256 and 128, and
+the figures are refreshed below:
+
+| call | before (`9c8b3b3e…`) | step 2 |
+|---|---:|---:|
+| instant decide against a store of 4,096 paid orders | 2,578,928,712 (86.0%) | 2,374,452,135 (79.1%) |
+| same, with 511 more listings at both caps (the former 512-listing cap; 32 KiB, every field at its largest) | (not driven) | 2,700,592,729 (90.0%) |
+| same, with 10,000 listing statuses | (not driven) | 2,485,481,223 (82.8%) |
+| `KeepPurchase`, the 1024th | 2,217,700,871 (73.9%) | 1,113,104,193 (37.1%) |
+| `ListKeptPurchases (1024)` | 2,202,396,316 (73.4%) | 1,098,972,710 (36.6%) |
+| `ExportPurchasesBackup`, a page, everything at its caps | (new) | 83,227,209 (2.8%), 18 pages |
+| `ImportPurchasesBackup`, 16 paid purchases not held | (new) | 182,442,695 (6.1%) |
+
+At the caps step 2 ships (`MAX_ORDERS` 256, `MAX_LISTINGS` 128), with the
+seller's book (three stages full: 128 unpaid and 128 paid orders waiting for
+room, 512 paid unsent at 3.9 MiB, 1024 sent at 6.7 MiB), delegate
+`e83aaf07…` (step 2, review round 3):
+
+| call | step 2 |
+|---|---:|
+| instant decide against a store of 256 paid orders | 1,462,264,798 (48.7%) |
+| same, the seller's book full | 1,540,351,916 (51.3%) |
+| same, with 127 more listings of 32 KiB (every field at its largest) | 1,543,385,549 (51.4%) |
+| same, with 10,000 listing statuses | 1,573,706,706 (52.5%) |
+| `KeepSellerOrders`, 48 sent, a full book | 1,689,370,614 (56.3%) |
+| `ListSellerOrders`, a page, a full book (each paid record sealed) | 667,094,175 (22.2%), 31 pages |
+| heartbeat wake-up moving 256 paid orders on (128 marked paid, 128 waiting for room) | 1,924,640,993 (64.2%) |
+| heartbeat wake-up with the same 256 and the paid stage full (128 wait, every one named) | 1,996,184,523 (66.5%) |
+| `ImportMigratedSecret`, a predecessor's full sent stage into a book that holds none | 894,341,833 (29.8%) |
+| same, its full paid stage after it | 1,444,903,677 (48.2%) |
+| `ImportMigratedSecret`, a full ledger into a full ledger | 704,032,904 (23.5%; 41.8% before) |
+| `KeepPurchase`, the 1024th | 1,113,917,725 (37.1%) |
+| `ListKeptPurchases (1024)` | 1,099,787,553 (36.7%) |
+| `SetPaymentXpub`, a new key, two full stores' 512 scripts (pending, then made active) | 1,220,971,781 (40.7%), 2 calls |
+
+The book's imports were 105% and 165% when first measured: a migrated
+secret's value crossed the wire as an array of integers, one item a byte.
+It is one byte string now (`MigratedSecretValue`), which is also why the
+ledger import fell, and a predecessor's book is taken as written (its
+signatures were checked when it was filed) rather than verified again.
+
+The new-key row used to take one full store's scripts; at 256 they fit in
+one call's scan (`FLOOR_SCAN_BUDGET`, 384), which would leave the pending
+slot unexercised, so it now takes as many whole stores as need two calls.
+
+The store's signed records now write their signed payload and signature as
+CBOR byte strings, which is most of why the kept purchases halve, and
+decide's light read skips each listing's and listing status's signature,
+signed payload and certificate, and reads only the statuses of listings the
+store holds. A listing status costs decide about 11K fuel, so on a store
+at today's caps (256 paid orders) decide reaches the budget at about 135,000
+status edits with few listings, and at about 128,000 with 128 listings at
+the bound (at the former caps, 4,096 paid orders and 512 listings, about
+56,000 and 27,000): a store that edits that often stops answering Buy now
+(`docs/untested-invariants.md`, step 2).

@@ -57,14 +57,8 @@ pub(crate) fn harvest_response_summary(response: &HarvestDelegateResponse) -> St
         R::BuyerConversationList { request_id, .. } => {
             ("BuyerConversationList", request(request_id))
         }
-        R::BuyerConversationExported { request_id, .. } => {
-            ("BuyerConversationExported", request(request_id))
-        }
         R::BuyerConversationImported { request_id, .. } => {
             ("BuyerConversationImported", request(request_id))
-        }
-        R::BuyerConversationMarkedBackedUp { request_id, .. } => {
-            ("BuyerConversationMarkedBackedUp", request(request_id))
         }
         R::BuyerConversationForgotten { request_id, .. } => {
             ("BuyerConversationForgotten", request(request_id))
@@ -346,7 +340,7 @@ mod tests {
     /// variants that carry secrets, for the same reason as the Bitcoin test.
     #[test]
     fn a_harvest_response_summary_prints_only_its_name_and_id() {
-        use harvest_common::{BackupString, ConversationKey, HarvestDelegateResponse as R};
+        use harvest_common::{ConversationKey, HarvestDelegateResponse as R};
         let key = [0xA7u8; 32];
         let samples = [
             (
@@ -360,15 +354,6 @@ mod tests {
                     }]),
                 },
                 "ConversationKeys (request 42, fp-one)",
-            ),
-            (
-                R::BuyerConversationExported {
-                    request_id: 42,
-                    store_contract_id: vec![3u8; 32],
-                    buyer_public_key: [1u8; 32],
-                    result: Ok(BackupString("SECRET-BACKUP".into())),
-                },
-                "BuyerConversationExported (request 42)",
             ),
             (
                 R::BuyerConversationList {

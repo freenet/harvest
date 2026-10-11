@@ -41,6 +41,15 @@ fn Progress(step: usize) -> Element {
     }
 }
 
+/// Whether an order's page offers the backup outright (step 2): it is paid,
+/// so it holds what a complaint needs.
+fn paid_offer(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Paid | Status::Sent | Status::Complete | Status::Reported
+    )
+}
+
 /// What the page knows about the purchase, worked out once per render.
 #[derive(Clone, PartialEq)]
 struct OrderFacts {
@@ -58,7 +67,7 @@ struct OrderFacts {
     complaint: ComplaintOffer,
     bitcoin: crate::state::BitcoinState,
     open_pill: &'static str,
-    /// A conversation this device keeps has no backup elsewhere.
+    /// This order, as it is now, is in no backup the buyer saved.
     backup_due: bool,
     open: bool,
     trust: Option<String>,
@@ -156,7 +165,11 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                     },
                     bitcoin: state.bitcoin.clone(),
                     open_pill: open.pill(),
-                    backup_due: super::purchases_view::backup_due(&state),
+                    backup_due: state.order_not_backed_up(
+                        &store,
+                        &purchase.order_id,
+                        &purchase.conversation,
+                    ),
                     open: open == crate::state::BuyerOpen::Open,
                     trust,
                     purchase,
@@ -422,9 +435,26 @@ fn StoreOrder(store: Vec<u8>, order: OrderId) -> Element {
                             }
                         }
                     }
-                    // The order lives on this device only: the backup is
-                    // offered once there is something worth keeping.
-                    if facts.backup_due && !matches!(facts.status, Status::Expired | Status::Cancelled) {
+                    // The order lives on this device only. Once paid it is
+                    // worth keeping, and the backup is offered outright, once
+                    // per purchase: the offer goes when a saved backup holds
+                    // this order as it is now (step 2). Before that, a quiet
+                    // line.
+                    if facts.backup_due && paid_offer(facts.status) {
+                        div { class: "coin-note",
+                            p {
+                                "Paid. This order is saved on this device only. Save a backup so "
+                                "you can still see it, and report a problem, if you lose this device."
+                            }
+                            button {
+                                class: "btn btn-sm btn-primary",
+                                onclick: move |_| go(Page::Backup),
+                                "Save a backup"
+                            }
+                        }
+                    } else if facts.backup_due
+                        && !matches!(facts.status, Status::Expired | Status::Cancelled)
+                    {
                         p { class: "text-muted small",
                             "This order is kept on this device only. "
                             button { class: "link-btn", onclick: move |_| go(Page::Backup), "Save a backup" }

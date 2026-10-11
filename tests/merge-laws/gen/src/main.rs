@@ -1785,6 +1785,18 @@ fn main() {
     if want("presence") {
         gen_presence(&root);
     }
+    if want("paidcap") {
+        gen_paidcap(&root);
+    }
+    if want("listcap") {
+        gen_listcap(&root);
+    }
+    if want("pause") {
+        gen_pause(&root);
+    }
+    if want("statuscap") {
+        gen_statuscap(&root);
+    }
 }
 
 use harvest_common::listing::{AuthorizedListingStatus, ListingAvailability, ListingStatus};
@@ -2318,13 +2330,12 @@ fn gen_rr(root: &Path) {
     }
     c.finish();
 
-    // Q3: migration fold, modelled exactly as freenet-migrate 0.6 FoldAll +
-    // harvest StoreOps: acc = newest real predecessor, merge_generations(acc,
-    // older) = acc.merge(acc, older) + normalize, then merge_with_local(folded,
-    // Default) and PUT under the current contract.
-    let fold = |mut base: StoreStateV1, other: &StoreStateV1| {
-        let snap = base.clone();
-        match base.merge(&snap, &fx.params, other) { Ok(()) => { base.listings.normalize(); base }, Err(e) => { println!("  fold refused: {e}"); snap } }
+    // Q3: migration fold, modelled as freenet-migrate 0.6 FoldAll + harvest
+    // StoreOps: acc = newest real predecessor, merge_generations(acc, older),
+    // then merge_with_local(folded, Default) and PUT under the current
+    // contract. Both are `fold_store` (see there for what it models).
+    let fold = |base: StoreStateV1, other: &StoreStateV1| {
+        fold_store(&fx.params, &fx.seller.verifying_key(), base, other)
     };
     let pred_junk_listing = { let mut s = l1.clone(); s.info = junk_a.info.clone(); s };
     let cases: [(&str, Vec<&StoreStateV1>); 4] = [
@@ -2841,6 +2852,7 @@ impl BackingFx {
             copies: (!copies.is_empty()).then_some(copies),
             fulfilment: None,
             listing_statuses: None,
+            pause: None,
         };
         s.apply_delta(&StoreStateV1::default(), &self.fx.params, &Some(delta))
             .unwrap();
@@ -3067,6 +3079,10 @@ fn native_laws_total(name: &str, params: &StoreParameters, all: &[(&str, StoreSt
         }
     }
     println!("{name} native: {} states, {n} triples; comm {comm} assoc {assoc} idem {idem} merge-errors {errs}", all.len());
+    assert!(
+        comm + assoc + idem + errs == 0,
+        "{name}: the native merge laws do not hold on this corpus"
+    );
 }
 
 fn gen_review98(root: &Path) {
@@ -3293,6 +3309,7 @@ fn gen_retire98(root: &Path) {
         copies: None,
         fulfilment: None,
         listing_statuses: None,
+        pause: None,
     };
     let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
         ("ret1", d(vec![], vec![r1.clone()], vec![], true)),
@@ -3367,4 +3384,891 @@ fn gen_retire98(root: &Path) {
     let named: Vec<(&str, StoreStateV1)> = all.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
     native_laws_total("retire98", p, &named);
     c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 (review round 2): the store rules no corpus exercised.
+//   store-paidcap  `as_kept`: a Paid record stays paid only on the canonical
+//                  minimal proof (`verify_minimal_proof`) within
+//                  MAX_ORDER_BYTES, and is otherwise kept as its unpaid
+//                  terms. Deltas carry the RAW records (honest minimal,
+//                  padded, minimal-but-over-8-KiB, unpaid, cancelled); states
+//                  carry what the store keeps, since a state holding a padded
+//                  Paid does not verify. A MAX_ORDERS state whose boundary
+//                  orders arrived padded, so the cap and the rule meet. Plus
+//                  the migration fold's result over a recovered BASE past
+//                  MAX_ORDERS (`fold_store`).
+//   store-listcap  MAX_LISTINGS newest by (created_at, id), with a created_at
+//                  tie straddling the cut, and MAX_LISTING_BYTES either side.
+//   store-pause    PauseV1: one store-key-signed slot, the higher revision,
+//                  then the smaller encoding; equal revisions saying opposite
+//                  things.
+//   store-statuscap  MAX_LISTING_STATUSES newest by (revision, listing id):
+//                  unions past the bound, a revision tie straddling the cut,
+//                  old slots raised to the top by a later status (a merge
+//                  can raise a slot's rank, unlike the order cap's), and one
+//                  raised exactly onto the cut, where equal revisions are
+//                  broken by listing id.
+// ---------------------------------------------------------------------------
+
+use ed25519_dalek::VerifyingKey;
+use freenet_bitcoin_common::spv::testing::{build_tx, mine, sha256d_pub, EASIEST_BITS};
+use freenet_bitcoin_common::spv::SpvProof;
+use freenet_bitcoin_common::Txid;
+use harvest_common::payment::verify_minimal_proof;
+use harvest_common::store::{
+    as_kept, within_order_cap, StoreStateV1Summary, MAX_LISTINGS, MAX_LISTING_BYTES,
+    MAX_ORDER_BYTES,
+};
+use harvest_common::store_pause::{AuthorizedStorePause, StorePause};
+
+/// The store migration fold, as `ui/src/migrate.rs`'s
+/// `merge_store_reporting_discard` does it, for both of its callers:
+/// `merge_generations(newer, older)` and `merge_with_local(recovered,
+/// &local)`. The first argument is the BASE: in `merge_with_local` that is the
+/// RECOVERED predecessor state, which nothing in this generation verified.
+///
+/// Name a whole-key generation's owner on both sides
+/// (`name_whole_key_owner`), hold each side's listings, orders and listing
+/// statuses to this generation's rules before the merge (so a padded `Paid` on one side
+/// cannot outrank the other side's cancellation inside it: review round 3
+/// of step 2), merge (a refused merge keeps the base as it was), then
+/// `normalize_carried` and the version-0 info reset, which run on the
+/// kept base either way. This modelled `normalize_carried` as
+/// `listings.normalize()` alone until step 2's review round 2, which missed
+/// the order rule and both caps.
+fn fold_store(
+    params: &StoreParameters,
+    seller: &VerifyingKey,
+    base: StoreStateV1,
+    other: &StoreStateV1,
+) -> StoreStateV1 {
+    let name = |mut s: StoreStateV1| {
+        if s.owner.is_none() && s.holds_signed_content() {
+            s.owner = Some(*seller);
+        }
+        s
+    };
+    let mut base = name(base);
+    base.listings.normalize();
+    base.orders.normalize();
+    base.listing_statuses.normalize();
+    let mut other = name(other.clone());
+    other.listings.normalize();
+    other.orders.normalize();
+    other.listing_statuses.normalize();
+    let snap = base.clone();
+    if let Err(e) = base.merge(&snap, params, &other) {
+        println!("  fold refused: {e}");
+        base = snap;
+    }
+    base.normalize_carried();
+    if base.info.info.version == 0 {
+        base.info = Default::default();
+    }
+    base
+}
+
+/// Whether the store keeps `r` as paid: the private `paid_minimally`, from
+/// its public halves.
+fn kept_paid(r: &AuthorizedOrder) -> bool {
+    r.status == OrderStatus::Paid
+        && within_order_cap(r)
+        && r.payment_proof
+            .as_ref()
+            .is_some_and(|proof| verify_minimal_proof(&r.order, proof).is_ok())
+}
+
+impl StoreFx {
+    /// A seller-signed `Paid` record on `proof`, which must verify.
+    fn paid_on(&self, order: &Order, proof: OrderPaymentProof) -> AuthorizedOrder {
+        let (scoped_payload, signature) = sign_scoped(&self.seller, order);
+        let rec = AuthorizedOrder {
+            order: order.clone(),
+            scoped_payload,
+            signature,
+            status: OrderStatus::Paid,
+            payment_proof: Some(proof),
+            status_scoped_payload: None,
+            status_signature: None,
+        };
+        rec.verify(&self.seller.verifying_key())
+            .unwrap_or_else(|e| panic!("fixture Paid record does not verify: {e}"));
+        rec
+    }
+
+    /// The genuine payment of `paid_proof(order, seed)` plus `pads` bridge
+    /// `ScannedTo` claims, which name no outpoint and change no verdict: a
+    /// proof that verifies but is not the minimal one.
+    fn padded_paid(&self, order: &Order, seed: u8, pads: u32) -> AuthorizedOrder {
+        let OrderPaymentProof::OnChain(p) = self.paid_proof(order, seed) else {
+            unreachable!("paid_proof is on-chain")
+        };
+        let mut claims = p.claims;
+        for height in 1..=pads {
+            claims.push(
+                SignedClaim::sign(
+                    &self.bridge,
+                    &ClaimBody {
+                        script_id: order.bitcoin_params().script_id(),
+                        network: order.network,
+                        as_of: BlockAnchor { height, hash: BlockHash([height as u8; 32]) },
+                        claim: Claim::ScannedTo,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        self.paid_on(order, OrderPaymentProof::on_chain(claims, p.tip))
+    }
+
+    /// The minimal `Paid` record whose one claim carries `raw_tx` (a block of
+    /// that one transaction), as `common`'s `make_big_payment_proof` builds it.
+    fn paid_on_tx(&self, order: &Order, raw_tx: Vec<u8>) -> AuthorizedOrder {
+        let txid = Txid(sha256d_pub(&raw_tx));
+        let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+        let anchor = BlockAnchor { height: 100, hash: BlockHash(sha256d_pub(&header.0)) };
+        let claim = SignedClaim::sign(
+            &self.bridge,
+            &ClaimBody {
+                script_id: order.bitcoin_params().script_id(),
+                network: order.network,
+                as_of: anchor,
+                claim: Claim::ConfirmedOutput {
+                    outpoint: OutPoint { txid, vout: 0 },
+                    value_sats: order.amount_sats,
+                    anchor,
+                    spv: SpvProof {
+                        raw_tx,
+                        merkle_branch: Vec::new(),
+                        tx_index: 0,
+                        header,
+                        following_headers: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        self.paid_on(order, OrderPaymentProof::on_chain(vec![claim], self.tip(order, 100)))
+    }
+
+    /// The two minimal `Paid` records either side of MAX_ORDER_BYTES,
+    /// as close to it as one output's script length allows: the largest
+    /// that fits, and the smallest that does not. Both pay the order once,
+    /// in a transaction padded with filler outputs, as an honest batched
+    /// payment would be.
+    fn paid_either_side_of_cap(&self, order: &Order) -> (AuthorizedOrder, AuthorizedOrder) {
+        let pay = (order.amount_sats, order.payment_script_pubkey.clone());
+        let rec = |full: usize, part: Option<usize>| {
+            let mut outs = vec![pay.clone()];
+            outs.extend((0..full).map(|_| (546u64, vec![0x6a; 250])));
+            if let Some(l) = part {
+                outs.push((546, vec![0x6a; l]));
+            }
+            self.paid_on_tx(order, build_tx(&outs))
+        };
+        let size = |r: &AuthorizedOrder| cbor(r).len();
+        let mut full = 0;
+        while size(&rec(full + 1, None)) <= MAX_ORDER_BYTES {
+            full += 1;
+        }
+        let mut under = rec(full, None);
+        let mut over = rec(full + 1, None);
+        for l in 0..250 {
+            let r = rec(full, Some(l));
+            if size(&r) <= MAX_ORDER_BYTES {
+                under = r;
+            } else {
+                over = r;
+                break;
+            }
+        }
+        assert!(size(&under) <= MAX_ORDER_BYTES && size(&over) > MAX_ORDER_BYTES);
+        (under, over)
+    }
+
+    /// A listing without photos, created at `created`, whose description is
+    /// `desc_len` bytes (or a short text when 0).
+    fn listing_at(&self, tag: &str, created: i64, desc_len: usize) -> AuthorizedListing {
+        let listing = Listing {
+            images: Vec::new(),
+            checkout: None,
+            choices: Vec::new(),
+            id: ListingId([0u8; 32]),
+            title: format!("Item {tag}"),
+            description: if desc_len == 0 { format!("Listing {tag}") } else { "x".repeat(desc_len) },
+            kind: ListingKind::Sale,
+            price: Some(PriceInfo { amount: "0.001".into(), currency: "BTC".into() }),
+            created_at: ts(created),
+        }
+        .with_derived_id();
+        let (scoped_payload, signature) = sign_scoped(&self.seller, &listing);
+        AuthorizedListing {
+            listing,
+            scoped_payload,
+            signature,
+            certificate_pem: "-----BEGIN THROWAWAY CERT-----".into(),
+        }
+    }
+}
+
+/// Write `named` states, the pairwise merges in `pairs` as states and
+/// transitions, the computed delta between each pair, and every hand-built
+/// delta in `deltas` applied to each of `bases` (a refused one is reported,
+/// not stepped). Results not already held by bytes become states too, so the
+/// state laws meet them.
+#[allow(clippy::too_many_arguments)]
+fn write_step2_corpus(
+    root: &Path,
+    corpus: &str,
+    fx: &StoreFx,
+    named: Vec<(String, StoreStateV1)>,
+    pairs: &[(&str, &str)],
+    bases: &[&str],
+    deltas: &[(&str, StoreStateV1Delta)],
+    native: &[&str],
+) {
+    let p = &fx.params;
+    let mut c = Corpus::new(root, corpus, &cbor(p));
+    let mut all = named;
+    let find = |all: &Vec<(String, StoreStateV1)>, n: &str| {
+        all.iter().find(|(m, _)| m == n).unwrap_or_else(|| panic!("no state {n}")).1.clone()
+    };
+    let name_of = |all: &mut Vec<(String, StoreStateV1)>, s: StoreStateV1, fresh: String| -> String {
+        let b = cbor(&s);
+        if let Some((n, _)) = all.iter().find(|(_, t)| cbor(t) == b) {
+            return n.clone();
+        }
+        all.push((fresh.clone(), s));
+        fresh
+    };
+    let mut transitions = vec![];
+    let mut steps: Vec<(StoreStateV1, StoreStateV1Summary, StoreStateV1Delta, StoreStateV1)> = vec![];
+    for (a, b) in pairs {
+        let base = find(&all, a);
+        let tgt = find(&all, b);
+        let r = fx.merged(&base, &tgt);
+        let rn = name_of(&mut all, r, format!("m_{a}__{b}"));
+        if rn != *a {
+            transitions.push((a.to_string(), rn));
+        }
+        let summ = base.summarize(&base, p);
+        if let Some(d) = tgt.delta(&tgt, p, &summ) {
+            let mut r = base.clone();
+            r.apply_delta(&base.clone(), p, &Some(d.clone())).expect("a computed delta applies");
+            fx.check(&r);
+            steps.push((base.clone(), summ, d, r));
+        }
+    }
+    let mut refused = vec![];
+    for bn in bases {
+        let base = find(&all, bn);
+        let summ = base.summarize(&base, p);
+        for (dn, d) in deltas {
+            let mut r = base.clone();
+            match r.apply_delta(&base.clone(), p, &Some(d.clone())) {
+                Ok(()) => {
+                    fx.check(&r);
+                    name_of(&mut all, r.clone(), format!("d_{bn}__{dn}"));
+                    steps.push((base.clone(), summ.clone(), d.clone(), r));
+                }
+                Err(e) => refused.push(format!("{bn}+{dn}: {e}")),
+            }
+        }
+    }
+    for (n, s) in &all {
+        c.state(n, &cbor(s));
+    }
+    for (a, r) in &transitions {
+        c.transition(a, r);
+    }
+    for (b, s, d, r) in &steps {
+        c.delta_step(&cbor(b), &cbor(s), &cbor(d), &cbor(r));
+    }
+    if !refused.is_empty() {
+        println!("{corpus}: refused hand-built deltas (not stepped): {refused:?}");
+    }
+    let natives: Vec<(&str, StoreStateV1)> =
+        native.iter().map(|n| (*n, find(&all, n))).collect();
+    native_laws_total(corpus, p, &natives);
+    c.finish();
+}
+
+fn gen_paidcap(root: &Path) {
+    use std::collections::BTreeMap;
+    let fx = StoreFx::new();
+    let p = &fx.params;
+    let seller = fx.seller.verifying_key();
+    let owner = Some(seller);
+    let o: Vec<Order> = (0..4)
+        .map(|i| fx.order(&format!("paidcap-{i}"), 1_750_000_000 + i as i64 * 3600))
+        .collect();
+    let aw = |x: &Order| fx.authorized(x, OrderStatus::AwaitingPayment, 0);
+    let cx = |x: &Order| fx.authorized(x, OrderStatus::Cancelled, 0);
+    let honest = |x: &Order, seed: u8| fx.authorized(x, OrderStatus::Paid, seed);
+    let pad = |x: &Order, pads: u32| fx.padded_paid(x, 1, pads);
+    let sides: Vec<(AuthorizedOrder, AuthorizedOrder)> =
+        o.iter().map(|x| fx.paid_either_side_of_cap(x)).collect();
+    let under = |i: usize| sides[i].0.clone();
+    let over = |i: usize| sides[i].1.clone();
+
+    // The item rule natively, on every variant, each rule isolated: padding
+    // stays within the byte bound (only minimality decides it), and the
+    // over-bound record is minimal (only the byte bound decides it).
+    for (i, x) in o.iter().enumerate() {
+        let variants = [
+            ("honestA", honest(x, 1), true),
+            ("honestB", honest(x, 2), true),
+            ("pad4", pad(x, 4), false),
+            ("pad8", pad(x, 8), false),
+            ("under", under(i), true),
+            ("over", over(i), false),
+        ];
+        for (n, r, kept) in variants {
+            let minimal = verify_minimal_proof(&r.order, r.payment_proof.as_ref().unwrap()).is_ok();
+            let within = within_order_cap(&r);
+            if i == 0 {
+                println!("paidcap: {n}: {} bytes, minimal {minimal}, within {within}", cbor(&r).len());
+            }
+            assert_eq!(kept_paid(&r), kept, "{n} kept as paid?");
+            assert!(n.starts_with("pad") != minimal, "{n}: only padding is non-minimal");
+            assert!(n == "over" || within, "{n}: only `over` is past the byte bound");
+            let k = as_kept(r.clone());
+            if kept {
+                assert_eq!(k, r, "{n} kept as it is");
+            } else {
+                assert_eq!(k, aw(x), "{n} kept as its unpaid terms");
+            }
+        }
+    }
+
+    // A full cap whose four oldest orders -- the first any newer order cuts --
+    // arrived as an honest Paid, a padded Paid, a minimal Paid over the byte
+    // bound and one just under it.
+    let bulk: Vec<Order> = (0..MAX_ORDERS)
+        .map(|i| fx.order(&format!("paidcap-bulk-{i}"), 1_700_000_000 + i as i64 * 60))
+        .collect();
+    let bsides: Vec<(AuthorizedOrder, AuthorizedOrder)> =
+        bulk[..4].iter().map(|x| fx.paid_either_side_of_cap(x)).collect();
+    let rest: Vec<AuthorizedOrder> = bulk[4..].iter().map(aw).collect();
+    let full = |bnd: Vec<AuthorizedOrder>| {
+        let mut v = bnd;
+        v.extend(rest.iter().cloned());
+        let s = fx.build(None, vec![], v);
+        assert_eq!(s.orders.orders.len(), MAX_ORDERS);
+        s
+    };
+    let full_pad = full(vec![
+        honest(&bulk[0], 1),
+        pad(&bulk[1], 8),
+        bsides[2].1.clone(),
+        bsides[3].0.clone(),
+    ]);
+    let full_hon = full(vec![
+        honest(&bulk[0], 2),
+        honest(&bulk[1], 1),
+        bsides[2].0.clone(),
+        cx(&bulk[3]),
+    ]);
+    let kept_status = |s: &StoreStateV1, x: &Order| s.orders.orders.get(&x.id).map(|r| r.status);
+    assert_eq!(kept_status(&full_pad, &bulk[1]), Some(OrderStatus::AwaitingPayment));
+    assert_eq!(kept_status(&full_pad, &bulk[2]), Some(OrderStatus::AwaitingPayment));
+    assert_eq!(kept_status(&full_pad, &bulk[3]), Some(OrderStatus::Paid));
+
+    let from_raw = fx.build(None, vec![], vec![pad(&o[0], 4), over(1)]);
+    assert_eq!(
+        cbor(&from_raw),
+        cbor(&fx.build(None, vec![], vec![aw(&o[0]), aw(&o[1])])),
+        "a state built from a padded and an over-bound Paid is their unpaid terms"
+    );
+
+    let mut named: Vec<(String, StoreStateV1)> = vec![
+        ("default".into(), StoreStateV1::default()),
+        ("aw0123".into(), fx.build(None, vec![], o.iter().map(aw).collect())),
+        ("from_raw_pad0_over1".into(), from_raw),
+        ("paidA0_paidB1_aw2".into(), fx.build(None, vec![], vec![honest(&o[0], 1), honest(&o[1], 2), aw(&o[2])])),
+        ("paidB0_under1".into(), fx.build(None, vec![], vec![honest(&o[0], 2), under(1)])),
+        ("under1_cx2_aw3".into(), fx.build(None, vec![], vec![under(1), cx(&o[2]), aw(&o[3])])),
+        ("cx2_paidA3".into(), fx.build(None, vec![], vec![cx(&o[2]), honest(&o[3], 1)])),
+        ("full_pad".into(), full_pad.clone()),
+        ("full_hon".into(), full_hon.clone()),
+        (
+            "bnd_raw".into(),
+            fx.build(None, vec![], vec![pad(&bulk[0], 4), honest(&bulk[1], 2), bsides[2].1.clone(), bsides[3].0.clone()]),
+        ),
+    ];
+
+    // The migration fold over a recovered BASE past MAX_ORDERS (the driver
+    // calls `merge_with_local(recovered, &local)`): a whole-key predecessor
+    // naming no owner, holding 300 orders as an earlier generation kept them
+    // -- padded and over-bound Paid records among them, at both ends of the
+    // cap -- and 130 listings out of order.
+    let pred_order = |i: usize| fx.order(&format!("paidcap-pred-{i}"), 1_690_000_000 + i as i64 * 60);
+    let mut pred_orders: BTreeMap<OrderId, AuthorizedOrder> = BTreeMap::new();
+    let (p296, p297) = (pred_order(296), pred_order(297));
+    let (p296_under, _) = fx.paid_either_side_of_cap(&p296);
+    for i in 0..300 {
+        let x = pred_order(i);
+        let r = match i {
+            0 | 299 => pad(&x, 8),
+            1 | 298 => fx.paid_either_side_of_cap(&x).1,
+            2 => honest(&x, 1),
+            296 | 297 => pad(&x, 1),
+            _ => aw(&x),
+        };
+        pred_orders.insert(x.id.clone(), r);
+    }
+    let mut pred_listings: Vec<AuthorizedListing> =
+        (0..130).map(|i| fx.listing_at(&format!("pred-{i}"), 1_690_000_000 + i as i64, 0)).collect();
+    pred_listings.sort_by(|a, b| b.listing.id.cmp(&a.listing.id));
+    let pred = StoreStateV1 {
+        owner: None,
+        listings: ListingsV1 { listings: pred_listings },
+        orders: OrdersV1 { orders: pred_orders },
+        ..Default::default()
+    };
+    assert!(pred.verify(&pred, p).is_err(), "the recovered state is not one this generation keeps");
+    let newest = fx.order("paidcap-local-newest", 1_800_000_000);
+    let locals: [(&str, StoreStateV1); 3] = [
+        ("local_default", StoreStateV1::default()),
+        ("local_info", fx.build(Some(fx.info(1, "Throwaway Farm")), vec![], vec![])),
+        ("local_orders", fx.build(None, vec![], vec![cx(&p297), p296_under.clone(), aw(&newest)])),
+    ];
+    // What the fold modelled before this round: merge, then the listings only.
+    let old_fold = |base: StoreStateV1, other: &StoreStateV1| {
+        let mut base = base;
+        base.owner = Some(seller);
+        let snap = base.clone();
+        let mut other = other.clone();
+        if other.owner.is_none() && other.holds_signed_content() {
+            other.owner = Some(seller);
+        }
+        match base.merge(&snap, p, &other) {
+            Ok(()) => {
+                base.listings.normalize();
+                base
+            }
+            Err(_) => snap,
+        }
+    };
+    for (ln, local) in &locals {
+        let folded = fold_store(p, &seller, pred.clone(), local);
+        folded
+            .verify(&folded, p)
+            .unwrap_or_else(|e| panic!("fold over {ln}: the forward state does not verify: {e}"));
+        assert_eq!(folded.orders.orders.len(), MAX_ORDERS);
+        assert_eq!(folded.listings.listings.len(), MAX_LISTINGS);
+        let old = old_fold(pred.clone(), local);
+        // The same fold with the recovered base normalized FIRST: what the
+        // fold would give if `as_kept` ran before `merge_order`'s maximum, as
+        // it does for every record a contract receives.
+        let mut pre = pred.clone();
+        pre.owner = Some(seller);
+        pre.normalize_carried();
+        let first = fold_store(p, &seller, pre, local);
+        assert_eq!(
+            cbor(&folded),
+            cbor(&first),
+            "paidcap fold over {ln}: the fold must agree with normalising first"
+        );
+        println!(
+            "paidcap fold over {ln}: forward verify ok; pre-round-2 model verify: {:?}; \
+             normalize-first agrees: {} [p296 {:?} vs {:?}; p297 {:?} vs {:?}]",
+            old.verify(&old, p).err().map(|e| e.chars().take(90).collect::<String>()),
+            cbor(&folded) == cbor(&first),
+            kept_status(&folded, &p296),
+            kept_status(&first, &p296),
+            kept_status(&folded, &p297),
+            kept_status(&first, &p297),
+        );
+        named.push((format!("fold_recovered_over_cap__{ln}"), folded));
+        if *ln != "local_default" {
+            named.push((ln.to_string(), local.clone()));
+        }
+    }
+
+    let od = |recs: Vec<AuthorizedOrder>| StoreStateV1Delta {
+        owner,
+        orders: Some(recs),
+        ..Default::default()
+    };
+    let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
+        ("pad4_0", od(vec![pad(&o[0], 4)])),
+        ("pad8_0", od(vec![pad(&o[0], 8)])),
+        ("honA_0", od(vec![honest(&o[0], 1)])),
+        ("honB_0", od(vec![honest(&o[0], 2)])),
+        ("pad_then_hon_0", od(vec![pad(&o[0], 8), honest(&o[0], 1)])),
+        ("hon_then_pad_0", od(vec![honest(&o[0], 1), pad(&o[0], 8)])),
+        ("over_1", od(vec![over(1)])),
+        ("under_1", od(vec![under(1)])),
+        ("over_then_under_1", od(vec![over(1), under(1)])),
+        ("cx_2", od(vec![cx(&o[2])])),
+        ("pad_2", od(vec![pad(&o[2], 4)])),
+        ("mix_0123", od(vec![pad(&o[0], 8), over(1), honest(&o[2], 1), under(3)])),
+        ("bnd_pad_1", od(vec![pad(&bulk[1], 4)])),
+        ("bnd_hon_1", od(vec![honest(&bulk[1], 2)])),
+        ("bnd_over_3", od(vec![bsides[3].1.clone()])),
+        ("bnd_under_2", od(vec![bsides[2].0.clone()])),
+    ];
+    let pairs = [
+        ("aw0123", "paidA0_paidB1_aw2"),
+        ("paidA0_paidB1_aw2", "aw0123"),
+        ("paidB0_under1", "paidA0_paidB1_aw2"),
+        ("paidA0_paidB1_aw2", "paidB0_under1"),
+        ("under1_cx2_aw3", "cx2_paidA3"),
+        ("from_raw_pad0_over1", "paidB0_under1"),
+        ("full_pad", "aw0123"),
+        ("aw0123", "full_pad"),
+        ("full_pad", "full_hon"),
+        ("full_hon", "full_pad"),
+        ("full_pad", "bnd_raw"),
+        ("bnd_raw", "full_hon"),
+        ("default", "full_pad"),
+        ("full_hon", "local_orders"),
+        ("fold_recovered_over_cap__local_orders", "local_orders"),
+        ("fold_recovered_over_cap__local_default", "full_pad"),
+    ];
+    let bases = [
+        "default",
+        "aw0123",
+        "paidA0_paidB1_aw2",
+        "under1_cx2_aw3",
+        "full_pad",
+        "full_hon",
+        "bnd_raw",
+    ];
+    let native = [
+        "default",
+        "aw0123",
+        "from_raw_pad0_over1",
+        "paidA0_paidB1_aw2",
+        "paidB0_under1",
+        "under1_cx2_aw3",
+        "cx2_paidA3",
+        "full_pad",
+        "full_hon",
+        "bnd_raw",
+    ];
+    let named_owned = std::mem::take(&mut named);
+    write_step2_corpus(root, "store-paidcap", &fx, named_owned, &pairs, &bases, &deltas, &native);
+}
+
+fn gen_listcap(root: &Path) {
+    let fx = StoreFx::new();
+    let owner = Some(fx.seller.verifying_key());
+    let t_tie = 1_760_000_000i64;
+    let newest: Vec<AuthorizedListing> =
+        (0..100).map(|i| fx.listing_at(&format!("new-{i}"), t_tie + 60 + i as i64, 0)).collect();
+    // Forty listings created in the same second, sorted by id: a full union
+    // keeps the 28 smallest ids and cuts the other 12, so the cut runs
+    // through the tie.
+    let mut tie: Vec<AuthorizedListing> =
+        (0..40).map(|i| fx.listing_at(&format!("tie-{i}"), t_tie, 0)).collect();
+    tie.sort_by(|a, b| a.listing.id.cmp(&b.listing.id));
+    let keep_tie = MAX_LISTINGS - newest.len();
+    assert_eq!(keep_tie, 28);
+    let old: Vec<AuthorizedListing> =
+        (0..8).map(|i| fx.listing_at(&format!("old-{i}"), t_tie - 3600 + i as i64, 0)).collect();
+    let newer = fx.listing_at("newer", t_tie + 100_000, 0);
+
+    // One listing either side of MAX_LISTING_BYTES.
+    let size = |n: usize, tag: &str| cbor(&fx.listing_at(tag, t_tie + 50, n)).len();
+    let (mut lo, mut hi) = (0usize, 40_000usize);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if size(mid, "big-under") <= MAX_LISTING_BYTES { lo = mid } else { hi = mid }
+    }
+    let big_under = fx.listing_at("big-under", t_tie + 50, lo);
+    let (mut lo2, mut hi2) = (0usize, 40_000usize);
+    while lo2 + 1 < hi2 {
+        let mid = (lo2 + hi2) / 2;
+        if size(mid, "big-over") <= MAX_LISTING_BYTES { lo2 = mid } else { hi2 = mid }
+    }
+    let big_over = fx.listing_at("big-over", t_tie + 50, hi2);
+    println!(
+        "listcap: big_under {} bytes, big_over {} bytes (bound {MAX_LISTING_BYTES})",
+        cbor(&big_under).len(),
+        cbor(&big_over).len()
+    );
+    assert!(cbor(&big_under).len() <= MAX_LISTING_BYTES && cbor(&big_over).len() > MAX_LISTING_BYTES);
+
+    let build = |ls: Vec<AuthorizedListing>| {
+        let n = ls.len();
+        let s = fx.build(None, ls, vec![]);
+        assert_eq!(s.listings.listings.len(), n.min(MAX_LISTINGS));
+        s
+    };
+    let cat = |parts: &[&[AuthorizedListing]]| parts.iter().flat_map(|p| p.iter().cloned()).collect::<Vec<_>>();
+    let a = build(cat(&[&newest, &tie[12..]]));
+    let d_full = build(cat(&[&newest[..90], &tie[2..]]));
+    assert_eq!(a.listings.listings.len(), MAX_LISTINGS);
+    assert_eq!(d_full.listings.listings.len(), MAX_LISTINGS);
+    let b = build(cat(&[&tie, &old]));
+    let union = fx.merged(&a, &b);
+    let ids = |s: &StoreStateV1| s.listings.listings.iter().map(|l| l.listing.id.clone()).collect::<std::collections::BTreeSet<_>>();
+    let want: std::collections::BTreeSet<ListingId> =
+        cat(&[&newest, &tie[..keep_tie]]).into_iter().map(|l| l.listing.id).collect();
+    assert_eq!(ids(&union), want, "the union keeps the newest and the smallest ids of the tie");
+    assert_eq!(ids(&union), ids(&fx.merged(&b, &a)));
+    // Built from an over-bound listing beside others: it is dropped.
+    let with_over = fx.build(None, cat(&[&newest[..3], std::slice::from_ref(&big_over)]), vec![]);
+    assert_eq!(with_over.listings.listings.len(), 3);
+
+    let named: Vec<(String, StoreStateV1)> = vec![
+        ("default".into(), StoreStateV1::default()),
+        ("A_new100_tie28hi".into(), a),
+        ("B_tie40_old8".into(), b),
+        ("C_tie20lo_old8_new10".into(), build(cat(&[&tie[..20], &old, &newest[..10]]))),
+        ("D_new90_tie38".into(), d_full),
+        ("N_new100".into(), build(newest.clone())),
+        ("big_under_new3".into(), build(cat(&[&newest[..3], std::slice::from_ref(&big_under)]))),
+        ("built_with_over_new3".into(), with_over),
+    ];
+    let ld = |ls: Vec<AuthorizedListing>| StoreStateV1Delta {
+        owner,
+        listings: Some(ls),
+        ..Default::default()
+    };
+    let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
+        ("over32k", ld(vec![big_over.clone()])),
+        ("under32k", ld(vec![big_under.clone()])),
+        ("over32k_tie0", ld(vec![big_over.clone(), tie[0].clone()])),
+        ("tie0", ld(vec![tie[0].clone()])),
+        ("tie1", ld(vec![tie[1].clone()])),
+        ("tie27", ld(vec![tie[27].clone()])),
+        ("tie28", ld(vec![tie[28].clone()])),
+        ("tie39", ld(vec![tie[39].clone()])),
+        ("old0", ld(vec![old[0].clone()])),
+        ("newer", ld(vec![newer.clone()])),
+        ("newer_tie0_old0", ld(vec![newer.clone(), tie[0].clone(), old[0].clone()])),
+    ];
+    let pairs = [
+        ("A_new100_tie28hi", "B_tie40_old8"),
+        ("B_tie40_old8", "A_new100_tie28hi"),
+        ("A_new100_tie28hi", "D_new90_tie38"),
+        ("D_new90_tie38", "A_new100_tie28hi"),
+        ("C_tie20lo_old8_new10", "A_new100_tie28hi"),
+        ("A_new100_tie28hi", "C_tie20lo_old8_new10"),
+        ("B_tie40_old8", "D_new90_tie38"),
+        ("N_new100", "B_tie40_old8"),
+        ("big_under_new3", "A_new100_tie28hi"),
+        ("A_new100_tie28hi", "big_under_new3"),
+        ("default", "A_new100_tie28hi"),
+    ];
+    let bases = ["default", "A_new100_tie28hi", "B_tie40_old8", "D_new90_tie38", "N_new100", "big_under_new3"];
+    let native = [
+        "default",
+        "A_new100_tie28hi",
+        "B_tie40_old8",
+        "C_tie20lo_old8_new10",
+        "D_new90_tie38",
+        "N_new100",
+        "big_under_new3",
+    ];
+    write_step2_corpus(root, "store-listcap", &fx, named, &pairs, &bases, &deltas, &native);
+}
+
+fn gen_statuscap(root: &Path) {
+    use harvest_common::store::MAX_LISTING_STATUSES;
+    let bx = BackingFx::new();
+    let owner = Some(bx.store.verifying_key());
+    let st = |n: u32, revision: u64| {
+        let status = ListingStatus {
+            listing: ListingId(*blake3::hash(format!("statuscap/{n}").as_bytes()).as_bytes()),
+            revision,
+            availability: ListingAvailability::SoldOut,
+        };
+        let (scoped_payload, signature) = sign_scoped(&bx.store, &status);
+        AuthorizedListingStatus {
+            status,
+            scoped_payload,
+            signature,
+        }
+    };
+    let cap = MAX_LISTING_STATUSES as u32;
+    let range = |from: u32, to: u32, revision: &dyn Fn(u32) -> u64| {
+        (from..to).map(|n| st(n, revision(n))).collect::<Vec<_>>()
+    };
+    let by_n = |n: u32| 100 + u64::from(n);
+    let build = |ss: Vec<AuthorizedListingStatus>| {
+        let s = bx.build_s(vec![], ss, vec![]);
+        assert!(s.listing_statuses.records.len() <= MAX_LISTING_STATUSES);
+        s
+    };
+    // A full side, a full side overlapping it (their union is past the
+    // bound), old slots raised to the top, and a tie at A's 41st-oldest
+    // revision that a union with A cuts through.
+    let a = build(range(0, cap, &by_n));
+    let b = build(range(cap - 324, cap + 188, &by_n));
+    let raised = build(range(0, 64, &|_| 10_000));
+    let tie = build(range(1_000, 1_045, &|_| by_n(40)));
+    let few_new = build(range(2_000, 2_008, &|_| 20_000));
+    // Slot 0, A's oldest, raised to exactly the tie's revision: in a union
+    // with A and the tie it lands on the cut, where equal revisions are
+    // broken by listing id.
+    let edge = build(vec![st(0, by_n(40))]);
+    let union = bx.fx.merged(&bx.fx.merged(&a, &edge), &tie);
+    assert_eq!(
+        cbor(&union),
+        cbor(&bx.fx.merged(&a, &bx.fx.merged(&edge, &tie))),
+        "a slot raised onto the cut is cut the same way in either grouping"
+    );
+    assert_eq!(union.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+    assert_eq!(
+        cbor(&bx.fx.merged(&a, &tie)),
+        cbor(&bx.fx.merged(&tie, &a)),
+        "the tie is cut the same way round"
+    );
+    let named: Vec<(String, StoreStateV1)> = vec![
+        ("default".into(), StoreStateV1::default()),
+        ("A_full".into(), a),
+        ("B_full_overlap".into(), b),
+        ("R_raised64".into(), raised),
+        ("T_tie45".into(), tie),
+        ("N_new8".into(), few_new),
+        ("E_slot0_at_tie".into(), edge),
+    ];
+    let sd = |ss: Vec<AuthorizedListingStatus>| StoreStateV1Delta {
+        owner,
+        listing_statuses: Some(ss),
+        ..Default::default()
+    };
+    let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
+        ("newest", sd(vec![st(5_000, 1_000_000)])),
+        ("oldest", sd(vec![st(5_001, 1)])),
+        ("raise0", sd(vec![st(0, 50_000)])),
+        ("tie1", sd(vec![st(1_000, by_n(40))])),
+        ("slot0_at_tie", sd(vec![st(0, by_n(40))])),
+        ("over_cap", sd(range(0, cap + 1, &by_n))),
+        (
+            "newest_oldest_raise",
+            sd(vec![st(5_000, 1_000_000), st(5_001, 1), st(1, 60_000)]),
+        ),
+    ];
+    let pairs = [
+        ("A_full", "B_full_overlap"),
+        ("B_full_overlap", "A_full"),
+        ("A_full", "R_raised64"),
+        ("R_raised64", "A_full"),
+        ("B_full_overlap", "R_raised64"),
+        ("A_full", "T_tie45"),
+        ("T_tie45", "A_full"),
+        ("N_new8", "B_full_overlap"),
+        ("default", "A_full"),
+        ("A_full", "E_slot0_at_tie"),
+        ("E_slot0_at_tie", "T_tie45"),
+        ("T_tie45", "E_slot0_at_tie"),
+    ];
+    let bases = [
+        "default",
+        "A_full",
+        "B_full_overlap",
+        "R_raised64",
+        "T_tie45",
+    ];
+    let native = [
+        "default",
+        "A_full",
+        "B_full_overlap",
+        "R_raised64",
+        "T_tie45",
+        "N_new8",
+        "E_slot0_at_tie",
+    ];
+    write_step2_corpus(
+        root,
+        "store-statuscap",
+        &bx.fx,
+        named,
+        &pairs,
+        &bases,
+        &deltas,
+        &native,
+    );
+}
+
+fn gen_pause(root: &Path) {
+    let bx = BackingFx::new();
+    let p = &bx.fx.params;
+    let store = bx.store.verifying_key();
+    let owner = Some(store);
+    let pause = |revision: u64, paused: bool| {
+        let pz = StorePause::new(store, revision, paused);
+        let (scoped_payload, signature) = sign_scoped(&bx.store, &pz);
+        let r = AuthorizedStorePause { pause: pz, scoped_payload, signature };
+        r.verify(&store).expect("fixture pause verifies");
+        r
+    };
+    let l1 = bx.fx.listing(1);
+    let closed = bx.closure_by(&bx.store);
+    let build = |listings: Vec<AuthorizedListing>, pauses: Vec<AuthorizedStorePause>, cl: Vec<AuthorizedClosure>| {
+        let mut s = StoreStateV1::default();
+        s.apply_delta(
+            &StoreStateV1::default(),
+            p,
+            &Some(StoreStateV1Delta {
+                owner,
+                listings: (!listings.is_empty()).then_some(listings),
+                pause: (!pauses.is_empty()).then_some(pauses),
+                closed: (!cl.is_empty()).then_some(cl),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        bx.fx.check(&s);
+        s
+    };
+    let p2_on = build(vec![], vec![pause(2, true)], vec![]);
+    let p2_off = build(vec![], vec![pause(2, false)], vec![]);
+    let tie = bx.fx.merged(&p2_on, &p2_off);
+    println!(
+        "pause: equal revision 2, on vs off: merge keeps paused={} both ways: {}",
+        tie.paused(),
+        cbor(&tie) == cbor(&bx.fx.merged(&p2_off, &p2_on))
+    );
+    let named: Vec<(String, StoreStateV1)> = vec![
+        ("default".into(), StoreStateV1::default()),
+        ("L1".into(), build(vec![l1.clone()], vec![], vec![])),
+        ("p1_on".into(), build(vec![], vec![pause(1, true)], vec![])),
+        ("p2_off".into(), p2_off),
+        ("p2_on".into(), p2_on),
+        ("L1_p1_on".into(), build(vec![l1.clone()], vec![pause(1, true)], vec![])),
+        ("L1_p2_off".into(), build(vec![l1.clone()], vec![pause(2, false)], vec![])),
+        ("L1_p2_on".into(), build(vec![l1.clone()], vec![pause(2, true)], vec![])),
+        ("p5_on".into(), build(vec![], vec![pause(5, true)], vec![])),
+        ("p5_off".into(), build(vec![], vec![pause(5, false)], vec![])),
+        ("pmax_off".into(), build(vec![], vec![pause(u64::MAX, false)], vec![])),
+        ("closed_p5_on".into(), build(vec![], vec![pause(5, true)], vec![closed.clone()])),
+    ];
+    let pd = |ps: Vec<AuthorizedStorePause>| StoreStateV1Delta {
+        owner,
+        pause: Some(ps),
+        ..Default::default()
+    };
+    let deltas: Vec<(&str, StoreStateV1Delta)> = vec![
+        ("p2_on", pd(vec![pause(2, true)])),
+        ("p2_off", pd(vec![pause(2, false)])),
+        ("p2_on_then_off", pd(vec![pause(2, true), pause(2, false)])),
+        ("p2_off_then_on", pd(vec![pause(2, false), pause(2, true)])),
+        ("p3_on", pd(vec![pause(3, true)])),
+        ("p5_off_p1_on", pd(vec![pause(5, false), pause(1, true)])),
+        ("pmax_on", pd(vec![pause(u64::MAX, true)])),
+    ];
+    let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+    let mut pairs = vec![];
+    for a in &names {
+        for b in &names {
+            if a != b && *b != "default" {
+                pairs.push((*a, *b));
+            }
+        }
+    }
+    let bases = ["default", "L1", "p2_off", "p2_on", "p5_on", "L1_p2_off", "closed_p5_on"];
+    let native: Vec<&str> = names.clone();
+    // Owned copies so `named` can move.
+    let pairs: Vec<(String, String)> = pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+    let pairs_ref: Vec<(&str, &str)> = pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let native: Vec<String> = native.iter().map(|s| s.to_string()).collect();
+    let native_ref: Vec<&str> = native.iter().map(|s| s.as_str()).collect();
+    write_step2_corpus(root, "store-pause", &bx.fx, named, &pairs_ref, &bases, &deltas, &native_ref);
 }

@@ -2,7 +2,7 @@
 //!
 //! What `harvest_common::store` bounds, and what this fixture puts there:
 //!
-//! * **Orders: [`MAX_ORDERS`] (4096)**, every one `Paid` with a genuine SPV
+//! * **Orders: [`MAX_ORDERS`] (256)**, every one `Paid` with a genuine SPV
 //!   payment proof, the status whose `verify` costs the most (the seller's
 //!   signature on the terms, then the bridge's signed tip, the bridge's
 //!   signed claim and the SPV proof inside it). Each is an instant-checkout
@@ -11,17 +11,19 @@
 //!   one the UI publishes (`minimal_on_chain_proof`, one claim) for a
 //!   two-output transaction in a block of a few thousand, so its Merkle
 //!   branch is 12 hashes deep. `MAX_PROOF_CLAIM_BYTES` (256 KiB a proof) is
-//!   NOT filled: the merge keeps the smaller of two proofs for one order, so
-//!   padding a proof is not a state a replica keeps, and 4096 orders at 256
-//!   KiB would be a 1 GiB state no node holds.
+//!   NOT filled in a held state: since step 2 the store keeps a `Paid` only
+//!   on the minimal proof (`store::as_kept`). The padding case below
+//!   measures what a padded `Paid` costs on arrival.
 //! * **Despatches: one per order** (they are kept only while their order is,
-//!   so the order cap is theirs): 4096.
+//!   so the order cap is theirs): 256.
 //! * **Backing slots: `MAX_BACKINGS` (64)** Ghost Keys, each backing carrying
-//!   a certificate of `MAX_CERTIFICATE_PEM_BYTES` (4096). Half are retired,
-//!   which is how a store reaches the bound in practice (rotation keeps the
-//!   retired key's slot), and each of the other half holds
-//!   `MAX_SCOPES_PER_BACKER` (4) wrapped copies of the store key: 64
-//!   backings, 32 retirements, 128 copies.
+//!   a certificate of `MAX_CERTIFICATE_PEM_BYTES` (4096), none retired, and
+//!   each holding `MAX_SCOPES_PER_BACKER` (4) wrapped copies of the store
+//!   key: 64 backings, 256 copies. A retired backer holds no copies, so a
+//!   retirement in place of a backer's four copies is one record (and one
+//!   signature) instead of four; this is the larger and dearer of the two
+//!   (step 2: until then this fixture retired half, holding 128 copies,
+//!   which is not the most a store holds).
 //! * **The closed flag**: at most one closure, and it is there.
 //! * **Photos: `MAX_IMAGES_HARD` (8) per listing**, each with a description
 //!   of `MAX_ALT_CHARS` (200), the cover with a thumbnail.
@@ -30,23 +32,21 @@
 //!   of `MAX_CHOICE_OPTIONS` options, `MAX_DELIVERY_REGIONS` regions, every
 //!   name `MAX_TERM_NAME_CHARS` long.
 //!
+//! * **Listings: `MAX_LISTINGS` (128)**, each at `MAX_LISTING_BYTES` (32
+//!   KiB) as it encodes (step 2): every field above at its largest, then
+//!   the description padded until one more character would not fit, so the
+//!   store keeps it. The two stores share 120 listings and each has 8 the
+//!   other lacks; the merge keeps the 128 newest.
+//! * **The pause**: one record, signed.
+//! * **Listing statuses: `MAX_LISTING_STATUSES` (512)** (step 2), one for
+//!   each listing held and the rest for listings taken down and cut, as a
+//!   long edit history leaves them.
+//!
 //! What has NO cap in the contract, and the size chosen:
 //!
-//! * **Listings** ([`LISTINGS`] = 64) and **listing statuses** (one per
-//!   listing). Nothing in the contract bounds either. What bounds them here
-//!   is the node's own `MAX_STATE_SIZE` (50 MiB, freenet-core
-//!   `wasm_runtime/state_store.rs`): the capped parts alone encode to about
-//!   41 MB (the 4096 paid orders are about 34 MB of it, since every
-//!   `Vec<u8>` and byte array in an order is a CBOR integer array), and a
-//!   listing at the sizes below is about 115 KB, so 64 of them, and the 72
-//!   the merge produces, keep every state here under the node's limit. A
-//!   state over it is one no node stores, so measuring it would prove
-//!   nothing. [`cases`] checks every state against that limit.
-//! * **A listing's title** (200 characters) and **description**
-//!   ([`DESCRIPTION_BYTES`] = 16 KiB), and the store's own name and
-//!   description. 16 KiB is the UI markdown renderer's `MAX_SOURCE_BYTES`:
-//!   it shows no more than that, so a longer description is bytes nobody
-//!   reads.
+//! * **A listing's title** (200 characters), and the store's own name and
+//!   description ([`DESCRIPTION_BYTES`] = 16 KiB, the UI markdown renderer's
+//!   `MAX_SOURCE_BYTES`, which shows no more than that).
 //! * **The store's certificate PEM**, sized like a backing's (4096).
 //!
 //! Each state is built by `StoreStateV1::apply_delta` from the empty store,
@@ -70,8 +70,7 @@ use freenet_bitcoin_common::{
 use freenet_scaffold::ComposableState;
 use harvest_common::backing::{
     sign_with_store_key, store_key_envelope, AuthorizedBacking, AuthorizedClosure,
-    AuthorizedRetirement, BackingAcceptance, BackingStatement, Retirement, StoreClosure,
-    MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
+    BackingAcceptance, BackingStatement, StoreClosure, MAX_BACKINGS, MAX_CERTIFICATE_PEM_BYTES,
 };
 use harvest_common::custody::{
     AuthorizedCopy, StoreKeyCopy, WrapScope, WrappedStoreKey, MAX_SCOPES_PER_BACKER, SCHEME_V1,
@@ -89,13 +88,20 @@ use harvest_common::listing_image::{
 use harvest_common::payment::{AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus};
 use harvest_common::store::{
     AuthorizedStoreInfoV1, Bytes32, StoreInfoV1, StoreParameters, StoreStateV1, StoreStateV1Delta,
-    MAX_ORDERS,
+    MAX_LISTING_STATUSES, MAX_ORDERS,
 };
 
 use super::{array, bytes, cbor, now, signing_key, Case, Kind, Update};
 
+/// How many `Paid` records padded to [`PADDED_PROOF_BYTES`] the padding
+/// case delivers in one delta: 16 MiB, well under the node's state limit.
+const PADDED_ORDERS: u64 = 64;
+
+/// About how large each padded proof is: `MAX_PROOF_CLAIM_BYTES`.
+const PADDED_PROOF_BYTES: usize = 256 * 1024;
+
 /// Listings in each at-cap store. The contract has no listing cap.
-const LISTINGS: u64 = 64;
+const LISTINGS: u64 = harvest_common::store::MAX_LISTINGS as u64;
 
 /// How many of its listings the second store holds that the first does not.
 /// The rest are the same listings, as two replicas of one shop share most of
@@ -199,6 +205,47 @@ impl Shop {
     /// Listing `i`, every field at its largest. `label` decides its terms,
     /// so two stores that share a label share the listing.
     fn listing(&self, label: &str, i: u64) -> Result<AuthorizedListing> {
+        self.listing_at(
+            label,
+            i,
+            now() - chrono::Duration::days(30) + chrono::Duration::minutes(i as i64),
+        )
+    }
+
+    /// Listing `i` at the store's per-listing bound
+    /// ([`harvest_common::store::MAX_LISTING_BYTES`], step 2): every field
+    /// at its largest, the description padded until one more character would
+    /// not fit, so the store keeps it.
+    fn listing_at(
+        &self,
+        label: &str,
+        i: u64,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AuthorizedListing> {
+        let fits =
+            |l: &AuthorizedListing| cbor(l).len() <= harvest_common::store::MAX_LISTING_BYTES;
+        if !fits(&self.listing_sized(label, i, created_at, 0)?) {
+            bail!("a listing with every field at its largest does not fit the listing bound");
+        }
+        let (mut lo, mut hi) = (0usize, DESCRIPTION_BYTES);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if fits(&self.listing_sized(label, i, created_at, mid)?) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        self.listing_sized(label, i, created_at, lo)
+    }
+
+    fn listing_sized(
+        &self,
+        label: &str,
+        i: u64,
+        created_at: chrono::DateTime<chrono::Utc>,
+        description: usize,
+    ) -> Result<AuthorizedListing> {
         let name = |what: &str, j: u64| {
             text(
                 &format!("{label}/{what}"),
@@ -242,13 +289,16 @@ impl Shop {
         let listing = Listing {
             id: ListingId([0u8; 32]),
             title: text(&format!("{label}/title"), i, TITLE_CHARS, true),
-            description: text(&format!("{label}/description"), i, DESCRIPTION_BYTES, true),
+            description: text(&format!("{label}/description"), i, description, true),
             kind: ListingKind::Sale,
             price: Some(PriceInfo {
                 amount: "0.00125000".into(),
                 currency: "BTC".into(),
             }),
-            created_at: now() - chrono::Duration::days(30) + chrono::Duration::minutes(i as i64),
+            // The caller's: the delta's "newest" listing must rank newest, or
+            // the store's cap could cut it and the delta would change nothing
+            // (it ignored this argument before round 2 of step 2).
+            created_at,
             checkout: Some(FixedCheckout {
                 unit_sats: 125_000,
                 delivery: DeliveryPrice::ByRegion(regions),
@@ -292,6 +342,44 @@ impl Shop {
     /// An instant-checkout order, `age` seconds old, paid by a transaction
     /// in a 12-deep Merkle tree and confirmed at [`CONFIRM_HEIGHT`].
     fn paid_order(&self, label: &str, i: u64, age: i64) -> Result<AuthorizedOrder> {
+        self.paid_order_with(label, i, age, 0)
+    }
+
+    /// [`Self::paid_order`] whose payment's transaction also pays the
+    /// largest number of filler outputs that keeps the record within
+    /// `bytes` as it encodes (step 2's `store::MAX_ORDER_BYTES`): still
+    /// the minimal proof, as large as a big honest transaction makes it.
+    fn paid_order_at(
+        &self,
+        label: &str,
+        i: u64,
+        age: i64,
+        bytes: usize,
+    ) -> Result<AuthorizedOrder> {
+        // At most 0xfc outputs in all: `build_tx` writes the count as one byte.
+        let (mut lo, mut hi) = (0usize, 0xf9);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if cbor(&self.paid_order_with(label, i, age, mid)?).len() <= bytes {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let record = self.paid_order_with(label, i, age, lo)?;
+        if cbor(&record).len() > bytes {
+            bail!("a paid order does not fit {bytes} bytes even with no filler");
+        }
+        Ok(record)
+    }
+
+    fn paid_order_with(
+        &self,
+        label: &str,
+        i: u64,
+        age: i64,
+        fillers: usize,
+    ) -> Result<AuthorizedOrder> {
         // P2WPKH, as the delegate derives from a seller's BIP-84 wallet.
         let mut script = vec![0x00, 0x14];
         script.extend_from_slice(&bytes(&format!("{label}/script"), i, 20));
@@ -327,10 +415,12 @@ impl Shop {
         // The payment and the buyer's change.
         let mut change = vec![0x00, 0x14];
         change.extend_from_slice(&bytes(&format!("{label}/change"), i, 20));
-        let raw_tx = build_tx(&[
+        let mut outputs = vec![
             (order.amount_sats, order.payment_script_pubkey.clone()),
             (1_734_221, change),
-        ]);
+        ];
+        outputs.extend((0..fillers).map(|_| (546, vec![0x6a; 250])));
+        let raw_tx = build_tx(&outputs);
         let txid = Txid(sha256d_pub(&raw_tx));
         let merkle_branch: Vec<[u8; 32]> = (0..MERKLE_DEPTH as u64)
             .map(|d| array(&format!("{label}/merkle"), i * 100 + d))
@@ -397,6 +487,62 @@ impl Shop {
         })
     }
 
+    /// [`Self::paid_order`] with its proof padded to about
+    /// [`PADDED_PROOF_BYTES`] by claims of one satoshi each about other
+    /// outpoints, every one confirmed inside the window (the genuine claim,
+    /// last, already covers the amount). The store's rule (`store::as_kept`,
+    /// step 2) checks the record's size first, so a record this large is kept
+    /// as its unpaid terms without its proof being folded: what this costs is
+    /// decoding the delta and re-encoding each record to size it. A record
+    /// under `MAX_ORDER_BYTES` is the one whose proof is folded.
+    fn padded_paid_order(&self, label: &str, i: u64) -> Result<AuthorizedOrder> {
+        let mut record = self.paid_order(label, i, 0)?;
+        let Some(OrderPaymentProof::OnChain(proof)) = record.payment_proof.take() else {
+            bail!("the fixture's proof is on-chain");
+        };
+        let genuine = proof.claims[0].clone();
+        let anchor = BlockAnchor {
+            height: CONFIRM_HEIGHT,
+            hash: BlockHash(array("store/padding-block", 0)),
+        };
+        let mut claims = Vec::new();
+        let mut size = cbor(&genuine).len();
+        let mut j = 0u64;
+        while size < PADDED_PROOF_BYTES {
+            let raw_tx = bytes(&format!("{label}/padding-tx"), i * 1000 + j, 8 * 1024);
+            let claim = SignedClaim::sign(
+                &self.bridge,
+                &ClaimBody {
+                    script_id: record.order.bitcoin_params().script_id(),
+                    network: record.order.network,
+                    as_of: anchor,
+                    claim: Claim::ConfirmedOutput {
+                        outpoint: OutPoint {
+                            txid: Txid(array(&format!("{label}/padding-txid"), i * 1000 + j)),
+                            vout: 0,
+                        },
+                        value_sats: 1,
+                        anchor,
+                        spv: SpvProof {
+                            raw_tx,
+                            merkle_branch: Vec::new(),
+                            tx_index: 0,
+                            header: mine([0u8; 32], [0u8; 32], 1_790_000_000, EASIEST_BITS),
+                            following_headers: vec![],
+                        },
+                    },
+                },
+            )
+            .map_err(|e| anyhow!("sign padding claim: {e:?}"))?;
+            size += cbor(&claim).len();
+            claims.push(claim);
+            j += 1;
+        }
+        claims.push(genuine);
+        record.payment_proof = Some(OrderPaymentProof::on_chain(claims, proof.tip));
+        Ok(record)
+    }
+
     fn despatch(&self, order: &OrderId, i: u64) -> Result<AuthorizedDespatch> {
         let despatch = Despatch {
             order_id: order.clone(),
@@ -446,18 +592,6 @@ impl Shop {
         })
     }
 
-    fn retirement(&self, backer: &SigningKey) -> Result<AuthorizedRetirement> {
-        let retirement = Retirement {
-            backer: backer.verifying_key(),
-        };
-        let (scoped_payload, signature) = self.sign(&retirement)?;
-        Ok(AuthorizedRetirement {
-            retirement,
-            scoped_payload,
-            signature,
-        })
-    }
-
     fn copy(&self, backer: &SigningKey, label: &str, j: u64, scope: u64) -> Result<AuthorizedCopy> {
         let copy = StoreKeyCopy {
             store: self.owner(),
@@ -471,6 +605,17 @@ impl Shop {
         let (scoped_payload, signature) = self.sign(&copy)?;
         Ok(AuthorizedCopy {
             copy,
+            scoped_payload,
+            signature,
+        })
+    }
+
+    /// The seller's pause (step 2), at `revision`.
+    fn pause(&self, revision: u64) -> Result<harvest_common::store_pause::AuthorizedStorePause> {
+        let pause = harvest_common::store_pause::StorePause::new(self.owner(), revision, true);
+        let (scoped_payload, signature) = self.sign(&pause)?;
+        Ok(harvest_common::store_pause::AuthorizedStorePause {
+            pause,
             scoped_payload,
             signature,
         })
@@ -506,15 +651,40 @@ impl Shop {
         revision: u64,
         offset: i64,
     ) -> Result<StoreStateV1> {
+        self.at_cap_paid(label, version, listings, revision, offset, None)
+    }
+
+    /// [`Self::at_cap`], each paid order at `paid_bytes` as it encodes when
+    /// given.
+    fn at_cap_paid(
+        &self,
+        label: &str,
+        version: u32,
+        listings: std::ops::Range<u64>,
+        revision: u64,
+        offset: i64,
+        paid_bytes: Option<usize>,
+    ) -> Result<StoreStateV1> {
         let listings = listings
             .map(|i| self.listing("store/listing", i))
             .collect::<Result<Vec<_>>>()?;
+        // A status for every listing held, and the rest of the bound for
+        // listings an edit history took down and the cut dropped.
+        let gone = (0u64..).map(|i| {
+            ListingId(*blake3::hash(format!("store/withdrawn-listing/{i}").as_bytes()).as_bytes())
+        });
         let listing_statuses = listings
             .iter()
-            .map(|l| self.listing_status(&l.listing.id, revision))
+            .map(|l| l.listing.id.clone())
+            .chain(gone)
+            .take(MAX_LISTING_STATUSES)
+            .map(|id| self.listing_status(&id, revision))
             .collect::<Result<Vec<_>>>()?;
         let orders = (0..MAX_ORDERS as u64)
-            .map(|i| self.paid_order(label, i, offset + 60 + 2 * i as i64))
+            .map(|i| match paid_bytes {
+                Some(bytes) => self.paid_order_at(label, i, offset + 60 + 2 * i as i64, bytes),
+                None => self.paid_order(label, i, offset + 60 + 2 * i as i64),
+            })
             .collect::<Result<Vec<_>>>()?;
         let fulfilment = orders
             .iter()
@@ -530,13 +700,8 @@ impl Shop {
             .enumerate()
             .map(|(j, b)| self.backing(b, label, j as u64))
             .collect::<Result<Vec<_>>>()?;
-        let (retired, current) = backers.split_at(MAX_BACKINGS / 2);
-        let retirements = retired
-            .iter()
-            .map(|b| self.retirement(b))
-            .collect::<Result<Vec<_>>>()?;
         let mut copies = Vec::new();
-        for (j, b) in current.iter().enumerate() {
+        for (j, b) in backers.iter().enumerate() {
             for scope in 0..MAX_SCOPES_PER_BACKER as u64 {
                 copies.push(self.copy(b, label, j as u64, scope)?);
             }
@@ -548,11 +713,12 @@ impl Shop {
             listings: Some(listings),
             orders: Some(orders),
             backings: Some(backings),
-            retirements: Some(retirements),
+            retirements: None,
             closed: Some(vec![self.closure()?]),
             copies: Some(copies),
             fulfilment: Some(fulfilment),
             listing_statuses: Some(listing_statuses),
+            pause: Some(vec![self.pause(u64::from(version))?]),
         };
         let mut state = StoreStateV1::default();
         state
@@ -597,6 +763,7 @@ impl Shop {
             && state.fulfilment.records.len() == MAX_ORDERS
             && slots.len() == MAX_BACKINGS
             && per_backer.len() == unretired
+            && state.copies.records.len() == MAX_BACKINGS * MAX_SCOPES_PER_BACKER
             && per_backer.values().all(|&n| n == MAX_SCOPES_PER_BACKER)
             && state.closed.records.len() == 1
             && state
@@ -604,12 +771,29 @@ impl Shop {
                 .listings
                 .iter()
                 .all(|l| l.listing.images.len() == MAX_IMAGES_HARD)
-            && state.listing_statuses.records.len() == state.listings.listings.len();
+            && state.listings.listings.len() == harvest_common::store::MAX_LISTINGS
+            && state.listing_statuses.records.len() == MAX_LISTING_STATUSES
+            && state.pause.records.len() == 1
+            // Every order still `Paid`: one the store kept as its unpaid
+            // terms (`store::as_kept`) would make this a cheaper state than
+            // the rows say it is.
+            && state
+                .orders
+                .orders
+                .values()
+                .all(|o| o.status == harvest_common::payment::OrderStatus::Paid);
         if !full {
             bail!(
-                "{what} is not at its caps: {} orders, {} despatches, {} backing slots, \
-                 {} backers with copies of {unretired} unretired, {} listings, {} statuses",
+                "{what} is not at its caps, every order paid: {} orders ({} paid), {} despatches, \
+                 {} backing slots, {} backers with copies of {unretired} unretired, {} listings, \
+                 {} statuses",
                 state.orders.orders.len(),
+                state
+                    .orders
+                    .orders
+                    .values()
+                    .filter(|o| o.status == harvest_common::payment::OrderStatus::Paid)
+                    .count(),
                 state.fulfilment.records.len(),
                 slots.len(),
                 per_backer.len(),
@@ -632,14 +816,29 @@ pub fn cases() -> Result<Vec<Case>> {
     // listing, every other part absent.
     let one = StoreStateV1Delta {
         owner: Some(shop.owner()),
-        listings: Some(vec![shop.listing("store/new-listing", 0)?]),
+        // The newest, so the store's cut keeps it and drops its oldest.
+        listings: Some(vec![shop.listing_at("store/new-listing", 0, now())?]),
         ..Default::default()
     };
 
+    // The delta must change the store, or its row measures a no-op: the
+    // listing it adds is the newest, so the cut keeps it and drops the
+    // oldest (it was dated as the oldest before round 2 of step 2, and at
+    // 128 listings the store cut it on arrival).
+    {
+        let mut after = held.clone();
+        after
+            .apply_delta(&held, &shop.parameters, &Some(one.clone()))
+            .map_err(|e| anyhow!("the one-listing delta applies natively: {e}"))?;
+        if after.listings == held.listings {
+            bail!("the one-listing delta changes nothing: its listing is cut on arrival");
+        }
+    }
+
     // (b) A full state of the same store from a replica that has diverged:
     // later details, eight listings this one lacks and a later status for
-    // every shared one, 4096 different orders interleaved in time with the
-    // held ones (the cap keeps the newest 2048 of each), and 64 different
+    // every shared one, `MAX_ORDERS` different orders interleaved in time
+    // with the held ones (the cap keeps the newest half of each), and 64 different
     // backers (the cap keeps the 64 smallest of the 128). Every part
     // therefore brings something, and the merge is still at every cap.
     let other = shop.at_cap(
@@ -657,24 +856,231 @@ pub fn cases() -> Result<Vec<Case>> {
     if merged == held {
         bail!("the second store fixture brings nothing to the first");
     }
+    // (c) Step 2: `Paid` records padded to the proof bound, as anyone may
+    // publish one, the newest orders there are. The store keeps each as its
+    // unpaid terms (`store::as_kept`), refused by its size.
+    let padded = StoreStateV1Delta {
+        owner: Some(shop.owner()),
+        orders: Some(
+            (0..PADDED_ORDERS)
+                .map(|i| shop.padded_paid_order("store/padded", i))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        ..Default::default()
+    };
+    {
+        let mut kept = held.clone();
+        kept.apply_delta(&held, &shop.parameters, &Some(padded.clone()))
+            .map_err(|e| anyhow!("the padded delta applies natively: {e}"))?;
+        let unpaid = kept
+            .orders
+            .orders
+            .values()
+            .filter(|o| o.status == OrderStatus::AwaitingPayment)
+            .count();
+        if unpaid != PADDED_ORDERS as usize {
+            bail!("the padded orders are not all kept unpaid ({unpaid})");
+        }
+        kept.verify(&kept, &shop.parameters)
+            .map_err(|e| anyhow!("the store after the padded delta fails verify: {e}"))?;
+    }
+    // (d) Step 2: every paid order at the store's byte bound for a `Paid`
+    // record (`store::MAX_ORDER_BYTES`), as big honest payments make
+    // them, beside the listings at theirs.
+    let big = shop.at_cap_paid(
+        "store/held-big",
+        2,
+        0..LISTINGS,
+        1,
+        0,
+        Some(harvest_common::store::MAX_ORDER_BYTES),
+    )?;
+    for (what, bytes) in [
+        ("held store", held_bytes.len()),
+        ("other store", cbor(&other).len()),
+        ("merged store", cbor(&merged).len()),
+        ("store of paid orders at their byte bound", cbor(&big).len()),
+        ("one-listing delta", cbor(&one).len()),
+        ("padded delta", cbor(&padded).len()),
+        (
+            "a status",
+            cbor(&held.listing_statuses.records.values().next()).len(),
+        ),
+        ("  its info", cbor(&big.info).len()),
+        ("  its listings", cbor(&big.listings).len()),
+        ("  its orders", cbor(&big.orders).len()),
+        ("  its despatches", cbor(&big.fulfilment).len()),
+        ("  its listing statuses", cbor(&big.listing_statuses).len()),
+        ("  its backings", cbor(&big.backings).len()),
+        ("  its retirements", cbor(&big.retirements).len()),
+        ("  its wrapped copies", cbor(&big.copies).len()),
+        (
+            "  its closure and pause",
+            cbor(&big.closed).len() + cbor(&big.pause).len(),
+        ),
+    ] {
+        println!("store      size: {what}: {bytes} bytes");
+    }
+    if cbor(&big).len() > harvest_common::store::AT_CAPS_BYTES {
+        bail!(
+            "the store at its caps encodes in {} bytes, past `AT_CAPS_BYTES` ({})",
+            cbor(&big).len(),
+            harvest_common::store::AT_CAPS_BYTES
+        );
+    }
+    fits_a_node("the store of paid orders at their byte bound", &big)?;
     fits_a_node("the held store fixture", &held)?;
     fits_a_node("the second store fixture", &other)?;
     fits_a_node("the merge of the two store fixtures", &merged)?;
 
-    Ok(vec![
+    // (e) Measuring the hostile delta against the honest one it must not
+    // outcost: padded `Paid` deltas of several sizes, and the largest honest
+    // delta there is, a new subscriber's whole store of paid orders at their
+    // byte bound.
+    let padded_of = |n: u64| -> Result<Vec<u8>> {
+        Ok(cbor(&StoreStateV1Delta {
+            owner: Some(shop.owner()),
+            orders: Some(
+                (0..n)
+                    .map(|i| shop.padded_paid_order("store/padded", i))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            ..Default::default()
+        }))
+    };
+    let whole = {
+        use freenet_scaffold::ComposableState;
+        let empty = StoreStateV1::default();
+        let summary = empty.summarize(&empty, &shop.parameters);
+        cbor(
+            &big.delta(&big, &shop.parameters, &summary)
+                .ok_or_else(|| anyhow!("a whole store has a delta to an empty one"))?,
+        )
+    };
+    println!("store      size: whole-store delta: {} bytes", whole.len());
+    // The most padded records a delta under `MAX_STORE_BYTES` carries: the
+    // worst a hostile delta can do now. One more record is past the bound.
+    let bound = harvest_common::store::MAX_STORE_BYTES;
+    let mut n = 1u64;
+    while padded_of(n + 1)?.len() <= bound {
+        n += 1;
+    }
+    let at_bound = padded_of(n)?;
+    let past_bound = padded_of(n + 1)?;
+    println!(
+        "store      size: {n}-record padded delta: {} bytes (bound {bound})",
+        at_bound.len()
+    );
+    if whole.len() > bound || cbor(&big).len() > bound {
+        bail!("the largest honest store, or its whole-store delta, is past MAX_STORE_BYTES");
+    }
+    let mut sized = vec![
         Case {
             kind: Kind::Store,
-            name: "4096 orders at caps + one-listing delta".into(),
+            name: format!("{MAX_ORDERS} orders at caps + {n} padded Paid, the most under the store's byte bound"),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::Delta(at_bound),
+        },
+        Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + {} padded Paid, past the store's byte bound (refused)", n + 1),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::RefusedDelta(past_bound),
+        },
+    ];
+    // (f) Replayed genuine records (review round 4 of step 2): copies of
+    // records the store holds, beside the one new listing, are not
+    // verified again. 256 copies of a held paid order and 512 of a held
+    // listing status, the most a delta may carry of each; one status more
+    // and the delta is refused whole, on its count.
+    let held_order = held
+        .orders
+        .orders
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("the held store has orders"))?;
+    let held_status = held
+        .listing_statuses
+        .records
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("the held store has statuses"))?;
+    for (what, delta) in [
+        (
+            format!("{MAX_ORDERS} copies of a held paid order"),
+            StoreStateV1Delta {
+                orders: Some(vec![held_order.clone(); MAX_ORDERS]),
+                ..one.clone()
+            },
+        ),
+        (
+            format!("{MAX_LISTING_STATUSES} copies of a held listing status"),
+            StoreStateV1Delta {
+                listing_statuses: Some(vec![held_status.clone(); MAX_LISTING_STATUSES]),
+                ..one.clone()
+            },
+        ),
+    ] {
+        sized.push(Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + one-listing delta + {what}"),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
+            update: Update::Delta(cbor(&delta)),
+        });
+    }
+    sized.push(Case {
+        kind: Kind::Store,
+        name: format!(
+            "{MAX_ORDERS} orders at caps + one-listing delta + {} copies of a held listing status (refused)",
+            MAX_LISTING_STATUSES + 1
+        ),
+        parameters: parameters.clone(),
+        held: held_bytes.clone(),
+        update: Update::RefusedDelta(cbor(&StoreStateV1Delta {
+            listing_statuses: Some(vec![held_status.clone(); MAX_LISTING_STATUSES + 1]),
+            ..one.clone()
+        })),
+    });
+    sized.push(Case {
+        kind: Kind::Store,
+        name: "a new subscriber's whole store (paid orders at their byte bound) as one delta"
+            .into(),
+        parameters: parameters.clone(),
+        held: Vec::new(),
+        update: Update::Delta(whole),
+    });
+
+    let mut cases = vec![
+        Case {
+            kind: Kind::Store,
+            name: format!("{MAX_ORDERS} orders at caps + one-listing delta"),
             parameters: parameters.clone(),
             held: held_bytes.clone(),
             update: Update::Delta(cbor(&one)),
         },
         Case {
             kind: Kind::Store,
-            name: "4096 orders at caps + another at-caps state".into(),
-            parameters,
-            held: held_bytes,
+            name: format!("{MAX_ORDERS} orders at caps + another at-caps state"),
+            parameters: parameters.clone(),
+            held: held_bytes.clone(),
             update: Update::State(cbor(&other)),
         },
-    ])
+        Case {
+            kind: Kind::Store,
+            name: format!(
+                "{MAX_ORDERS} Paid orders of {} KiB + one-listing delta",
+                harvest_common::store::MAX_ORDER_BYTES / 1024
+            ),
+            parameters: parameters.clone(),
+            held: cbor(&big),
+            update: Update::Delta(cbor(&one)),
+        },
+    ];
+    cases.extend(sized);
+    Ok(cases)
 }

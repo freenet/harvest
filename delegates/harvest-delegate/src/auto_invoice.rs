@@ -221,15 +221,21 @@ pub(crate) fn store_read_key(store_contract_id: &[u8]) -> Vec<u8> {
 const STORE_READ_OPEN: &[u8] = b"o";
 const STORE_READ_CLOSED: &[u8] = b"c";
 const STORE_READ_NOT_OURS: &[u8] = b"n";
+const STORE_READ_PAUSED: &[u8] = b"p";
+
+/// What a paused store tells a buyer whose Buy now arrives (step 2).
+const STORE_PAUSED_REASON: &str = "This store is closed for now.";
 
 /// The refusal a store's state gives on its own, as `decide` checks it: not
 /// signed by `owner` (including a store nobody has published to), then
-/// closed.
+/// closed, then paused by the seller (step 2; a closure overrides a pause).
 fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> {
     if store.owner.as_ref() != Some(owner) {
         Some(Refusal::NotOurStore)
     } else if !store.closed.is_empty() {
         Some(Refusal::StoreClosed)
+    } else if store.paused() {
+        Some(Refusal::StorePaused)
     } else {
         None
     }
@@ -237,21 +243,25 @@ fn store_refusal(store: &StoreStateV1, owner: &VerifyingKey) -> Option<Refusal> 
 
 /// Record what a read of the store's state said ([`store_read_key`]),
 /// written only when it changed: a store notification arrives with every
-/// order and status, and the answer almost never changes.
-fn note_store_read<S: SecretStore>(
+/// order and status, and the answer almost never changes. True when it
+/// changed, so the caller can tell buyers at once.
+pub(crate) fn note_store_read<S: SecretStore>(
     secrets: &mut S,
     store_contract_id: &[u8],
     refusal: Option<&Refusal>,
-) {
+) -> bool {
     let value = match refusal {
         Some(Refusal::NotOurStore) => STORE_READ_NOT_OURS,
         Some(Refusal::StoreClosed) => STORE_READ_CLOSED,
+        Some(Refusal::StorePaused) => STORE_READ_PAUSED,
         _ => STORE_READ_OPEN,
     };
     let key = store_read_key(store_contract_id);
-    if secrets.get_secret(&key).as_deref() != Some(value) {
-        secrets.set_secret(&key, value);
+    if secrets.get_secret(&key).as_deref() == Some(value) {
+        return false;
     }
+    // A write the node refused changed nothing a heartbeat could report.
+    secrets.set_secret(&key, value)
 }
 
 /// The refusal the last read of the store's state gave ([`store_read_key`]).
@@ -262,6 +272,7 @@ fn store_read_refusal<S: SecretStore>(secrets: &S, store_contract_id: &[u8]) -> 
     {
         Some(STORE_READ_NOT_OURS) => Some(Refusal::NotOurStore),
         Some(STORE_READ_CLOSED) => Some(Refusal::StoreClosed),
+        Some(STORE_READ_PAUSED) => Some(Refusal::StorePaused),
         _ => None,
     }
 }
@@ -1757,6 +1768,11 @@ pub(crate) enum Refusal {
     NoStoreKey,
     NotOurStore,
     StoreClosed,
+    /// The seller paused the store (`StoreStateV1::pause`, step 2). Unlike
+    /// the other store-wide refusals, `decide` answers each Buy now with a
+    /// Decline and marks it seen, so none is invoiced when the store opens
+    /// again, and a buyer whose view of the store is old still hears.
+    StorePaused,
     NoPaymentKey,
     NetworkMismatch,
     NoFreshTip,
@@ -1813,6 +1829,7 @@ impl Refusal {
             Refusal::ClockAhead => Some(
                 "Your computer's clock is ahead of the right time. Set it right, then try again.",
             ),
+            Refusal::StorePaused => Some(STORE_PAUSED_REASON),
             _ => None,
         }
     }
@@ -1821,12 +1838,12 @@ impl Refusal {
     /// taking orders (`harvest_common::presence::Heartbeat::reason`):
     /// coarse, since the buyer needs to know only whether to come back. The
     /// seller sees the detailed reason (`AutoInvoiceStatus::paused`).
-    /// `Paused` is reserved for a whole-store pause, which nothing here
-    /// gives yet.
+    /// `Paused` is the seller's own pause.
     pub(crate) fn for_buyers(&self) -> harvest_common::presence::NotTakingReason {
         use harvest_common::presence::NotTakingReason as R;
         match self {
             Refusal::StoreClosed | Refusal::NotOurStore => R::ClosedForGood,
+            Refusal::StorePaused => R::Paused,
             Refusal::CatchingUp => R::CatchingUp,
             _ => R::Unavailable,
         }
@@ -1848,6 +1865,7 @@ impl Refusal {
                 | Refusal::NoStoreKey
                 | Refusal::NotOurStore
                 | Refusal::StoreClosed
+                | Refusal::StorePaused
                 | Refusal::NoPaymentKey
                 | Refusal::NetworkMismatch
                 | Refusal::NoFreshTip
@@ -1873,6 +1891,7 @@ impl Refusal {
             Refusal::NoStoreKey => "this device does not hold the store's key".into(),
             Refusal::NotOurStore => "the store is not signed by this store key".into(),
             Refusal::StoreClosed => "the store is closed".into(),
+            Refusal::StorePaused => "the store is paused".into(),
             Refusal::NoPaymentKey => "no payment key is set".into(),
             Refusal::NetworkMismatch => "the payment key is for another network".into(),
             Refusal::NoFreshTip => "no recent Bitcoin block has arrived".into(),
@@ -2072,17 +2091,33 @@ fn on_store_change<S: SecretStore>(
         return Vec::new();
     };
     let read = store_refusal(&store, &store_sk.verifying_key());
-    note_store_read(secrets, &record.arm.store_contract_id, read.as_ref());
+    // A change in what the store says (paused, resumed, closed) reaches
+    // buyers now rather than at the next wake-up: the heartbeat goes out
+    // because its reason changed.
+    let mut out: Vec<OutboundDelegateMsg> =
+        if note_store_read(secrets, &record.arm.store_contract_id, read.as_ref()) {
+            heartbeat(secrets, record, now_ms, false)
+                .map(|(_, message)| message)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
     if read == Some(Refusal::NotOurStore) {
-        return Vec::new();
+        return out;
     }
     note_paid_scripts(secrets, &store);
+    // The seller's own book (step 2): an open order the store now shows
+    // paid, or cancelled before payment.
+    crate::seller_orders::on_store_statuses(secrets, &store_sk.verifying_key().to_bytes(), |id| {
+        store.orders.orders.get(id).map(|o| o.status)
+    });
     let tip: Option<TipCache> = load(secrets, &tip_key(record.arm.network));
     let Some(mut ledger) = load_ledger_kept(secrets, &record.arm.store_contract_id) else {
-        return Vec::new();
+        return out;
     };
     if ledger.sales.is_empty() && ledger.statuses.is_empty() && ledger.gap_orders.is_empty() {
-        return Vec::new();
+        return out;
     }
     let statuses = settle(
         &mut ledger,
@@ -2094,14 +2129,17 @@ fn on_store_change<S: SecretStore>(
     // Recorded before anything is published: a decrement sent but not
     // recorded would be sent again on the next change, twice off the stock.
     if !save_ledger(secrets, &record.arm.store_contract_id, &ledger) {
-        return Vec::new();
+        return out;
     }
-    Decided {
-        statuses,
-        owner: Some(store_sk.verifying_key()),
-        ..Default::default()
-    }
-    .into_messages(&record.arm)
+    out.extend(
+        Decided {
+            statuses,
+            owner: Some(store_sk.verifying_key()),
+            ..Default::default()
+        }
+        .into_messages(&record.arm),
+    );
+    out
 }
 
 /// Settle the ledger's sales against the store, and return the statuses to
@@ -2116,6 +2154,11 @@ fn on_store_change<S: SecretStore>(
 /// - A sale is forgotten once its outcome cannot change any more: its
 ///   decrement landed, its payment was reversed, it never landed, or its
 ///   payment window closed. Until then a late payment still decrements.
+/// - A listing the store no longer holds (its cap cut it, step 2) has no
+///   stock to take off: its sales are forgotten and its statuses not sent.
+///   Without this, the light store read, which keeps only held listings'
+///   statuses, would never see a status for it land, and would re-send it
+///   on every change (round 1 of step 2's review).
 pub(crate) fn settle(
     ledger: &mut Ledger,
     store: &StoreStateV1,
@@ -2129,6 +2172,13 @@ pub(crate) fn settle(
             .records
             .get(&harvest_common::store::Bytes32(listing.0))
             .map(|s| s.status.revision)
+    };
+    let listing_held = |listing: &ListingId| {
+        store
+            .listings
+            .listings
+            .iter()
+            .any(|l| l.listing.id == *listing)
     };
     ledger
         .oversold
@@ -2165,16 +2215,21 @@ pub(crate) fn settle(
     while ledger.oversold.len() > STATUSES_CAP {
         ledger.oversold.remove(0);
     }
-    // Our own statuses the store now shows, or has moved past, are done.
-    ledger
-        .statuses
-        .retain(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision));
+    // Our own statuses the store now shows, or has moved past, are done, and
+    // so are those of a listing it no longer holds.
+    ledger.statuses.retain(|own| {
+        listing_held(&own.listing)
+            && held_revision(&own.listing).is_none_or(|held| held < own.revision)
+    });
 
     let sales = std::mem::take(&mut ledger.sales);
     for mut sale in sales {
         let order = store.orders.orders.get(&sale.order);
         if let (Some(order), None) = (order, sale.decremented) {
-            if order.status == OrderStatus::Paid {
+            if order.status == OrderStatus::Paid && !listing_held(&sale.listing) {
+                // Cut from the store: nothing to take off.
+                sale.decremented = Some(0);
+            } else if order.status == OrderStatus::Paid {
                 let (revision, availability) = effective_status(store, ledger, &sale.listing);
                 // Paid when published stock could not cover it: its hold ended
                 // (a cancel, or a buyer past the time to start paying) and the
@@ -2221,7 +2276,9 @@ pub(crate) fn settle(
         });
         let done = match (order.map(|o| o.status), sale.decremented) {
             (_, Some(revision)) => {
-                revision == 0 || held_revision(&sale.listing).is_some_and(|held| held >= revision)
+                revision == 0
+                    || !listing_held(&sale.listing)
+                    || held_revision(&sale.listing).is_some_and(|held| held >= revision)
             }
             (Some(OrderStatus::PaymentReversed), None) => true,
             (None, None) => now_ms.saturating_sub(sale.issued_at_ms) >= NOT_LANDED_MS,
@@ -2239,7 +2296,10 @@ pub(crate) fn settle(
     ledger
         .statuses
         .iter()
-        .filter(|own| held_revision(&own.listing).is_none_or(|held| held < own.revision))
+        .filter(|own| {
+            listing_held(&own.listing)
+                && held_revision(&own.listing).is_none_or(|held| held < own.revision)
+        })
         .filter_map(|own| sign_status(store_sk, own.clone()).ok())
         .collect()
 }
@@ -2379,10 +2439,21 @@ fn decline(
     now_ms: u64,
 ) -> Option<EncryptedMessage> {
     let (tag, from_seller, conversation_id, _) = open_instant(store_sk, message)?;
+    decline_opened(&tag, &from_seller, &conversation_id, reason, now_ms)
+}
+
+/// [`decline`], for a request already opened.
+fn decline_opened(
+    tag: &[u8; 32],
+    from_seller: &[u8; 32],
+    conversation_id: &harvest_common::mailbox::ConversationId,
+    reason: &str,
+    now_ms: u64,
+) -> Option<EncryptedMessage> {
     harvest_common::sealed::seal(
-        &from_seller,
-        &tag,
-        &conversation_id,
+        from_seller,
+        tag,
+        conversation_id,
         MessageContent::Decline {
             reason: reason.to_string(),
         },
@@ -2416,7 +2487,8 @@ fn open_instant(
             order_binding,
             buyer_receipt_key,
             instant: Some(instant),
-            ..
+            shipping,
+            note,
         } if crate::messaging::is_canonical_tag(&tag) => Some((
             tag,
             from_seller,
@@ -2427,6 +2499,8 @@ fn open_instant(
                 order_binding,
                 buyer_receipt_key,
                 instant,
+                shipping,
+                note,
             },
         )),
         _ => None,
@@ -2440,6 +2514,10 @@ struct OpenedRequest {
     order_binding: [u8; 32],
     buyer_receipt_key: Option<[u8; 32]>,
     instant: InstantSelection,
+    /// Where to send it and the buyer's note: kept in the seller's own
+    /// book with the order it answers (step 2, `seller_orders`).
+    shipping: String,
+    note: String,
 }
 
 /// Whether a request made at `at_ms` (the buyer's clock) is within the day
@@ -2946,6 +3024,28 @@ pub(crate) fn decide<S: SecretStore>(
         }
         decided.undecided = !entries.is_empty();
     };
+    // Paused by the seller (step 2): checked before everything else, since
+    // a lapsed watch or week would otherwise leave the requests undecided,
+    // to be invoiced when the seller opens Harvest and resumes.
+    if store.closed.is_empty() && store.paused() {
+        if let Some(store_sk) = store_key(secrets, &arm.store_verifying_key)
+            .filter(|sk| store.owner.as_ref() == Some(&sk.verifying_key()))
+        {
+            note_store_read(secrets, &arm.store_contract_id, Some(&Refusal::StorePaused));
+            let Some(mut ledger) = load_ledger_kept(secrets, &arm.store_contract_id) else {
+                refuse_all(&mut decided, Refusal::LedgerUnreadable);
+                return decided;
+            };
+            decline_while_paused(&store_sk, &mut ledger, entries, &mut decided, now_ms);
+            if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
+                return Decided {
+                    undecided: true,
+                    ..Decided::default()
+                };
+            }
+            return decided;
+        }
+    }
     let anchor = match global_refusal(secrets, record, tip.as_ref(), now_ms) {
         Ok(anchor) => anchor,
         Err(why) => {
@@ -3026,6 +3126,7 @@ pub(crate) fn decide<S: SecretStore>(
     };
     decided.statuses = settle(&mut ledger, store, Some(anchor.height), &store_sk, now_ms);
     let mut issued_now: Vec<AuthorizedOrder> = Vec::new();
+    let mut kept: Vec<harvest_common::delegate::SellerKeptOrder> = Vec::new();
     // Counted once a run, not per request: up to MAX_ADDRESS_RUN
     // derivations each time. Every invoice this run adds one unpaid address
     // on top, and nothing else moves the counter.
@@ -3064,10 +3165,22 @@ pub(crate) fn decide<S: SecretStore>(
             now_ms,
         );
         match outcome {
-            Ok(Answer::Invoice { order, reply }) => {
+            Ok(Answer::Invoice {
+                order,
+                reply,
+                request,
+            }) => {
                 if let Some(request) = order.order.request_id {
                     decided.retry.push((digest, request));
                 }
+                kept.push(harvest_common::delegate::SellerKeptOrder {
+                    order: (*order).clone(),
+                    request: Some(*request),
+                    despatch: None,
+                    paid_height: None,
+                    sent_off_store: false,
+                    seal: None,
+                });
                 issued_now.push((*order).clone());
                 decided.orders.push(*order);
                 decided.held_back.push(reply.clone());
@@ -3105,7 +3218,12 @@ pub(crate) fn decide<S: SecretStore>(
     }
     // Recorded before anything is published, as in `on_store_change`: an
     // order or decrement sent but not recorded would lose its hold, or be
-    // decremented again.
+    // decremented again. The seller's own book first (step 2), so the
+    // ship-to is kept from the moment the order is signed; but a book that
+    // cannot take it (the most books this device keeps, or one that does
+    // not read) does not stop instant checkout: the request stays in the
+    // mailbox, and the seller's tab offers it to the book again.
+    let _ = crate::seller_orders::keep_signed(secrets, &store_sk.verifying_key().to_bytes(), kept);
     if !save_ledger(secrets, &arm.store_contract_id, &ledger) {
         return Decided {
             undecided: true,
@@ -3115,10 +3233,49 @@ pub(crate) fn decide<S: SecretStore>(
     decided
 }
 
+/// While the store is paused: answer every Buy now not yet seen, and fresh
+/// enough to answer, with [`STORE_PAUSED_REASON`], and mark every entry
+/// seen, whatever it is, as `decide` marks every entry it refuses for a
+/// reason of its own (not a store-wide one). So nothing seen while paused
+/// is invoiced on resume. A request that is not a Buy now (a quote request)
+/// gets no answer and is left to the seller, as `decide` leaves it; one
+/// older than [`REQUEST_MAX_AGE_MS`] gets no answer, as `decide` gives it
+/// none.
+fn decline_while_paused(
+    store_sk: &SigningKey,
+    ledger: &mut Ledger,
+    entries: &[EncryptedMessage],
+    decided: &mut Decided,
+    now_ms: u64,
+) {
+    let mut ordered: Vec<&EncryptedMessage> = entries.iter().collect();
+    ordered.sort_by_key(|m| (m.timestamp, entry_digest(m)));
+    for message in ordered {
+        let digest = entry_digest(message);
+        if ledger.seen.contains(&digest) {
+            continue;
+        }
+        let reply = open_instant(store_sk, message).and_then(|(tag, from, conv, request)| {
+            let at = request.instant.requested_at_ms;
+            (at >= 0 && now_ms.abs_diff(at as u64) <= REQUEST_MAX_AGE_MS)
+                .then(|| decline_opened(&tag, &from, &conv, STORE_PAUSED_REASON, now_ms))
+                .flatten()
+        });
+        if let Some(reply) = reply {
+            decided.replies.push(reply);
+            decided.declined.push(digest);
+        }
+        decided.refused.push((digest, Refusal::StorePaused));
+        ledger.saw(digest);
+    }
+}
+
 enum Answer {
     Invoice {
         order: Box<AuthorizedOrder>,
         reply: EncryptedMessage,
+        /// The request it answers, for the seller's own book.
+        request: Box<harvest_common::delegate::KeptRequest>,
     },
     Decline(EncryptedMessage),
 }
@@ -3348,6 +3505,15 @@ fn decide_one<S: SecretStore>(
     Ok(Answer::Invoice {
         order: Box::new(signed),
         reply,
+        request: Box::new(harvest_common::delegate::KeptRequest {
+            listing_id: request.listing_id.clone(),
+            quantity: request.quantity,
+            shipping: request.shipping.clone(),
+            note: request.note.clone(),
+            region: request.instant.region.clone(),
+            choices: request.instant.choices.clone(),
+            conversation: tag,
+        }),
     })
 }
 
@@ -4918,6 +5084,104 @@ mod tests {
             .is_empty());
     }
 
+    /// Step 2: an order instant checkout signs goes into the seller's own
+    /// book with the request it answers (the ship-to), with no tab open; a
+    /// store notification showing it paid marks it so. So an order that
+    /// rolls off the store, or a request a mailbox flood pushes out, still
+    /// leaves the seller what to send and where. Mutated red by not keeping
+    /// the signed orders, and by not marking paid.
+    #[test]
+    fn a_signed_order_and_its_ship_to_go_into_the_sellers_book() {
+        let mut f = fixture();
+        let decided = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.orders.len(), 1);
+        let store_key = store_sk().verifying_key().to_bytes();
+        let book = |f: &Fixture| match crate::seller_orders::list(&f.secrets, 1, store_key, None) {
+            HarvestDelegateResponse::SellerOrders {
+                result: Ok(page), ..
+            } => page.orders,
+            other => panic!("{other:?}"),
+        };
+        let kept = book(&f);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].order.order.id, decided.orders[0].order.id);
+        let request = kept[0].request.as_ref().expect("the request it answers");
+        assert!(!request.shipping.is_empty(), "with the ship-to");
+        assert_eq!(request.listing_id, jam().id);
+
+        publish(&mut f, &decided);
+        with_status(&mut f, &decided.orders[0].order.id, OrderStatus::Paid);
+        store_change(&mut f);
+        assert_eq!(book(&f)[0].order.status, OrderStatus::Paid);
+    }
+
+    /// Review round 2 of step 2 (skeptical): a seller's book that cannot
+    /// take the order (this device already keeps the most books it keeps)
+    /// does not stop instant checkout: the order is signed, and its request
+    /// stays in the mailbox for the tab. Mutated red by refusing the whole
+    /// run when the book refuses.
+    #[test]
+    fn a_book_that_cannot_take_the_order_does_not_stop_instant_checkout() {
+        let mut f = fixture();
+        for b in 0..harvest_common::delegate::MAX_SELLER_BOOKS as u8 {
+            let other = SigningKey::from_bytes(&[0x60 + b; 32]);
+            crate::store_keys::keep(&mut f.secrets, &other);
+            f.secrets.set_secret(
+                &crate::seller_orders::open_key(&other.verifying_key().to_bytes()),
+                &to_cbor(&Vec::<u8>::new()).unwrap(),
+            );
+        }
+        let decided = run(&mut f, &[Buyer::new(41).request(&jam(), 1, 1, 12_000)]);
+        assert_eq!(decided.orders.len(), 1, "signed all the same");
+        let store_key = store_sk().verifying_key().to_bytes();
+        assert!(!f
+            .secrets
+            .has_secret(&crate::seller_orders::unpaid_key(&store_key)));
+    }
+
+    /// A listing the store's cap has cut (step 2) has no stock to take off:
+    /// a decrement not yet landed stops going out, and its sale is
+    /// forgotten, rather than re-sent on every change for good (the light
+    /// store read keeps only held listings' statuses, so it would never see
+    /// it land). Mutated red by keeping statuses of listings not held, and by
+    /// keeping the sale. The branch that takes nothing off a sale paid after
+    /// its listing went survives its mutation, equivalently: through the
+    /// light store read the cut listing has no status, so nothing would be
+    /// taken off anyway. It covers the full-decode fallback.
+    #[test]
+    fn a_decrement_for_a_listing_the_store_cut_stops() {
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        assert_eq!(store_change(&mut f).len(), 1);
+        // Lost, and then the listing is cut from the store.
+        f.store
+            .listings
+            .listings
+            .retain(|l| l.listing.id != jam().id);
+        assert!(store_change(&mut f).is_empty());
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.sales.is_empty());
+        assert!(ledger.statuses.is_empty());
+
+        // Paid only after its listing was cut: nothing is taken off.
+        let mut f = fixture();
+        counted(&mut f, 3);
+        let first = run(&mut f, &[Buyer::new(40).request(&jam(), 1, 1, 12_000)]);
+        publish(&mut f, &first);
+        f.store
+            .listings
+            .listings
+            .retain(|l| l.listing.id != jam().id);
+        with_status(&mut f, &first.orders[0].order.id, OrderStatus::Paid);
+        assert!(store_change(&mut f).is_empty());
+        let ledger = load_ledger(&f.secrets, &f.record.arm.store_contract_id);
+        assert!(ledger.sales.is_empty());
+        assert!(ledger.statuses.is_empty());
+    }
+
     /// A migration keeps every sale: the predecessor's ledger is folded
     /// into the successor's by order id. Mutated red by dropping incoming
     /// sales in `merge_ledgers`.
@@ -6077,6 +6341,31 @@ mod tests {
         let entry = Buyer::new(86).request(&jam(), 1, 1, 12_000);
         f.record = held;
         assert!(run(&mut f, &[entry]).orders.is_empty());
+    }
+
+    /// Review round 2 of step 2 (codex): a store read whose write the node
+    /// refuses changed nothing, so no heartbeat goes out on the old answer
+    /// (a store paused would otherwise say it is taking orders). Mutated red
+    /// by answering true whatever the write did.
+    #[test]
+    fn a_store_read_the_node_did_not_keep_is_not_a_change() {
+        let mut secrets = MemSecrets::refusing_writes();
+        assert!(!note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
+        let mut secrets = MemSecrets::default();
+        assert!(note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
+        assert!(!note_store_read(
+            &mut secrets,
+            b"store",
+            Some(&Refusal::StorePaused)
+        ));
     }
 
     /// Review round 3 of batch 2: a closed store's heartbeat says closed for
@@ -7324,6 +7613,44 @@ mod tests {
             "the photographed listing is in the fixture"
         );
         store.info.scoped_payload = vec![1, 2, 3];
+        // Two listing statuses and a pause (step 2), signatures and all, so
+        // the light read is compared on what it keeps of them.
+        for (i, availability) in [
+            harvest_common::listing::ListingAvailability::SoldOut,
+            harvest_common::listing::ListingAvailability::Available { quantity: Some(3) },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // One for a listing held, one for a listing not held (which the
+            // light read passes over, as decide never reads it).
+            let listing = if i == 0 {
+                store.listings.listings[0].listing.id.clone()
+            } else {
+                harvest_common::listing::ListingId([0x41; 32])
+            };
+            store.listing_statuses.records.insert(
+                harvest_common::store::Bytes32(listing.0),
+                harvest_common::listing::AuthorizedListingStatus {
+                    status: harvest_common::listing::ListingStatus {
+                        listing,
+                        revision: 7 + i as u64,
+                        availability,
+                    },
+                    scoped_payload: vec![0x33; 120],
+                    signature: vec![0x34; 64],
+                },
+            );
+        }
+        let owner = store.owner.expect("an owner");
+        store.pause.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::store_pause::AuthorizedStorePause {
+                pause: harvest_common::store_pause::StorePause::new(owner, 9, true),
+                scoped_payload: vec![0x35; 90],
+                signature: vec![0x36; 64],
+            },
+        );
         store
     }
 
@@ -7338,12 +7665,27 @@ mod tests {
             o.status_scoped_payload = None;
             o.status_signature = None;
         }
+        let mut listings = store.listings.clone();
+        for l in listings.listings.iter_mut() {
+            l.scoped_payload.clear();
+            l.signature.clear();
+            l.certificate_pem.clear();
+        }
+        let mut listing_statuses = store.listing_statuses.clone();
+        listing_statuses
+            .records
+            .retain(|slot, _| listings.listings.iter().any(|l| l.listing.id.0 == slot.0));
+        for s in listing_statuses.records.values_mut() {
+            s.scoped_payload.clear();
+            s.signature.clear();
+        }
         StoreStateV1 {
             owner: store.owner,
-            listings: store.listings.clone(),
+            listings,
             orders,
-            listing_statuses: store.listing_statuses.clone(),
+            listing_statuses,
             closed: store.closed.clone(),
+            pause: store.pause.clone(),
             ..Default::default()
         }
     }
@@ -7710,6 +8052,179 @@ mod tests {
         assert_eq!(open_now(&f, NOW), (None, true), "read open again");
         f.store = theirs;
         says(&mut f, Refusal::NotOurStore, "not ours, read by decide");
+    }
+
+    /// `store` with the seller's pause (step 2) at `revision`: paused or
+    /// resumed. Unsigned: the delegate reads what the store contract
+    /// verified.
+    fn with_pause(store: &StoreStateV1, revision: u64, paused: bool) -> StoreStateV1 {
+        let owner = store_sk().verifying_key();
+        let mut s = store.clone();
+        s.pause.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::store_pause::AuthorizedStorePause {
+                pause: harvest_common::store_pause::StorePause::new(owner, revision, paused),
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+            },
+        );
+        s
+    }
+
+    /// Step 2: a paused store answers every Buy now with "This store is
+    /// closed for now." and marks it seen, so none is invoiced when the
+    /// seller resumes; the status and heartbeat say Paused; after resuming,
+    /// a new Buy now is invoiced. Mutated red by leaving paused requests
+    /// undecided (the store-wide default), by not marking them seen, and by
+    /// dropping the pause from `store_refusal`.
+    #[test]
+    fn a_paused_store_declines_every_buy_now_and_none_is_invoiced_on_resume() {
+        let mut f = fixture();
+        let open = f.store.clone();
+        f.store = with_pause(&open, 5, true);
+        let (a, b) = (Buyer::new(41), Buyer::new(42));
+        let entries = [
+            a.request(&jam(), 1, 1, 12_000),
+            b.request(&jam(), 1, 1, 12_000),
+        ];
+        let decided = run(&mut f, &entries);
+        assert!(decided.orders.is_empty());
+        assert!(!decided.undecided, "answered, not left for later");
+        for buyer in [&a, &b] {
+            assert_eq!(
+                buyer.read(&decided.replies),
+                vec![MessageContent::Decline {
+                    reason: STORE_PAUSED_REASON.into()
+                }]
+            );
+        }
+        assert_eq!(
+            open_now(&f, NOW),
+            (Some(Refusal::StorePaused.explain()), false)
+        );
+        let record = f.record.clone();
+        let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert_eq!(
+            beat.heartbeat.reason,
+            Some(harvest_common::presence::NotTakingReason::Paused)
+        );
+
+        f.store = with_pause(&open, 6, false);
+        let again = run(&mut f, &entries);
+        assert!(
+            again.orders.is_empty(),
+            "nothing paused is invoiced on resume"
+        );
+        assert!(again.replies.is_empty());
+        assert_eq!(open_now(&f, NOW), (None, true), "taking orders again");
+        assert_eq!(
+            run(&mut f, &[Buyer::new(43).request(&jam(), 1, 1, 12_000)])
+                .orders
+                .len(),
+            1
+        );
+    }
+
+    /// The pause is checked before every other refusal: with the watch
+    /// lapsed (or the week since the seller last opened Harvest), a paused
+    /// store still answers each Buy now, which would otherwise wait,
+    /// undecided, to be invoiced on resume. A closure outranks a pause: a
+    /// closed and paused store is closed for good. A request older than
+    /// `REQUEST_MAX_AGE_MS` is marked seen without an answer. Mutated red by
+    /// checking the pause after `global_refusal`, and by dropping the age
+    /// check.
+    #[test]
+    fn a_pause_outranks_a_lapse_and_a_closure_outranks_a_pause() {
+        let mut f = fixture();
+        f.record.watched_until_ms = NOW;
+        f.store = with_pause(&f.store, 5, true);
+        let a = Buyer::new(44);
+        let stale = Buyer::new(45);
+        let decided = run(
+            &mut f,
+            &[
+                a.request(&jam(), 1, 1, 12_000),
+                stale.request_at(&jam(), 1, 1, 12_000, NOW - REQUEST_MAX_AGE_MS - 1_000),
+            ],
+        );
+        assert!(!decided.undecided);
+        assert_eq!(a.read(&decided.replies).len(), 1);
+        assert!(stale.read(&decided.replies).is_empty(), "too old to answer");
+        assert_eq!(decided.refused.len(), 2, "both seen");
+
+        let mut f = fixture();
+        let owner = store_sk().verifying_key();
+        let mut closed = with_pause(&f.store, 5, true);
+        closed.closed.records.insert(
+            harvest_common::store::Bytes32(owner.to_bytes()),
+            harvest_common::backing::AuthorizedClosure {
+                closure: harvest_common::backing::StoreClosure { store: owner },
+                scoped_payload: Vec::new(),
+                signature: Vec::new(),
+            },
+        );
+        f.store = closed;
+        let entry = Buyer::new(46).request(&jam(), 1, 1, 12_000);
+        let decided = run(&mut f, std::slice::from_ref(&entry));
+        assert_eq!(
+            decided.refused,
+            vec![(entry_digest(&entry), Refusal::StoreClosed)]
+        );
+        let record = f.record.clone();
+        let (beat, _) = heartbeat(&mut f.secrets, &record, NOW, true).unwrap();
+        assert_eq!(
+            beat.heartbeat.reason,
+            Some(harvest_common::presence::NotTakingReason::ClosedForGood)
+        );
+    }
+
+    /// A store notification that pauses or resumes the store sends a
+    /// heartbeat at once (buyers would otherwise read the old answer until
+    /// the next wake-up), and one that changes nothing the heartbeat says
+    /// sends none. Mutated red by not sending it, and by sending one on
+    /// every notification.
+    #[test]
+    fn pausing_or_resuming_tells_buyers_at_once() {
+        let mut f = fixture();
+        let id: [u8; 32] = f.record.arm.store_contract_id.clone().try_into().unwrap();
+        let presence = ContractInstanceId::new(f.record.arm.presence_contract_id.unwrap());
+        let beats = |out: &[OutboundDelegateMsg]| -> Vec<harvest_common::presence::Heartbeat> {
+            out.iter()
+                .filter_map(|m| match m {
+                    OutboundDelegateMsg::UpdateContractRequest(u) if u.contract_id == presence => {
+                        match &u.update {
+                            UpdateData::Delta(d) => {
+                                from_cbor::<harvest_common::presence::SignedHeartbeat>(d.as_ref())
+                                    .ok()
+                                    .map(|s| s.heartbeat)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let notify = |f: &mut Fixture, store: &StoreStateV1| {
+            on_notification(&mut f.secrets, &id, &to_cbor(store).unwrap(), NOW).unwrap()
+        };
+        let open = f.store.clone();
+        // The first read of the store is a change too (nothing was noted).
+        notify(&mut f, &open);
+        let paused = notify(&mut f, &with_pause(&open, 5, true));
+        let said = beats(&paused);
+        assert_eq!(said.len(), 1, "paused: one heartbeat");
+        assert_eq!(
+            said[0].reason,
+            Some(harvest_common::presence::NotTakingReason::Paused)
+        );
+        assert!(
+            beats(&notify(&mut f, &with_pause(&open, 5, true))).is_empty(),
+            "nothing changed: none"
+        );
+        let resumed = beats(&notify(&mut f, &with_pause(&open, 6, false)));
+        assert_eq!(resumed.len(), 1, "resumed: one heartbeat");
+        assert!(resumed[0].taking_orders);
     }
 
     /// What buyers are told for each refusal (harvest#219): closed and not

@@ -295,19 +295,6 @@ pub struct AppState {
     /// [`AppState::on_buyer_conversations_recall_failed`].
     pub buyer_conversation_recall_failures: HashMap<Vec<u8>, u8>,
 
-    /// `ExportBuyerConversation` and `MarkConversationBackedUp` requests in
-    /// flight, as request id -> the store AND conversation THIS browser asked
-    /// about.
-    ///
-    /// One map for two families because both answer about a store and
-    /// neither can be outstanding for the same request id. The reason they
-    /// are correlated at all is the one stated on
-    /// [`Self::pending_conversation_recalls`]: this file says in three places
-    /// that an answer is filed where the QUESTION says it belongs, and a
-    /// principle followed in three places out of five is one the next reader
-    /// concludes is optional.
-    pub pending_conversation_backups: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
-
     /// The digests of entries this seller's browsers sent, per store KEY
     /// (it outlives a store contract's re-key), as `(conversation tag, entry
     /// digest)`, oldest first: what the harvest delegate keeps
@@ -372,13 +359,6 @@ pub struct AppState {
     /// says the record is gone, so a refused removal leaves the thread on
     /// screen rather than hiding a record that is still on disk.
     pub pending_conversation_forgets: std::collections::BTreeMap<u64, (Vec<u8>, [u8; 32])>,
-
-    /// The backup string the buyer asked for and has not dismissed, if any.
-    ///
-    /// Held here rather than in the component because it arrives
-    /// asynchronously, from a delegate answer, long after the click that
-    /// asked for it.
-    pub conversation_backup_on_screen: Option<ConversationBackup>,
 
     /// Request ids for the messaging requests above. A separate counter from
     /// `BitcoinState::next_request_id` because they are different request
@@ -826,6 +806,28 @@ pub struct AppState {
         (Vec<u8>, harvest_common::listing::ListingId),
         crate::listing_status_flow::SentStatus,
     >,
+    /// The highest pause or resume this session sent per store (step 2),
+    /// and whether it is still waiting for the store's state to show it.
+    /// See `crate::pause_flow`.
+    pub store_pause_sent: HashMap<Vec<u8>, crate::listing_status_flow::SentStatus>,
+    /// A purchases backup being assembled from the delegate's pages (step
+    /// 2; `crate::backup_flow`).
+    pub backup_export: Option<crate::backup_flow::BackupExport>,
+    /// The seller's own order books, by store key (step 2;
+    /// `crate::seller_book`).
+    pub seller_books: HashMap<[u8; 32], crate::seller_book::SellerBook>,
+    /// Orders this tab proved paid whose `Paid` record is past the store's
+    /// byte bound (`harvest_common::store::MAX_ORDER_BYTES`), so the
+    /// store keeps them unpaid: what the seller's views show for them,
+    /// rebuilt from the address claims each session.
+    pub paid_past_store_bound:
+        HashMap<harvest_common::payment::OrderId, harvest_common::payment::AuthorizedOrder>,
+    /// A finished backup file, waiting for the buyer to save it.
+    pub backup_file_ready: Option<crate::backup_flow::ReadyBackup>,
+    /// A restore being sent a chunk at a time.
+    pub backup_restore: Option<crate::backup_flow::BackupRestore>,
+    /// What the purchases backup last said, shown under its buttons.
+    pub backup_message: Option<String>,
 
     /// New listings on their way to the network, with the notice that says
     /// so, keyed by listing id (harvest#161). See
@@ -1216,9 +1218,19 @@ fn spawn_store_key_signature(request_id: u64, store_verifying_key: [u8; 32], pay
         };
         if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
             fail(format!("send for signing: {e}"));
+            return;
         }
+        gloo_timers::future::TimeoutFuture::new(STORE_KEY_SIGNATURE_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .store_key_signature_timed_out(request_id);
     });
 }
+
+/// How long a store-key signature may go unanswered before it is withdrawn
+/// ([`AppState::store_key_signature_timed_out`]). The delegate signs in
+/// well under a second; a minute is long past any honest wait.
+pub(crate) const STORE_KEY_SIGNATURE_TIMEOUT_MS: u32 = 60_000;
 
 /// The store key test fixtures register their stores under: a store this
 /// device can sign for (harvest#93). A test about a store made before
@@ -1655,6 +1667,12 @@ fn unverified_listings(
 }
 
 impl BrowsingStore {
+    /// Whether the seller has paused this store (step 2). A closed store is
+    /// closed, not paused.
+    pub fn paused(&self) -> bool {
+        !self.closed && self.pause.as_ref().is_some_and(|pause| pause.paused)
+    }
+
     /// Whether this store can take an order at all, whatever its presence:
     /// not closed for good, it publishes a key to seal a buyer's address to,
     /// and its backing identity verified (`seller_verifying_key` is `None`
@@ -1850,6 +1868,8 @@ pub enum PendingSignature {
     BackingAcceptance(Box<crate::backing_flow::PendingBacking>),
     /// A listing's availability, for the store key (harvest#70).
     ListingStatus(Box<crate::listing_status_flow::PendingListingStatus>),
+    /// The seller pausing or resuming the store, for the store key (step 2).
+    StorePause(Box<crate::pause_flow::PendingStorePause>),
     /// A buyer's Ghost Key vouching for one conversation, so their messages
     /// in it are shown to the seller (`crate::voucher_flow`).
     MessageVoucher(Box<crate::voucher_flow::PendingMessageVoucher>),
@@ -1881,6 +1901,7 @@ impl PendingSignature {
         match self {
             PendingSignature::Listing(pending) => harvest_common::to_cbor(&pending.listing),
             PendingSignature::ListingStatus(pending) => harvest_common::to_cbor(&pending.status),
+            PendingSignature::StorePause(pending) => harvest_common::to_cbor(&pending.pause),
             PendingSignature::StoreInfo(pending) => harvest_common::to_cbor(&pending.info),
             PendingSignature::Order(pending) => harvest_common::to_cbor(&pending.order),
             PendingSignature::Cancellation(pending) => pending.signed_bytes(),
@@ -1915,6 +1936,7 @@ impl PendingSignature {
         match self {
             PendingSignature::Listing(_)
             | PendingSignature::ListingStatus(_)
+            | PendingSignature::StorePause(_)
             | PendingSignature::StoreInfo(_)
             | PendingSignature::Order(_)
             | PendingSignature::Cancellation(_)
@@ -2956,6 +2978,9 @@ pub enum KeepStep {
     /// about. For a paid order the node never kept (3.3) this is the press
     /// that keeps it.
     Complaint,
+    /// Add the store's despatch to the kept copy (step 2), so the order
+    /// still reads as sent once the store's cap has dropped it.
+    Despatch,
 }
 
 impl KeepStep {
@@ -2965,6 +2990,7 @@ impl KeepStep {
             KeepStep::Keep => true,
             KeepStep::Paid => kept.order.status == harvest_common::payment::OrderStatus::Paid,
             KeepStep::Complaint => kept.complaint.is_some(),
+            KeepStep::Despatch => kept.despatch.is_some(),
         }
     }
 }
@@ -3106,6 +3132,8 @@ pub struct StoreListRow {
     /// taking orders (`presence_flow`), as opposed to closed for good or
     /// unable to take an order at all. Said "Closed right now" only then.
     pub closed_for_now: bool,
+    /// Closed because its seller paused it (step 2): "Closed for now".
+    pub paused: bool,
 }
 
 /// What a store is called on screen.
@@ -3259,6 +3287,10 @@ pub struct BrowsingStore {
     /// (`harvest_common::backing::StoreClosure`). Buyers cannot pay a closed
     /// store; see [`PaymentBlocker::StoreClosed`].
     pub closed: bool,
+    /// The seller's pause as the store last said it (step 2;
+    /// `harvest_common::store_pause`): the latest pause or resume. See
+    /// [`Self::paused`].
+    pub pause: Option<harvest_common::store_pause::StorePause>,
     /// Listings whose own certificate did not verify against this store.
     ///
     /// Keyed by [`harvest_common::listing::ListingId`] rather than by position,
@@ -3375,46 +3407,6 @@ pub enum NotArrived {
 /// what a buyer needs is to match one line against another.
 pub fn short_conversation_tag(tag: &[u8]) -> String {
     bs58::encode(tag).into_string().chars().take(8).collect()
-}
-
-/// One store's conversation secrets, in the form the buyer can save.
-///
-/// # What holding this means
-///
-/// It contains the secrets themselves, which is what lets it restore the
-/// conversation on another machine -- and what makes it worth exactly as much
-/// as the conversation it restores. Anyone holding it can read that
-/// conversation and, once a seller's reply carries a pre-signed statement,
-/// file the complaint it authorizes. The UI says that beside the string
-/// rather than in a tooltip.
-#[derive(Clone, PartialEq)]
-pub struct ConversationBackup {
-    pub store_contract_id: Vec<u8>,
-    /// Which conversation this string covers. One conversation, so the panel
-    /// shows it under that conversation and a buyer saving several can tell
-    /// them apart.
-    pub buyer_public_key: [u8; 32],
-    /// The pasteable string. Kept out of `Debug` for the same reason
-    /// `ConversationKeys` is: this is the one value in the app that must not
-    /// reach a console log a user pastes into a bug report.
-    backup: String,
-}
-
-impl ConversationBackup {
-    pub fn text(&self) -> &str {
-        &self.backup
-    }
-}
-
-/// Deliberately opaque. A `Debug` that printed this would put every
-/// conversation secret for a store into a browser console, and from there
-/// into any log a user pastes into a bug report -- the same reasoning as
-/// [`crate::messaging::ConversationKeys`], with more at stake, because this
-/// one is a complete portable copy.
-impl std::fmt::Debug for ConversationBackup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ConversationBackup(redacted)")
-    }
 }
 
 /// How many times a mailbox subscribe may fail to send before
@@ -4343,6 +4335,9 @@ impl AppState {
                             .is_some_and(|store| store.takes_orders())
                             && self.store_presence(id, now_ms).is_closed()
                     }),
+                    paused: id
+                        .as_ref()
+                        .is_some_and(|id| self.store_presence(id, now_ms).is_paused()),
                 }
             })
             .collect();
@@ -5479,6 +5474,12 @@ impl AppState {
                     let store = self.browsing_stores.entry(contract_id.clone()).or_default();
                     store.backing_state = backing_state;
                     store.closed = closed;
+                    store.pause = store_state
+                        .pause
+                        .records
+                        .values()
+                        .next()
+                        .map(|record| record.pause.clone());
                     store.owner = owner.map(|key| key.to_bytes());
                     store.unverified_listings = unverified_listings;
                     // `Some` even at version 0: `None` means "not loaded yet"
@@ -5568,6 +5569,9 @@ impl AppState {
                     // theirs now paid, before the seller can push it out
                     // (`docs/complaint-threat-model.md` sections 3.2, 3.3).
                     self.upgrade_kept_purchases();
+                    // And, for one of our own stores, keep in the seller's
+                    // own book what the store shows that it lacks (step 2).
+                    self.sync_seller_book(&contract_id);
 
                     // And ask the bridge to watch the payment address of any
                     // new order this seller issued. Nothing else tells the
@@ -6467,127 +6471,6 @@ impl AppState {
         }
     }
 
-    /// Ask the delegate for ONE conversation as a saveable string.
-    ///
-    /// One at a time, because a store-wide string is silently incomplete the
-    /// moment the next conversation is opened and nothing about the artefact
-    /// says so. See `docs/buyer-conversation-persistence.md`.
-    pub fn conversation_to_export(
-        &mut self,
-        store_contract_id: &[u8],
-        buyer_public_key: &[u8; 32],
-    ) -> harvest_common::HarvestDelegateRequest {
-        let request_id = self.next_messaging_request_id();
-        self.pending_conversation_backups
-            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
-        harvest_common::HarvestDelegateRequest::ExportBuyerConversation {
-            request_id,
-            store_contract_id: self.conversation_kept_under(store_contract_id, buyer_public_key),
-            buyer_public_key: *buyer_public_key,
-        }
-    }
-
-    /// [`Self::conversation_to_export`], dispatched.
-    pub fn export_conversation(&mut self, store_contract_id: &[u8], buyer_public_key: &[u8; 32]) {
-        let request = self.conversation_to_export(store_contract_id, buyer_public_key);
-        self.send_to_harvest_delegate("back up this conversation", &request);
-    }
-
-    /// Put a backup on screen, or say why there is none.
-    ///
-    /// It is held rather than shown-and-forgotten because the buyer has to
-    /// copy it somewhere, and a string that vanished on the next render would
-    /// be a backup they believe they have.
-    pub fn on_conversation_exported(&mut self, request_id: u64, result: Result<String, String>) {
-        // Filed under the conversation this browser asked about, and an
-        // answer nothing asked for is ignored. A backup is the strongest
-        // thing in this protocol -- putting one on screen under the wrong
-        // heading would invite the buyer to save it as that conversation's.
-        let Some((store_contract_id, buyer_public_key)) =
-            self.pending_conversation_backups.remove(&request_id)
-        else {
-            warn!("A backup arrived for request {request_id}, which nothing asked for");
-            return;
-        };
-        match result {
-            Ok(backup) => {
-                self.conversation_backup_on_screen = Some(ConversationBackup {
-                    store_contract_id,
-                    buyer_public_key,
-                    backup,
-                })
-            }
-            // Reported rather than logged: the buyer pressed a button and
-            // nothing appeared, and the reason is usually actionable ("this
-            // node does not hold that conversation").
-            Err(why) => {
-                warn!("Could not export this conversation: {why}");
-                self.notifications
-                    .push(format!("That backup could not be made: {why}"));
-            }
-        }
-    }
-
-    /// Take the buyer's word that they have saved THIS conversation's backup.
-    ///
-    /// One conversation, matching the export. Marking every conversation with
-    /// the store would clear the warning on ones the saved string does not
-    /// contain, which is the granularity form of silencing a warning about a
-    /// key nobody has a backup of.
-    pub fn conversation_to_mark_backed_up(
-        &mut self,
-        store_contract_id: &[u8],
-        buyer_public_key: &[u8; 32],
-    ) -> harvest_common::HarvestDelegateRequest {
-        let request_id = self.next_messaging_request_id();
-        self.pending_conversation_backups
-            .insert(request_id, (store_contract_id.to_vec(), *buyer_public_key));
-        harvest_common::HarvestDelegateRequest::MarkConversationBackedUp {
-            request_id,
-            store_contract_id: self.conversation_kept_under(store_contract_id, buyer_public_key),
-            buyer_public_key: *buyer_public_key,
-        }
-    }
-
-    /// [`Self::conversation_to_mark_backed_up`], dispatched.
-    pub fn mark_conversation_backed_up(
-        &mut self,
-        store_contract_id: &[u8],
-        buyer_public_key: &[u8; 32],
-    ) {
-        let request = self.conversation_to_mark_backed_up(store_contract_id, buyer_public_key);
-        self.send_to_harvest_delegate("record that you have saved this", &request);
-    }
-
-    /// Fold in what marking did, by asking the delegate rather than assuming.
-    ///
-    /// The delegate is the only thing that knows whether the record was
-    /// actually written; a refused write leaves the warning in place, which
-    /// is the safe direction and is exactly what a local guess would get
-    /// wrong. So this re-asks and lets the answer decide what the screen
-    /// says.
-    pub fn on_conversation_marked_backed_up(
-        &mut self,
-        request_id: u64,
-        result: Result<bool, String>,
-    ) {
-        let Some((store_contract_id, _)) = self.pending_conversation_backups.remove(&request_id)
-        else {
-            warn!("A backup marking arrived for request {request_id}, which nothing asked for");
-            return;
-        };
-        match result {
-            Ok(marked) => {
-                info!("conversation recorded as saved: {marked}");
-                self.re_recall_buyer_conversations(&store_contract_id);
-            }
-            Err(why) => self.notifications.push(format!(
-                "This node could not record that you have saved that backup, so it will keep \
-                 warning you about it: {why}"
-            )),
-        }
-    }
-
     /// Whether the harvest delegate keeps `digest` as an entry this side
     /// sent, in any conversation: the buyer's kept conversations' digests
     /// (`BuyerConversation::sent_digests`) and the seller's per store
@@ -6908,10 +6791,12 @@ impl AppState {
         }
     }
 
-    /// Hand a pasted backup to the delegate.
+    /// Hand a pasted per-conversation backup string to the delegate: one
+    /// saved before the one backup file, which the Backup page still
+    /// restores (`backup_flow`).
     ///
-    /// One string carries one conversation; a buyer restoring a machine
-    /// pastes several in a row, and nothing here is stateful between them.
+    /// One string carries one conversation, and nothing here is stateful
+    /// between them.
     pub fn conversation_to_import(
         &mut self,
         backup: String,
@@ -6920,12 +6805,6 @@ impl AppState {
             request_id: self.next_messaging_request_id(),
             backup: harvest_common::BackupString(backup),
         }
-    }
-
-    /// [`Self::conversation_to_import`], dispatched.
-    pub fn import_conversation(&mut self, backup: String) {
-        let request = self.conversation_to_import(backup);
-        self.send_to_harvest_delegate("restore this conversation", &request);
     }
 
     /// Fold in what a pasted backup did, and say it in full.
@@ -7499,10 +7378,33 @@ impl AppState {
         }
     }
 
-    /// What [`Self::upgrade_kept_purchases`] sends.
+    /// What [`Self::upgrade_kept_purchases`] sends: a paid copy for a kept
+    /// unpaid one this node can now prove paid, and the store's despatch
+    /// for a kept copy that lacks it (step 2).
     fn upgrades_due(&self) -> Vec<(KeepStep, harvest_common::delegate::PurchaseToKeep)> {
         use harvest_common::payment::OrderStatus;
-        self.kept_purchases
+        let despatches = self.kept_purchases.iter().filter_map(|kept| {
+            if kept.despatch.is_some() {
+                return None;
+            }
+            let despatch = self.browsing_stores.values().find_map(|store| {
+                (store.owner == Some(kept.store_key))
+                    .then(|| store.despatches.get(&kept.order.order.id).cloned())
+                    .flatten()
+            })?;
+            Some((
+                KeepStep::Despatch,
+                harvest_common::delegate::PurchaseToKeep {
+                    store_key: kept.store_key,
+                    conversation: kept.conversation,
+                    order: kept.order.clone(),
+                    complaint: None,
+                    despatch: Some(despatch),
+                },
+            ))
+        });
+        let paid = self
+            .kept_purchases
             .iter()
             .filter(|kept| kept.order.status == OrderStatus::AwaitingPayment)
             .filter_map(|kept| {
@@ -7514,10 +7416,11 @@ impl AppState {
                         conversation: kept.conversation,
                         order,
                         complaint: None,
+                        despatch: None,
                     },
                 ))
-            })
-            .collect()
+            });
+        paid.chain(despatches).collect()
     }
 
     /// The buyer pressed "Pay this order", or "Try again" after the node
@@ -7610,6 +7513,7 @@ impl AppState {
                 conversation: purchase.conversation,
                 order,
                 complaint: None,
+                despatch: None,
             },
         );
         Ok(())
@@ -7647,11 +7551,13 @@ impl AppState {
         store_contract_id: &[u8],
         fingerprint: &str,
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
-        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+        if !self.browsing_stores.contains_key(store_contract_id) {
             return Vec::new();
-        };
+        }
+        // The store's, and those only the seller's own book still keeps
+        // (step 2): a paid order the store's cap dropped is still owed.
         crate::components::my_store::orders_to_send(
-            &store.orders,
+            &self.seller_orders_with_book(store_contract_id),
             fingerprint,
             |o| {
                 let tip = self
@@ -7753,10 +7659,52 @@ impl AppState {
         store_contract_id: &[u8],
         orders: &[harvest_common::payment::AuthorizedOrder],
     ) -> Vec<SellerRequest> {
-        use crate::messaging::{Addressing, MailboxEntry, MessageContent};
         let Some(store) = self.browsing_stores.get(store_contract_id) else {
             return orders.iter().map(|_| SellerRequest::NotFound).collect();
         };
+        let requests = self.matched_requests(store_contract_id, store);
+        self.requests_for(store_contract_id, store, orders, requests)
+    }
+
+    /// The buyer's request each order of this store answers, as the
+    /// seller's own book keeps it (step 2, `crate::seller_book`), read from
+    /// the mailbox once.
+    pub(crate) fn seller_kept_requests(
+        &self,
+        store_contract_id: &[u8],
+    ) -> HashMap<harvest_common::payment::OrderId, harvest_common::delegate::KeptRequest> {
+        let Some(store) = self.browsing_stores.get(store_contract_id) else {
+            return HashMap::new();
+        };
+        let mut kept = HashMap::new();
+        for (id, _, total, request) in self.matched_requests(store_contract_id, store) {
+            let agrees = store
+                .orders
+                .iter()
+                .find(|o| o.order.id == id)
+                .is_some_and(|o| total.is_none_or(|total| total == o.order.amount_sats));
+            if agrees {
+                kept.entry(id).or_insert(request);
+            }
+        }
+        kept
+    }
+
+    /// Each readable request in this store's mailbox with the store order
+    /// it answers: as the seller's card shows it, the total a Buy now was
+    /// shown, and as the seller's book keeps it.
+    #[allow(clippy::type_complexity)]
+    fn matched_requests(
+        &self,
+        store_contract_id: &[u8],
+        store: &BrowsingStore,
+    ) -> Vec<(
+        harvest_common::payment::OrderId,
+        SellerOrderRequest,
+        Option<u64>,
+        harvest_common::delegate::KeptRequest,
+    )> {
+        use crate::messaging::{Addressing, MailboxEntry, MessageContent};
         let entries = self.mailbox_entries(store_contract_id);
         let index = crate::components::message_view::OrderIndex::new(&store.orders);
         // Each request read once, with the id of the order answering it
@@ -7766,11 +7714,7 @@ impl AppState {
         // agrees; a quote request is answered by the one order its binding,
         // listing tag, receipt key and time place it with
         // (`message_view::quote_order_answers`, review of #205 L1).
-        let requests: Vec<(
-            harvest_common::payment::OrderId,
-            SellerOrderRequest,
-            Option<u64>,
-        )> = entries
+        entries
             .iter()
             .filter_map(|entry| match entry {
                 MailboxEntry::Readable {
@@ -7831,25 +7775,50 @@ impl AppState {
                             quantity: *quantity,
                             shipping: shipping.clone(),
                             note: note.clone(),
-                            region,
+                            region: region.clone(),
                             choices: labelled_choices(
                                 listing.map(|l| l.choices.as_slice()).unwrap_or_default(),
                                 picks,
                             ),
                         },
                         total,
+                        harvest_common::delegate::KeptRequest {
+                            listing_id: listing_id.clone(),
+                            quantity: *quantity,
+                            shipping: shipping.clone(),
+                            note: note.clone(),
+                            region,
+                            choices: picks.to_vec(),
+                            conversation: tag,
+                        },
                     ))
                 }
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    /// [`Self::seller_order_requests`] over requests already matched.
+    #[allow(clippy::type_complexity)]
+    fn requests_for(
+        &self,
+        store_contract_id: &[u8],
+        store: &BrowsingStore,
+        orders: &[harvest_common::payment::AuthorizedOrder],
+        requests: Vec<(
+            harvest_common::payment::OrderId,
+            SellerOrderRequest,
+            Option<u64>,
+            harvest_common::delegate::KeptRequest,
+        )>,
+    ) -> Vec<SellerRequest> {
         // Grouped by the order each answers, once, so each order below reads
         // only its own requests (review round 4 of #205).
         let mut by_order: HashMap<
             harvest_common::payment::OrderId,
             Vec<(SellerOrderRequest, Option<u64>)>,
         > = HashMap::new();
-        for (id, request, total) in requests {
+        for (id, request, total, _) in requests {
             by_order.entry(id).or_default().push((request, total));
         }
         orders
@@ -7863,6 +7832,11 @@ impl AppState {
                     .filter(|(_, total)| total.is_none_or(|total| total == order.order.amount_sats))
                     .map(|(request, _)| request.clone())
                     .collect();
+                // Gone from the mailbox, or its order from the store: the
+                // seller's own book's copy (step 2).
+                if asked.is_empty() {
+                    asked.extend(self.book_request(store_contract_id, store, order));
+                }
                 if !retained {
                     for request in asked.iter_mut() {
                         request.shipping = crate::fulfilment::ADDRESS_HIDDEN.to_string();
@@ -8308,8 +8282,10 @@ impl AppState {
     ///
     /// An order whose status has already moved, and an order whose evidence
     /// does not carry the transition. The second is the one that matters:
-    /// `assemble_on_chain_proof` verifies before it returns, so a record this
-    /// produces is one the network accepts. Publishing `Paid` on evidence
+    /// `minimal_on_chain_proof` verifies before it returns, so a record this
+    /// produces is one the network accepts. And it is the minimal proof: the
+    /// store keeps a `Paid` on any other as its unpaid terms (step 2,
+    /// `harvest_common::store::as_kept`), so a padded one would never show. Publishing `Paid` on evidence
     /// that fails verification is a state every peer refuses, and on the
     /// buyer's screen that looks like the payment never registering.
     ///
@@ -8319,7 +8295,7 @@ impl AppState {
         &self,
         store_contract_id: &[u8],
     ) -> Vec<harvest_common::payment::AuthorizedOrder> {
-        use harvest_common::payment::{assemble_on_chain_proof, OrderStatus};
+        use harvest_common::payment::{minimal_on_chain_proof, OrderStatus};
 
         // Scoped to the orders this node may settle, which is the SAME set
         // the twin guard compares against -- see `orders_we_may_settle` for
@@ -8357,7 +8333,7 @@ impl AppState {
             // Declines for every ordinary reason -- nothing seen yet, not
             // deep enough, short of the amount -- which is the common case
             // and not worth a line anywhere.
-            let Ok(proof) = assemble_on_chain_proof(&order.order, &view.claims, tip) else {
+            let Ok(proof) = minimal_on_chain_proof(&order.order, &view.claims, tip) else {
                 continue;
             };
             let mut paid = order.clone();
@@ -8756,6 +8732,16 @@ impl AppState {
             .retain(|_, (store, _)| store.as_slice() != store_contract_id);
         let mut published = Vec::new();
         for settled in self.settled_orders(store_contract_id) {
+            // Past the store's byte bound for a `Paid` record (step 2): the
+            // store would keep it unpaid, so it is not sent there. This tab
+            // shows it paid, and the seller's own book keeps it paid.
+            if !harvest_common::store::within_order_cap(&settled) {
+                self.paid_past_store_bound
+                    .insert(settled.order.id.clone(), settled.clone());
+                let out = self.keep_paid_past_bound(store_contract_id, settled);
+                crate::backup_flow::send_all(out);
+                continue;
+            }
             if self.settlement_hold(&settled.order).is_some() {
                 // Already confirmed and sent: do not offer it again.
                 if self.settlements_submitted.contains(&settled.order.id) {
@@ -10927,7 +10913,6 @@ impl AppState {
     ) -> Result<(), String> {
         use harvest_common::payment::OrderStatus;
 
-        let store_key = self.signing_store_key(store_contract_id)?;
         let order = self
             .browsing_stores
             .get(store_contract_id)
@@ -10935,6 +10920,18 @@ impl AppState {
             .cloned()
             .ok_or("this invoice is not in the store as this device last read it")?;
         let settled = match order.status {
+            // Paid as this tab or the seller's own book knows, though the
+            // store keeps it unpaid (step 2: a payment past the store's byte
+            // bound for a `Paid` record).
+            OrderStatus::AwaitingPayment
+                if self.paid_past_store_bound.contains_key(order_id)
+                    || self
+                        .seller_book(store_contract_id)
+                        .and_then(|b| b.orders.iter().find(|r| r.order.order.id == *order_id))
+                        .is_some_and(|r| r.order.status == OrderStatus::Paid) =>
+            {
+                Some("already paid")
+            }
             OrderStatus::AwaitingPayment => None,
             OrderStatus::Paid => Some("already paid"),
             OrderStatus::Cancelled => Some("already cancelled"),
@@ -10957,6 +10954,7 @@ impl AppState {
         {
             return Err("this invoice is already being cancelled".to_string());
         }
+        let store_key = self.signing_store_key(store_contract_id)?;
         info!("Cancelling invoice {}", order_id.short());
         self.request_store_key_signature(
             PendingSignature::Cancellation(Box::new(PendingCancellation {
@@ -11038,15 +11036,13 @@ impl AppState {
         use harvest_common::payment::OrderStatus;
 
         let store_key = self.signing_store_key(store_contract_id)?;
-        let store = self
-            .browsing_stores
-            .get(store_contract_id)
-            .ok_or("this order is not in the store as this device last read it")?;
-        let order = store
-            .orders
-            .iter()
+        // The store's copy, or the seller's own book's for an order the
+        // store no longer holds (step 2): sent all the same, recorded in the
+        // book only.
+        let order = self
+            .seller_orders_with_book(store_contract_id)
+            .into_iter()
             .find(|o| &o.order.id == order_id)
-            .cloned()
             .ok_or("this order is not in the store as this device last read it")?;
         if order.status != OrderStatus::Paid {
             return Err(format!(
@@ -11296,6 +11292,14 @@ impl AppState {
             &pending.store_contract_id,
             &despatch.despatch.order_id,
         ));
+        // An order the store no longer holds: the store would drop the
+        // despatch, so it goes to the seller's own book only (step 2).
+        if self.order_only_in_book(&pending.store_contract_id, &despatch.despatch.order_id) {
+            let out =
+                self.keep_despatch_off_store(&pending.store_contract_id, pending.order, despatch);
+            crate::backup_flow::send_all(out);
+            return;
+        }
         #[cfg(target_arch = "wasm32")]
         {
             let store_contract_id = pending.store_contract_id;
@@ -11859,6 +11863,7 @@ impl AppState {
                 conversation: parts.conversation,
                 order: complaint.order.clone(),
                 complaint: Some(harvest_common::delegate::KeptComplaint::of(&complaint)),
+                despatch: None,
             },
         );
         Ok(())
@@ -11908,12 +11913,30 @@ impl AppState {
     ) -> Option<harvest_common::fulfilment::AuthorizedDespatch> {
         let mut stores: Vec<(&Vec<u8>, &BrowsingStore)> = self.browsing_stores.iter().collect();
         stores.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        stores.into_iter().find_map(|(_, store)| {
-            let despatch = store.despatches.get(&order.order.id)?;
-            let owner = ed25519_dalek::VerifyingKey::from_bytes(&store.owner?).ok()?;
-            order.verify_terms(&owner).ok()?;
-            Some(despatch.clone())
-        })
+        stores
+            .into_iter()
+            .find_map(|(_, store)| {
+                let despatch = store.despatches.get(&order.order.id)?;
+                let owner = ed25519_dalek::VerifyingKey::from_bytes(&store.owner?).ok()?;
+                order.verify_terms(&owner).ok()?;
+                Some(despatch.clone())
+            })
+            // Gone from the store with its order (step 2): the seller's own
+            // book's, then the buyer's kept copy's, each checked against the
+            // store key that signed the order.
+            .or_else(|| self.book_despatch(order))
+            .or_else(|| {
+                self.kept_purchases.iter().find_map(|kept| {
+                    if kept.order.order.id != order.order.id {
+                        return None;
+                    }
+                    let despatch = kept.despatch.clone()?;
+                    let owner = ed25519_dalek::VerifyingKey::from_bytes(&kept.store_key).ok()?;
+                    order.verify_terms(&owner).ok()?;
+                    despatch.verify(&owner).ok()?;
+                    Some(despatch)
+                })
+            })
     }
 
     /// Whether a cancellation of `order_id` in this store is waiting on its
@@ -12011,6 +12034,23 @@ impl AppState {
         Ok(())
     }
 
+    /// The Harvest delegate has not answered `request_id` within
+    /// [`STORE_KEY_SIGNATURE_TIMEOUT_MS`]: withdraw it as refused, so the
+    /// control that asked is offered again and the seller is told it was not
+    /// saved. Step 2's screenshots found a Resume held at "Saving" for minutes:
+    /// the delegate's queue was full, and the node's answer was an error that
+    /// carries no request id, so nothing ever withdrew the request. Answered
+    /// already, it is a no-op; a signature arriving after it is matched to
+    /// nothing and dropped.
+    pub(crate) fn store_key_signature_timed_out(&mut self, request_id: u64) {
+        if self.pending_store_key_requests.contains_key(&request_id) {
+            self.store_key_signature_failed(
+                request_id,
+                "your Harvest delegate did not answer in time",
+            );
+        }
+    }
+
     /// The Harvest delegate did not sign what `request_id` asked for, or the
     /// request never reached it: withdraw that entry and say so.
     ///
@@ -12032,6 +12072,7 @@ impl AppState {
         let what = match &withdrawn {
             Some(PendingSignature::Listing(_)) => "your listing",
             Some(PendingSignature::ListingStatus(_)) => "the change to your listing",
+            Some(PendingSignature::StorePause(_)) => "pausing or resuming your store",
             Some(PendingSignature::StoreInfo(_)) => "your store's details",
             Some(PendingSignature::Order(_)) => "the invoice",
             Some(PendingSignature::Cancellation(_)) => "the cancellation",
@@ -12072,6 +12113,11 @@ impl AppState {
                 "{} ({reason})",
                 crate::listing_status_flow::LISTING_STATUS_NOT_SAVED
             ));
+            return;
+        }
+        if matches!(withdrawn, Some(PendingSignature::StorePause(_))) {
+            self.notifications
+                .push(format!("{} ({reason})", crate::pause_flow::PAUSE_NOT_SAVED));
             return;
         }
         self.notifications.push(format!(
@@ -13568,17 +13614,9 @@ impl AppState {
                 self.on_buyer_conversation_forgotten(request_id, result)
             }
 
-            HarvestDelegateResponse::BuyerConversationExported {
-                request_id, result, ..
-            } => self.on_conversation_exported(request_id, result.map(|backup| backup.0)),
-
             HarvestDelegateResponse::BuyerConversationImported { result, .. } => {
                 self.on_conversation_imported(result)
             }
-
-            HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
-                request_id, result, ..
-            } => self.on_conversation_marked_backed_up(request_id, result),
 
             // Fire-and-forget notes: a refusal costs only a label after a
             // reload, so it is logged, not shown.
@@ -13597,6 +13635,37 @@ impl AppState {
                 store_key,
                 result,
             } => self.on_seller_sent(request_id, store_key, result),
+            HarvestDelegateResponse::PurchasesBackup { request_id, result } => {
+                let next = self.on_purchases_backup(request_id, result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::PurchasesBackupImported { request_id, result } => {
+                let next = self.on_purchases_backup_imported(request_id, result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::BackedUpMarked { result, .. } => {
+                let next = self.on_backed_up_marked(result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::SellerOrders {
+                request_id,
+                store_key,
+                result,
+            } => {
+                let next = self.on_seller_orders(request_id, store_key, result);
+                crate::backup_flow::send_all(next);
+            }
+            HarvestDelegateResponse::SellerOrdersKept {
+                request_id,
+                store_key,
+                result,
+            } => {
+                let mut next = self
+                    .on_restored_seller_orders(request_id, &result)
+                    .unwrap_or_default();
+                next.extend(self.on_seller_orders_kept(request_id, store_key, result));
+                crate::backup_flow::send_all(next);
+            }
 
             HarvestDelegateResponse::StoreRegistered {
                 ghostkey_fingerprint,
@@ -13744,8 +13813,12 @@ impl AppState {
                 // answer once the delegate has refused (#98 review, L1): an
                 // Error carries no request id, and the only request a
                 // creation has outstanding with this delegate at that stage
-                // is that one.
-                if self
+                // is that one. A purchases backup or restore waiting on its
+                // answer ends the same way (round 1 of step 2's review).
+                if self.backup_refused(&message) {
+                    self.notifications
+                        .push(format!("Delegate error: {message}"));
+                } else if self
                     .pending_store_creation
                     .as_ref()
                     .is_some_and(|p| p.store_verifying_key.is_none())
@@ -13958,6 +14031,9 @@ impl AppState {
             }
             Some(PendingSignature::ListingStatus(pending)) => {
                 self.on_listing_status_signed(*pending, scoped_payload, signature);
+            }
+            Some(PendingSignature::StorePause(pending)) => {
+                self.on_store_pause_signed(*pending, scoped_payload, signature);
             }
             Some(PendingSignature::Retirement(pending)) => {
                 self.on_retirement_signed(*pending, scoped_payload, signature);
@@ -18543,6 +18619,7 @@ mod tests {
                 PendingSignature::StoreInfo(store_info) => Some(&store_info.info),
                 PendingSignature::Listing(_)
                 | PendingSignature::ListingStatus(_)
+                | PendingSignature::StorePause(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -19282,6 +19359,7 @@ mod tests {
                 PendingSignature::StoreInfo(info) => Some(info.info.version),
                 PendingSignature::Listing(_)
                 | PendingSignature::ListingStatus(_)
+                | PendingSignature::StorePause(_)
                 | PendingSignature::Order(_)
                 | PendingSignature::Cancellation(_)
                 | PendingSignature::Despatch(_)
@@ -24511,15 +24589,6 @@ mod buyer_backup_tests {
         }
     }
 
-    /// The request id of a question this state actually asked.
-    fn asked(request: &HarvestDelegateRequest) -> u64 {
-        match request {
-            HarvestDelegateRequest::ExportBuyerConversation { request_id, .. }
-            | HarvestDelegateRequest::MarkConversationBackedUp { request_id, .. } => *request_id,
-            other => panic!("expected a backup request, got {other:?}"),
-        }
-    }
-
     /// Answer the recall this state actually issued.
     fn deliver_recall(state: &mut AppState, conversations: Vec<RecalledConversation>) {
         match state.buyer_conversations_to_recall(STORE) {
@@ -24831,130 +24900,12 @@ mod buyer_backup_tests {
         });
     }
 
-    /// **A backup the buyer asked for reaches the screen, under the
-    /// conversation they asked about.**
-    ///
-    /// It arrives from a delegate answer long after the click, so it has to
-    /// be held somewhere the component can render from -- and one string
-    /// covers ONE conversation, so it must not appear under another.
-    #[test]
-    fn an_exported_backup_reaches_the_screen_under_its_own_conversation() {
-        let mut state = buyer_state();
-        let tag = recalled(5, false).buyer_public_key;
-        let request = state.conversation_to_export(STORE, &tag);
-        match &request {
-            HarvestDelegateRequest::ExportBuyerConversation {
-                store_contract_id,
-                buyer_public_key,
-                ..
-            } => {
-                assert_eq!(store_contract_id, STORE);
-                assert_eq!(buyer_public_key, &tag);
-            }
-            other => panic!("expected ExportBuyerConversation, got {other:?}"),
-        }
-
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
-            request_id: asked(&request),
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: tag,
-            result: Ok(harvest_common::BackupString(
-                "harvest-conv-backup-v2:abc".to_string(),
-            )),
-        });
-
-        let on_screen = state
-            .conversation_backup_on_screen
-            .as_ref()
-            .expect("the backup must reach the screen, or the buyer cannot save it");
-        assert_eq!(on_screen.text(), "harvest-conv-backup-v2:abc");
-        assert_eq!(on_screen.store_contract_id, STORE);
-        assert_eq!(
-            on_screen.buyer_public_key, tag,
-            "a backup shown under the wrong conversation invites the buyer to save it as that \
-             conversation's"
-        );
-    }
-
-    /// **A backup does not print itself.**
-    ///
-    /// It is a portable copy of one conversation. A `Debug` that printed it
-    /// would put that into any console log a user pastes into a bug report.
-    #[test]
-    fn a_backup_on_screen_does_not_print_itself() {
-        let mut state = buyer_state();
-        let tag = recalled(6, false).buyer_public_key;
-        let request_id = asked(&state.conversation_to_export(STORE, &tag));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
-            request_id,
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: tag,
-            result: Ok(harvest_common::BackupString(
-                "harvest-conv-backup-v2:SECRETMATERIAL".to_string(),
-            )),
-        });
-        let printed = format!("{:?}", state.conversation_backup_on_screen);
-        assert!(
-            !printed.contains("SECRETMATERIAL"),
-            "the backup printed itself: {printed}"
-        );
-    }
-
-    /// A refused export is said out loud rather than leaving a button that
-    /// appears to do nothing.
-    #[test]
-    fn a_refused_export_is_reported() {
-        let mut state = buyer_state();
-        let tag = recalled(7, false).buyer_public_key;
-        let request_id = asked(&state.conversation_to_export(STORE, &tag));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
-            request_id,
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: tag,
-            result: Err("this node does not hold that conversation".to_string()),
-        });
-        assert!(state.conversation_backup_on_screen.is_none());
-        assert!(state
-            .notifications
-            .last()
-            .expect("a refusal must reach the buyer")
-            .contains("does not hold"));
-    }
-
-    /// **Marking names ONE conversation.**
-    ///
-    /// One saved string covers one conversation, so a request that named a
-    /// set would clear the warning on conversations the string does not
-    /// contain -- the granularity form of silencing a warning about a key
-    /// nobody has a backup of.
-    #[test]
-    fn marking_names_only_the_conversation_that_was_saved() {
-        let mut state = buyer_state();
-        let saved = recalled(5, false);
-        let other = recalled(6, false);
-        deliver_recall(&mut state, vec![saved.clone(), other.clone()]);
-
-        match state.conversation_to_mark_backed_up(STORE, &saved.buyer_public_key) {
-            HarvestDelegateRequest::MarkConversationBackedUp {
-                store_contract_id,
-                buyer_public_key,
-                ..
-            } => {
-                assert_eq!(store_contract_id, STORE);
-                assert_eq!(buyer_public_key, saved.buyer_public_key);
-                assert_ne!(buyer_public_key, other.buyer_public_key);
-            }
-            other => panic!("expected MarkConversationBackedUp, got {other:?}"),
-        }
-    }
-
     /// **A recall refreshes the warning on a conversation this browser
     /// already holds.**
     ///
-    /// The delegate is the source of truth for whether a backup exists, and
-    /// marking is confirmed by asking it again rather than by assuming
-    /// locally. A recall that only ADDED conversations would leave the
-    /// warning on screen after the buyer had cleared it.
+    /// The delegate is the source of truth for whether a backup exists. A
+    /// recall that only ADDED conversations would leave the warning on
+    /// screen after a saved backup had cleared it.
     #[test]
     fn a_recall_refreshes_whether_a_held_conversation_is_backed_up() {
         let mut state = buyer_state();
@@ -24962,16 +24913,8 @@ mod buyer_backup_tests {
         deliver_recall(&mut state, vec![conversation.clone()]);
         assert!(!state.browsing_stores[STORE].conversations[0].backed_up);
 
-        // The whole marking round trip: the buyer says they saved it, the
-        // delegate confirms, and the app asks again rather than assuming.
-        let request_id =
-            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
-            request_id,
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: conversation.buyer_public_key,
-            result: Ok(true),
-        });
+        // Marked by a saved backup file in the delegate; asked again.
+        state.re_recall_buyer_conversations(STORE);
         answer_outstanding_recall(
             &mut state,
             vec![RecalledConversation {
@@ -24988,32 +24931,6 @@ mod buyer_backup_tests {
         assert!(
             state.browsing_stores[STORE].conversations[0].backed_up,
             "the warning stayed after the buyer said they had saved it"
-        );
-    }
-
-    /// Marking asks the delegate again afterwards, rather than guessing what
-    /// it did.
-    #[test]
-    fn marking_asks_the_delegate_again_rather_than_assuming() {
-        let mut state = buyer_state();
-        let conversation = recalled(8, false);
-        deliver_recall(&mut state, vec![conversation.clone()]);
-        assert!(
-            state.buyer_conversations_recalled.contains(STORE),
-            "precondition: this store has been asked about"
-        );
-
-        let request_id =
-            asked(&state.conversation_to_mark_backed_up(STORE, &conversation.buyer_public_key));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationMarkedBackedUp {
-            request_id,
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: conversation.buyer_public_key,
-            result: Ok(true),
-        });
-        assert!(
-            !state.pending_conversation_recalls.is_empty(),
-            "nothing re-asked the delegate, so the screen still shows what it showed before"
         );
     }
 
@@ -25123,57 +25040,6 @@ mod buyer_backup_tests {
         assert!(
             notice.contains("already"),
             "the buyer must be told nothing was wrong: {notice}"
-        );
-    }
-
-    /// **A backup nothing asked for does not reach the screen.**
-    ///
-    /// Where it belongs is decided by the question this browser asked and not
-    /// by what the answer says about itself.
-    #[test]
-    fn a_backup_nothing_asked_for_does_not_reach_the_screen() {
-        let mut state = buyer_state();
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
-            request_id: 4321,
-            store_contract_id: STORE.to_vec(),
-            buyer_public_key: [9u8; 32],
-            result: Ok(harvest_common::BackupString(
-                "harvest-conv-backup-v2:abc".to_string(),
-            )),
-        });
-        assert!(
-            state.conversation_backup_on_screen.is_none(),
-            "a backup nothing asked for was put on screen"
-        );
-    }
-
-    /// And it is filed under the conversation that was asked about, not the
-    /// one the answer names.
-    #[test]
-    fn a_backup_is_filed_under_the_conversation_that_was_asked_about() {
-        const ANOTHER_STORE: &[u8] = &[2u8; 32];
-        let mut state = buyer_state();
-        let asked_about = recalled(13, false).buyer_public_key;
-        let request_id = asked(&state.conversation_to_export(STORE, &asked_about));
-        state.on_delegate_response(HarvestDelegateResponse::BuyerConversationExported {
-            request_id,
-            store_contract_id: ANOTHER_STORE.to_vec(),
-            buyer_public_key: [0xFF; 32],
-            result: Ok(harvest_common::BackupString(
-                "harvest-conv-backup-v2:abc".to_string(),
-            )),
-        });
-        let on_screen = state
-            .conversation_backup_on_screen
-            .as_ref()
-            .expect("on screen");
-        assert_eq!(
-            on_screen.store_contract_id, STORE,
-            "a backup was filed under a store this browser never asked about"
-        );
-        assert_eq!(
-            on_screen.buyer_public_key, asked_about,
-            "a backup was filed under a conversation this browser never asked about"
         );
     }
 }
@@ -26273,6 +26139,34 @@ mod buy_flow_tests {
         assert_eq!(hidden.shipping, crate::fulfilment::ADDRESS_HIDDEN);
         assert_eq!(hidden.note, "");
         assert_eq!(hidden.quantity, 2, "what to send stays");
+        // Nor does the seller's tab give its own book an address the app
+        // hides (step 2, review round 2: the book drops it once the window
+        // closes, and the tab put it back). Red with the filter dropped.
+        let owner = state.browsing_stores[STORE].owner.expect("owned");
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let notes = state.seller_book_notes(STORE);
+        let note = notes
+            .iter()
+            .find(|n| n.order.order.id == order.order.id)
+            .expect("the paid order is offered to the book");
+        assert_eq!(note.request, None, "without the hidden address");
+        state
+            .bitcoin
+            .tips
+            .insert(BitcoinNetwork::Signet, tip_at(TIP_HEIGHT));
+        assert!(
+            state
+                .seller_book_notes(STORE)
+                .iter()
+                .any(|n| n.order.order.id == order.order.id && n.request.is_some()),
+            "inside the window it goes with the request"
+        );
         state.bitcoin.tips.remove(&BitcoinNetwork::Signet);
         let SellerRequest::Found(shown) = state.seller_order_request(STORE, &order) else {
             panic!("found");
@@ -27706,6 +27600,19 @@ mod buy_flow_tests {
         Vec<freenet_bitcoin_common::SignedClaim>,
         freenet_bitcoin_common::SignedTipEntry,
     ) {
+        a_paid_order_with_fillers(edit, 0)
+    }
+
+    /// [`a_paid_order_where`] whose payment's transaction also pays
+    /// `fillers` outputs: as large as a big honest transaction makes it.
+    fn a_paid_order_with_fillers(
+        edit: impl FnOnce(&mut Order),
+        fillers: usize,
+    ) -> (
+        AuthorizedOrder,
+        Vec<freenet_bitcoin_common::SignedClaim>,
+        freenet_bitcoin_common::SignedTipEntry,
+    ) {
         use freenet_bitcoin_common::spv::testing::payment_proof;
         use freenet_bitcoin_common::{
             BlockHash, ClaimBody, SignedClaim, SignedTipEntry, TipEntryBody,
@@ -27733,8 +27640,29 @@ mod buy_flow_tests {
         };
 
         let confirmed_at = TIP_HEIGHT - 1;
-        let (spv, txid, block_hash) =
-            payment_proof(&order.order.payment_script_pubkey, paid_sats, 1, [7u8; 32]);
+        let (spv, txid, block_hash) = if fillers == 0 {
+            payment_proof(&order.order.payment_script_pubkey, paid_sats, 1, [7u8; 32])
+        } else {
+            // A big honest transaction: the payment, then `fillers` outputs.
+            use freenet_bitcoin_common::spv::testing::{build_tx, mine, sha256d_pub, EASIEST_BITS};
+            let mut outputs = vec![(paid_sats, order.order.payment_script_pubkey.clone())];
+            outputs.extend((0..fillers).map(|_| (546, vec![0x6a; 250])));
+            let raw_tx = build_tx(&outputs);
+            let txid = freenet_bitcoin_common::Txid(sha256d_pub(&raw_tx));
+            let header = mine([7u8; 32], txid.0, 1_700_000_000, EASIEST_BITS);
+            let block_hash = BlockHash(sha256d_pub(&header.0));
+            (
+                freenet_bitcoin_common::spv::SpvProof {
+                    raw_tx,
+                    merkle_branch: Vec::new(),
+                    tx_index: 0,
+                    header,
+                    following_headers: Vec::new(),
+                },
+                txid,
+                block_hash,
+            )
+        };
         let claim = SignedClaim::sign(
             &settling_bridge(),
             &ClaimBody {
@@ -27866,6 +27794,39 @@ mod buy_flow_tests {
             .expect("a settled order must verify as Paid");
     }
 
+    /// Step 2: the settlement publishes the minimal proof, the one the store
+    /// keeps a `Paid` on, even when the address view also holds a scan
+    /// watermark (which the view always puts first). With the whole view as
+    /// evidence, the store would keep the order unpaid. Mutated red by
+    /// assembling the proof from every claim the view holds.
+    #[test]
+    fn a_settlement_carries_the_minimal_proof() {
+        use freenet_bitcoin_common::{BlockAnchor, BlockHash, Claim, ClaimBody, SignedClaim};
+        let (order, claims, tip) = a_paid_order();
+        let watermark = SignedClaim::sign(
+            &settling_bridge(),
+            &ClaimBody {
+                script_id: order.order.bitcoin_params().script_id(),
+                network: order.order.network,
+                as_of: BlockAnchor {
+                    height: TIP_HEIGHT,
+                    hash: BlockHash([5u8; 32]),
+                },
+                claim: Claim::ScannedTo,
+            },
+        )
+        .expect("sign the watermark");
+        let mut view = vec![watermark];
+        view.extend(claims);
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, view, tip);
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        let proof = settled.payment_proof.as_ref().expect("a proof");
+        harvest_common::payment::verify_minimal_proof(&settled.order, proof)
+            .expect("the minimal proof");
+        assert_eq!(harvest_common::store::as_kept(settled.clone()), settled);
+    }
+
     /// This seller's store, loaded, holding a provable payment for `order`,
     /// plus `twin` (if any) on the same address with the given status.
     fn seller_holding_a_paid_order(
@@ -27899,6 +27860,608 @@ mod buy_flow_tests {
         }
         state.refresh_same_address_orders();
         (state, order)
+    }
+
+    /// Step 2 (the overseer, 2026-10-09): an honest payment past the store's
+    /// byte bound for a `Paid` record still reaches the seller as paid. The
+    /// settlement is not sent to the store (which would keep it unpaid); the
+    /// seller's views show the paid copy, the seller's own book is asked to
+    /// keep it paid, and Cancel is refused. Mutated red by publishing it as
+    /// any other, and by offering Cancel.
+    #[test]
+    fn a_payment_past_the_store_bound_still_reads_paid_to_the_seller() {
+        let (order, claims, tip) = a_paid_order_with_fillers(|_| {}, 80);
+        let (mut state, _) = buyer_after_acceptance(&order);
+        give_the_node_the_chain(&mut state, &order, claims, tip);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        super::invoice_tests::store_state_arrived(&mut state, STORE);
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
+        let settled = state.settled_orders(STORE).pop().expect("settles");
+        assert!(
+            !harvest_common::store::within_order_cap(&settled),
+            "past the bound"
+        );
+        harvest_common::payment::verify_minimal_proof(
+            &settled.order,
+            settled.payment_proof.as_ref().unwrap(),
+        )
+        .expect("an honest, minimal proof");
+
+        crate::backup_flow::SENT.with(|sent| sent.borrow_mut().clear());
+        assert!(
+            state.publish_settled_orders(STORE).is_empty(),
+            "not sent to the store"
+        );
+        assert!(
+            crate::backup_flow::SENT.with(|sent| sent.borrow().iter().any(|r| matches!(
+                r,
+                harvest_common::HarvestDelegateRequest::KeepSellerOrders { orders, .. }
+                    if orders.iter().any(|o| o.order.order.id == order.order.id
+                        && o.order.status == OrderStatus::Paid)
+            ))),
+            "the seller's own book is asked to keep it paid"
+        );
+        let shown = state.seller_orders_with_book(STORE);
+        assert!(shown
+            .iter()
+            .any(|o| o.order.id == order.order.id && o.status == OrderStatus::Paid));
+        assert!(state
+            .cancel_invoice(STORE, &order.order.id)
+            .unwrap_err()
+            .contains("already paid"));
+    }
+
+    /// Step 2, the seller's own book (`crate::seller_book`): a paid order
+    /// the store shows and the book lacks is noted for it, and nothing once
+    /// the book holds it; once the store's cap drops it, it is still on the
+    /// to-send list, its request read from the book and its despatch too.
+    /// Mutated red by reading the store alone for the to-send list, by not
+    /// falling back to the book's request, and by noting what the book
+    /// already holds.
+    #[test]
+    fn the_sellers_book_keeps_what_the_store_shows_and_fills_in_what_it_dropped() {
+        use harvest_common::delegate::{KeptRequest, SellerKeptOrder};
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.owner = Some(owner);
+            store.orders.retain(|o| o.order.id != paid.order.id);
+            store.orders.push(paid.clone());
+        }
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let notes = state.seller_book_notes(STORE);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.order.order.id == paid.order.id && n.order.status == OrderStatus::Paid),
+            "{notes:?}"
+        );
+        let despatch = {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            };
+            let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+                &seller_signing_key(),
+                harvest_common::to_cbor(&despatch).unwrap(),
+            )
+            .unwrap();
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        };
+        state.seller_books.get_mut(&owner).unwrap().orders = vec![SellerKeptOrder {
+            order: paid.clone(),
+            request: Some(KeptRequest {
+                listing_id: harvest_common::listing::ListingId([4; 32]),
+                quantity: 2,
+                shipping: "7 Book Lane".into(),
+                note: String::new(),
+                region: None,
+                choices: Vec::new(),
+                conversation: [9; 32],
+            }),
+            despatch: None,
+            paid_height: None,
+            sent_off_store: false,
+            seal: None,
+        }];
+        assert!(
+            state
+                .seller_book_notes(STORE)
+                .iter()
+                .all(|n| n.order.order.id != paid.order.id),
+            "nothing the book holds as fully"
+        );
+
+        // The store's cap drops it.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .retain(|o| o.order.id != paid.order.id);
+        assert!(state.order_only_in_book(STORE, &paid.order.id));
+        assert!(state
+            .seller_orders_to_send(STORE, "seller-fp")
+            .iter()
+            .any(|o| o.order.id == paid.order.id));
+        match state.seller_order_request(STORE, &paid) {
+            SellerRequest::Found(request) => {
+                assert_eq!(request.shipping, "7 Book Lane");
+                assert_eq!(request.quantity, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(state.despatch_of(&paid).is_none());
+        state.seller_books.get_mut(&owner).unwrap().orders[0].despatch = Some(despatch.clone());
+        assert_eq!(state.despatch_of(&paid), Some(despatch));
+        assert!(
+            !state
+                .seller_orders_to_send(STORE, "seller-fp")
+                .iter()
+                .any(|o| o.order.id == paid.order.id),
+            "sent"
+        );
+    }
+
+    /// Review round 2 of step 2 (skeptical, code-first): the seller's tab
+    /// offers its book each note once a session, and never one the book
+    /// would not keep as given. A sent order the book holds without its
+    /// proof (as it keeps every sent one) is not offered the store's proof;
+    /// a refused keep is not read again for; what was offered is not
+    /// offered again however the book answers. Each was a loop of a keep
+    /// and a whole read of the book for as long as the tab was open.
+    /// Mutated red by offering a sent order's proof, by re-reading after a
+    /// refusal, and by forgetting what was offered.
+    #[test]
+    fn the_sellers_tab_offers_its_book_each_note_once() {
+        use harvest_common::delegate::SellerKeptOrder;
+        use harvest_common::HarvestDelegateRequest;
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        let despatch = {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            };
+            let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+                &seller_signing_key(),
+                harvest_common::to_cbor(&despatch).unwrap(),
+            )
+            .unwrap();
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        };
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.owner = Some(owner);
+            store.orders.retain(|o| o.order.id != paid.order.id);
+            store.orders.push(paid.clone());
+            store
+                .despatches
+                .insert(paid.order.id.clone(), despatch.clone());
+        }
+        // Sent, held as the book keeps a sent order: no proof.
+        let mut held = paid.clone();
+        held.payment_proof = None;
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                orders: vec![SellerKeptOrder {
+                    order: held,
+                    request: None,
+                    despatch: Some(despatch),
+                    paid_height: Some(TIP_HEIGHT - 1),
+                    sent_off_store: false,
+                    seal: None,
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(
+            state.seller_book_notes(STORE).is_empty(),
+            "a sent order's proof is not offered"
+        );
+        // Nor when the store's copy comes without the despatch the book
+        // holds.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .clear();
+        assert!(
+            state.seller_book_notes(STORE).is_empty(),
+            "a sent order's proof is not offered, whatever the store shows of it"
+        );
+
+        // A paid order the book lacks: offered once.
+        state.seller_books.get_mut(&owner).unwrap().orders.clear();
+        let first = state.sync_seller_book_requests(STORE);
+        let request_id = match &first[..] {
+            [HarvestDelegateRequest::KeepSellerOrders {
+                request_id, orders, ..
+            }] => {
+                assert_eq!(orders.len(), 1);
+                *request_id
+            }
+            other => panic!("{other:?}"),
+        };
+        // Refused: not read again, and offered again at the store's next
+        // change (round 3: a refusal used to drop it for the session).
+        assert!(state
+            .on_seller_orders_kept(request_id, owner, Err("busy".into()))
+            .is_empty());
+        let again = state.sync_seller_book_requests(STORE);
+        let request_id = match &again[..] {
+            [HarvestDelegateRequest::KeepSellerOrders { request_id, .. }] => *request_id,
+            other => panic!("offered again: {other:?}"),
+        };
+        // Never answered: offered again once its wait is over.
+        state.seller_books.get_mut(&owner).unwrap().keeping = Some((request_id, 0));
+        let request_id = match &state.sync_seller_book_requests(STORE)[..] {
+            [HarvestDelegateRequest::KeepSellerOrders { request_id, .. }] => *request_id,
+            other => panic!("offered again after no answer: {other:?}"),
+        };
+        // Kept: read again, and not offered again however the book answers.
+        assert!(!state
+            .on_seller_orders_kept(request_id, owner, Ok(1))
+            .is_empty());
+        state.seller_books.get_mut(&owner).unwrap().reading = None;
+        assert!(state.sync_seller_book_requests(STORE).is_empty());
+        assert!(state.seller_book_notes(STORE).is_empty());
+    }
+
+    /// Review round 2 of step 2 (testing lens), the seller's book's guards:
+    /// a page answering another read is ignored; a despatch the book holds
+    /// that the store key did not sign is not believed; a paid order the
+    /// book holds paid is not offered again past the store's bound; and
+    /// Home counts only waiting orders still held somewhere. Mutated red by
+    /// dropping each.
+    #[test]
+    fn the_sellers_book_guards_what_it_reads_and_offers() {
+        use harvest_common::delegate::{SellerKeptOrder, SellerOrdersPage};
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.owner = Some(owner);
+            store.orders.retain(|o| o.order.id != paid.order.id);
+            store.orders.push(paid.clone());
+        }
+        let _ = state.read_seller_book(STORE);
+        let asked = state.seller_books[&owner].reading.as_ref().unwrap().0;
+        let page = SellerOrdersPage {
+            orders: Vec::new(),
+            next: None,
+            paid_refused: Vec::new(),
+        };
+        let _ = state.on_seller_orders(asked + 1, owner, Ok(page.clone()));
+        assert!(!state.seller_books[&owner].loaded, "another read's page");
+        let _ = state.on_seller_orders(asked, owner, Ok(page));
+        assert!(state.seller_books[&owner].loaded);
+
+        let mut forged = harvest_common::fulfilment::AuthorizedDespatch {
+            despatch: harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            },
+            scoped_payload: Vec::new(),
+            signature: vec![0u8; 64],
+        };
+        forged.scoped_payload = harvest_common::to_cbor(&forged.despatch).unwrap();
+        let record = |despatch| SellerKeptOrder {
+            order: paid.clone(),
+            request: None,
+            despatch,
+            paid_height: None,
+            sent_off_store: false,
+            seal: None,
+        };
+        state.seller_books.get_mut(&owner).unwrap().orders = vec![record(Some(forged))];
+        assert_eq!(state.book_despatch(&paid), None, "not the store key's");
+
+        state.seller_books.get_mut(&owner).unwrap().orders = vec![record(None)];
+        assert!(
+            state.keep_paid_past_bound(STORE, paid.clone()).is_empty(),
+            "the book holds it paid already"
+        );
+
+        // Home counts only names whose order the store or the book holds.
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.orders.clear();
+        book.paid_refused = vec![
+            paid.order.id.clone(),
+            harvest_common::payment::OrderId({
+                let mut gone = [0xEE; 32];
+                gone[0] = 1;
+                gone
+            }),
+        ];
+        assert_eq!(state.book_refused(STORE), 1, "a gone order's name");
+    }
+
+    /// Review round 2 of step 2 (codex, skeptical): the book's paid copy
+    /// wins over the store's unpaid or cancelled one (a payment past the
+    /// store's byte bound, which only the book remembers after a reload);
+    /// an unpaid order only the book holds is not shown; Cancel is refused
+    /// for the book's paid copy; a lost read is asked again. Mutated red by
+    /// preferring the store's copy, by showing a book-only unpaid order, by
+    /// cancelling it, and by never asking again.
+    #[test]
+    fn the_books_paid_copy_wins_and_cancel_is_refused_for_it() {
+        use harvest_common::delegate::SellerKeptOrder;
+        let (order, _, _) = a_paid_order_with_fillers(|_| {}, 80);
+        let (mut state, _) = buyer_after_acceptance(&order);
+        state.my_stores.insert(
+            "seller-fp".to_string(),
+            vec![StoreRegistration {
+                store_contract_id: STORE.to_vec(),
+                reputation_contract_id: vec![10u8; 32],
+                mailbox_contract_id: vec![11u8; 32],
+                store_contract_key: None,
+                store_verifying_key: Some(crate::state::test_store_key()),
+            }],
+        );
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
+        let _ = state.read_seller_book(STORE);
+        let mut paid = order.clone();
+        paid.status = OrderStatus::Paid;
+        let unpaid_only_here = {
+            let (o, _, _) = a_paid_order_where(|o| o.amount_sats += 1);
+            o
+        };
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.reading = None;
+        book.loaded = true;
+        book.orders = vec![
+            SellerKeptOrder {
+                order: paid.clone(),
+                request: None,
+                despatch: None,
+                paid_height: Some(TIP_HEIGHT - 1),
+                sent_off_store: false,
+                seal: None,
+            },
+            SellerKeptOrder {
+                order: unpaid_only_here.clone(),
+                request: None,
+                despatch: None,
+                paid_height: None,
+                sent_off_store: false,
+                seal: None,
+            },
+        ];
+        for status in [OrderStatus::AwaitingPayment, OrderStatus::Cancelled] {
+            state
+                .browsing_stores
+                .get_mut(STORE)
+                .unwrap()
+                .orders
+                .iter_mut()
+                .filter(|o| o.order.id == order.order.id)
+                .for_each(|o| o.status = status);
+            let shown = state.seller_orders_with_book(STORE);
+            assert!(
+                shown
+                    .iter()
+                    .any(|o| o.order.id == order.order.id && o.status == OrderStatus::Paid),
+                "the book's paid copy over the store's {status:?}"
+            );
+            assert!(
+                !shown
+                    .iter()
+                    .any(|o| o.order.id == unpaid_only_here.order.id),
+                "an unpaid order only the book holds"
+            );
+        }
+        // Read: Cancel is refused for the book's paid copy.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .iter_mut()
+            .filter(|o| o.order.id == order.order.id)
+            .for_each(|o| o.status = OrderStatus::AwaitingPayment);
+        assert!(state
+            .cancel_invoice(STORE, &order.order.id)
+            .unwrap_err()
+            .contains("already paid"));
+        // A read whose answer never came is asked again once its wait is
+        // over.
+        let book = state.seller_books.get_mut(&owner).unwrap();
+        book.loaded = false;
+        book.reading = Some((
+            1,
+            harvest_common::delegate::SellerOrdersPage {
+                orders: Vec::new(),
+                next: None,
+                paid_refused: Vec::new(),
+            },
+        ));
+        book.read_at_ms = crate::state::now_ms();
+        assert!(state.read_seller_book(STORE).is_empty(), "one at a time");
+        state.seller_books.get_mut(&owner).unwrap().read_at_ms = 0;
+        assert!(
+            matches!(
+                &state.read_seller_book(STORE)[..],
+                [harvest_common::HarvestDelegateRequest::ListSellerOrders { request_id, .. }]
+                    if *request_id != 1
+            ),
+            "asked again once its wait is over"
+        );
+    }
+
+    /// Review round 4 of step 2 (codex): Mark sent on an order only the
+    /// book holds goes to the book with the book's own record (its seal and
+    /// paid height, so the book keeps it paid), is shown sent at once, and
+    /// is undone, with a word to the seller, if the book refuses it. Mutated
+    /// red by sending it unsealed, and by leaving it shown sent.
+    #[test]
+    fn a_despatch_the_book_refuses_is_not_shown_sent() {
+        use harvest_common::delegate::SellerKeptOrder;
+        use harvest_common::HarvestDelegateRequest;
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        state.browsing_stores.get_mut(STORE).unwrap().owner = Some(owner);
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .orders
+            .retain(|o| o.order.id != paid.order.id);
+        let mut book_copy = paid.clone();
+        book_copy.payment_proof = None;
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                orders: vec![SellerKeptOrder {
+                    order: book_copy.clone(),
+                    request: None,
+                    despatch: None,
+                    paid_height: Some(TIP_HEIGHT - 1),
+                    sent_off_store: false,
+                    seal: Some([5u8; 32]),
+                }],
+                ..Default::default()
+            },
+        );
+        let despatch = {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            };
+            let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+                &seller_signing_key(),
+                harvest_common::to_cbor(&despatch).unwrap(),
+            )
+            .unwrap();
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        };
+        let out = state.keep_despatch_off_store(STORE, book_copy, despatch);
+        let request_id = match &out[..] {
+            [HarvestDelegateRequest::KeepSellerOrders {
+                request_id, orders, ..
+            }] => {
+                assert_eq!(orders[0].seal, Some([5u8; 32]), "the book's own seal");
+                assert_eq!(orders[0].paid_height, Some(TIP_HEIGHT - 1));
+                *request_id
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            state.seller_books[&owner].orders[0].despatch.is_some(),
+            "shown sent"
+        );
+        state
+            .despatches_sent
+            .insert((STORE.to_vec(), paid.order.id.clone()));
+        let _ = state.on_seller_orders_kept(request_id, owner, Err("refused".into()));
+        assert!(state.seller_books[&owner].orders[0].despatch.is_none());
+        assert!(!state
+            .despatches_sent
+            .contains(&(STORE.to_vec(), paid.order.id.clone())));
+        assert!(state
+            .notifications
+            .iter()
+            .any(|n| n.contains("Could not mark order")));
+    }
+
+    /// Step 2, the buyer's half of "history lives in each side's
+    /// delegate": a kept order the store shows sent is given the despatch
+    /// to keep, and once the store has dropped the order its kept copy's
+    /// despatch is what says it was sent. Mutated red by not offering the
+    /// despatch, and by not reading the kept copy's.
+    #[test]
+    fn a_buyer_keeps_the_despatch_and_reads_it_once_the_store_dropped_it() {
+        let (mut state, _) = seller_holding_a_paid_order(None);
+        let paid = state.settled_orders(STORE).pop().expect("settles");
+        let owner = seller_signing_key().verifying_key().to_bytes();
+        let despatch = {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: paid.order.id.clone(),
+                anchor: anchor(TIP_HEIGHT),
+            };
+            let (scoped_payload, signature) = harvest_common::backing::sign_with_store_key(
+                &seller_signing_key(),
+                harvest_common::to_cbor(&despatch).unwrap(),
+            )
+            .unwrap();
+            harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            }
+        };
+        {
+            let store = state.browsing_stores.get_mut(STORE).expect("store");
+            store.owner = Some(owner);
+            store
+                .despatches
+                .insert(paid.order.id.clone(), despatch.clone());
+        }
+        state.kept_purchases = vec![harvest_common::delegate::KeptPurchase {
+            store_key: owner,
+            conversation: [9; 32],
+            receipt_seed: [0; 32],
+            order: paid.clone(),
+            complaint: None,
+            backed_up: false,
+            despatch: None,
+        }];
+        let due = state.upgrades_due();
+        assert!(due
+            .iter()
+            .any(|(step, keep)| *step == KeepStep::Despatch
+                && keep.despatch.as_ref() == Some(&despatch)));
+
+        // The store drops it; the kept copy has the despatch.
+        state
+            .browsing_stores
+            .get_mut(STORE)
+            .unwrap()
+            .despatches
+            .clear();
+        state.browsing_stores.get_mut(STORE).unwrap().orders.clear();
+        assert!(state.despatch_of(&paid).is_none());
+        state.kept_purchases[0].despatch = Some(despatch.clone());
+        assert_eq!(state.despatch_of(&paid), Some(despatch));
+        assert!(state.upgrades_due().is_empty(), "nothing left to keep");
     }
 
     /// **PR #83 round 4.** With no twin and every owned store loaded, a
@@ -32273,6 +32836,16 @@ mod buy_flow_tests {
                 store_verifying_key: Some(seller_signing_key().verifying_key().to_bytes()),
             }],
         );
+        // The seller's own book read (step 2): Cancel waits for it.
+        if let Some(owner) = state.browsing_stores[STORE].owner {
+            state.seller_books.insert(
+                owner,
+                crate::seller_book::SellerBook {
+                    loaded: true,
+                    ..Default::default()
+                },
+            );
+        }
         (state, order)
     }
 
@@ -32459,6 +33032,19 @@ mod buy_flow_tests {
         assert!(state.pending_signatures.is_empty());
     }
 
+    /// The seller's own book read, as a seller's tab reads it once its
+    /// store's state arrives (step 2): Cancel waits for it.
+    fn the_book_is_read(state: &mut AppState) {
+        let owner = state.browsing_stores[STORE].owner.expect("owned");
+        state.seller_books.insert(
+            owner,
+            crate::seller_book::SellerBook {
+                loaded: true,
+                ..Default::default()
+            },
+        );
+    }
+
     /// A confirmed in-window row at `order`'s address, as
     /// `apply_address_state` builds them (the chain fixture leaves the rows
     /// empty).
@@ -32503,6 +33089,7 @@ mod buy_flow_tests {
         let _ = claims;
         give_the_node_the_chain(&mut state, &order, Vec::new(), tip);
         show_a_payment_row(&mut state, &order, 546);
+        the_book_is_read(&mut state);
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("dust does not refuse a cancel");
@@ -32525,6 +33112,7 @@ mod buy_flow_tests {
             }],
         );
         give_the_node_the_chain(&mut state, &order, claims, tip);
+        the_book_is_read(&mut state);
         state
             .cancel_invoice(STORE, &order.order.id)
             .expect("queued");
@@ -34353,6 +34941,8 @@ mod buy_flow_tests {
                 .to_bytes(),
             order: order.clone(),
             complaint: None,
+            despatch: None,
+            backed_up: false,
         }
     }
 
@@ -34477,6 +35067,7 @@ mod buy_flow_tests {
                 conversation: the_buyers_conversation().buyer_public_key,
                 order: unpaid.clone(),
                 complaint: None,
+                despatch: None,
             }]
         );
         state
@@ -34847,6 +35438,44 @@ mod buy_flow_tests {
         past_the_despatch_deadline(&mut state);
         let purchase = purchases(&state).remove(0);
         assert_eq!(purchase.paid.as_ref(), Some(&paid));
+        assert!(!purchase.cancellable(), "a paid order is not cancelled");
+        assert_eq!(state.complaint_refusal(STORE, &purchase), None);
+    }
+
+    /// Step 2 (the overseer, 2026-10-09): an honest payment past the store's
+    /// byte bound for a `Paid` record reads paid to the buyer too. The store
+    /// holds the order's unpaid terms (`store::as_kept`); the buyer's node
+    /// proves the payment, keeps the paid copy, shows it paid, offers no
+    /// Cancel, and can complain with it. Red if the buyer's view or the
+    /// upgrade held the paid copy to the store's bound.
+    #[test]
+    fn a_payment_past_the_store_bound_still_reads_paid_to_the_buyer() {
+        let (unpaid, claims, tip) = a_paid_order_with_fillers(|_| {}, 80);
+        let recognised = recognise_settling_bridge();
+        let (mut state, _) = buyer_after_acceptance(&unpaid);
+        state.test_guards.push(recognised);
+        state
+            .keep_purchase(STORE, &unpaid.order.id)
+            .expect("ready to keep");
+        let keep = state.keep_requests.pop().expect("sent");
+        state.on_kept_purchases(vec![kept(&keep.order)]);
+        give_the_node_the_chain(&mut state, &unpaid, claims.clone(), tip.clone());
+        let paid = paid_on_claims(&unpaid, claims, tip);
+        let as_kept = harvest_common::store::as_kept(paid.clone());
+        assert_eq!(as_kept.status, OrderStatus::AwaitingPayment, "precondition");
+        state.browsing_stores.get_mut(STORE).unwrap().orders = vec![as_kept];
+
+        state.upgrade_kept_purchases();
+        let upgrade = state.keep_requests.pop().expect("the upgrade is sent");
+        assert_eq!(upgrade.order.status, OrderStatus::Paid);
+        assert!(
+            !harvest_common::store::within_order_cap(&upgrade.order),
+            "past the store's bound"
+        );
+        state.on_kept_purchases(vec![kept(&upgrade.order)]);
+        past_the_despatch_deadline(&mut state);
+        let purchase = purchases(&state).remove(0);
+        assert_eq!(purchase.paid.as_ref(), Some(&upgrade.order), "paid");
         assert!(!purchase.cancellable(), "a paid order is not cancelled");
         assert_eq!(state.complaint_refusal(STORE, &purchase), None);
     }
@@ -36394,6 +37023,40 @@ mod buy_flow_tests {
                 "the clear run before the used one"
             );
             assert!(arm.watched_scripts.is_empty());
+        }
+    }
+
+    /// Step 2 (the money lens's two Lows): after a newly paid address the
+    /// empty arm still goes out when the bridge inbox is not known, and for
+    /// a store that has since stopped selling by Buy now. Neither could
+    /// reach an invoice (the delegate holds the paid script), but each left
+    /// the delegate's window stale. Mutated red by requiring the inbox
+    /// again, and by planning only the stores that sell.
+    #[test]
+    fn the_empty_arm_goes_out_without_the_inbox_and_for_a_store_that_stopped_selling() {
+        for case in ["no inbox", "stopped selling"] {
+            let gk = inbox::authority().mint();
+            let mut state = a_seller_with_a_lost_counter(&gk);
+            let work = state.queue_auto_invoice(100);
+            settle_absent_except(&mut state, &work, &[], 100);
+            let armed = state.queue_auto_invoice(200);
+            assert!(!armed.arms.is_empty(), "{case}: armed first");
+            let (paid, _) = address_states_paid_and_scanned();
+            assert!(state.on_address_vet_state(&vet_of(&work, 5).0, &paid, 300));
+            match case {
+                "no inbox" => state.bitcoin.inbox = None,
+                _ => {
+                    for store in state.browsing_stores.values_mut() {
+                        store.listings.clear();
+                    }
+                    assert!(state.instant_checkout_stores().is_empty());
+                }
+            }
+            let emptied = state.queue_auto_invoice(300);
+            assert!(!emptied.arms.is_empty(), "{case}: the empty arm goes out");
+            for arm in &emptied.arms {
+                assert!(arm.vetted_scripts.is_empty() && arm.watched_scripts.is_empty());
+            }
         }
     }
 
@@ -38814,6 +39477,7 @@ mod store_code_tests {
                 archived: false,
                 closed: false,
                 closed_for_now: false,
+                paused: false,
             }]
         );
         let (rows, hidden) = state.store_list_rows(true);
@@ -39310,13 +39974,7 @@ mod store_rekey_recall_tests {
 
     fn requested_store(request: &HarvestDelegateRequest) -> Vec<u8> {
         match request {
-            HarvestDelegateRequest::ExportBuyerConversation {
-                store_contract_id, ..
-            }
-            | HarvestDelegateRequest::MarkConversationBackedUp {
-                store_contract_id, ..
-            }
-            | HarvestDelegateRequest::ForgetBuyerConversation {
+            HarvestDelegateRequest::ForgetBuyerConversation {
                 store_contract_id, ..
             } => store_contract_id.clone(),
             other => panic!("expected a conversation request, got {other:?}"),
@@ -39387,10 +40045,10 @@ mod store_rekey_recall_tests {
         );
     }
 
-    /// Backing up, marking saved and forgetting such a conversation name the
-    /// id the delegate keeps it under, which is where the delegate looks. A
-    /// conversation kept under the current id is still addressed by it.
-    /// Mutated red by addressing every request by the store's current id.
+    /// Forgetting such a conversation names the id the delegate keeps it
+    /// under, which is where the delegate looks. A conversation kept under
+    /// the current id is still addressed by it. Mutated red by addressing
+    /// every request by the store's current id.
     #[test]
     fn requests_about_it_name_the_id_it_is_kept_under() {
         let mut state = buyer_state();
@@ -39401,24 +40059,21 @@ mod store_rekey_recall_tests {
         let old = recalled(5).buyer_public_key;
         let new = recalled(6).buyer_public_key;
 
-        for request in [
-            state.conversation_to_export(&current(), &old),
-            state.conversation_to_mark_backed_up(&current(), &old),
-            state.conversation_to_forget(&current(), &old),
-        ] {
-            assert_eq!(requested_store(&request), earlier()[0]);
-        }
         assert_eq!(
-            requested_store(&state.conversation_to_export(&current(), &new)),
+            requested_store(&state.conversation_to_forget(&current(), &old)),
+            earlier()[0]
+        );
+        assert_eq!(
+            requested_store(&state.conversation_to_forget(&current(), &new)),
             current()
         );
     }
 
-    /// After the buyer marks one saved, every id is asked again, so the
-    /// answer about the earlier one clears its warning. Mutated red by
-    /// re-asking only the current id.
+    /// Asking again after one conversation changed (a restore, say) asks
+    /// every id, so the answer about the earlier one is heard. Mutated red
+    /// by re-asking only the current id.
     #[test]
-    fn marking_one_saved_asks_every_id_again() {
+    fn a_re_ask_asks_every_id_again() {
         let mut state = buyer_state();
         state.note_store_code(current(), params().code().to_string());
         state.recall_buyer_conversations(&current());

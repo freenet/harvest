@@ -5,7 +5,7 @@ use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 
 use harvest_common::store::{
-    StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary,
+    StoreParameters, StoreStateV1, StoreStateV1Delta, StoreStateV1Summary, Unchecked,
 };
 
 #[allow(dead_code)]
@@ -22,6 +22,7 @@ impl ContractInterface for Contract {
         if bytes.is_empty() {
             return Ok(ValidateResult::Valid);
         }
+        within_bound(bytes, "a store state")?;
 
         let store_state = from_reader::<StoreStateV1, &[u8]>(bytes)
             .map_err(|e| ContractError::Deser(e.to_string()))?;
@@ -63,6 +64,32 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
+        // Every update past the store's byte bound is refused before anything
+        // is read, the held state included.
+        let mut total = 0usize;
+        for update in &data {
+            match update {
+                UpdateData::State(s) => {
+                    within_bound(s.as_ref(), "a store state")?;
+                    total += s.as_ref().len();
+                }
+                UpdateData::Delta(d) => {
+                    within_bound(d.as_ref(), "a store delta")?;
+                    total += d.as_ref().len();
+                }
+                _ => {}
+            }
+        }
+        // And all of them together: a node sends one, but nothing else stops
+        // several.
+        if total > harvest_common::store::MAX_STORE_BYTES {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: format!(
+                    "updates of {total} bytes together are past the most a store takes, {}",
+                    harvest_common::store::MAX_STORE_BYTES
+                ),
+            });
+        }
         let parameters = from_reader::<StoreParameters, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
@@ -80,6 +107,20 @@ impl ContractInterface for Contract {
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
 
+        // Each record merged is verified once: here if the state this ends
+        // with does not hold it as it came, and otherwise by the
+        // `validate_state` the node runs on that state before keeping it
+        // (`StoreStateV1::apply_update`, step 2).
+        //
+        // That second half is freenet-core's, not ours: it validates the
+        // result of every `update_state` before storing it
+        // (`crates/core/src/contract/executor/runtime/contract_ops.rs:97` and
+        // `:392`, `executor_impl.rs:780` and `:1285` at 60a6c1f; its
+        // `.claude/rules/contracts.md`, "WHEN updating contract state"). A
+        // core change that dropped that validation would silently let a
+        // forged record that wins its slot into the store. See
+        // `docs/untested-invariants.md`.
+        let mut unchecked = Unchecked::default();
         for update in data {
             match update {
                 UpdateData::State(new_state) => {
@@ -94,7 +135,7 @@ impl ContractInterface for Contract {
                     let new_state = from_reader::<StoreStateV1, &[u8]>(new_state.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
-                        .merge(&store_state.clone(), &parameters, &new_state)
+                        .merge_update(&parameters, &new_state, &mut unchecked)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         })?;
@@ -107,7 +148,7 @@ impl ContractInterface for Contract {
                     let delta = from_reader::<StoreStateV1Delta, &[u8]>(d.as_ref())
                         .map_err(|e| ContractError::Deser(e.to_string()))?;
                     store_state
-                        .apply_delta(&store_state.clone(), &parameters, &Some(delta))
+                        .apply_update(&parameters, &delta, &mut unchecked)
                         .map_err(|e| ContractError::InvalidUpdateWithInfo {
                             reason: e.to_string(),
                         })?;
@@ -122,6 +163,9 @@ impl ContractInterface for Contract {
         // nothing, so a stored state that is not canonical would otherwise be
         // written back as it came (harvest#26).
         store_state.listings.normalize();
+        unchecked
+            .check(&store_state)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
 
         if nothing_here {
             return Ok(UpdateModification::valid(State::from(vec![])));
@@ -195,6 +239,21 @@ impl ContractInterface for Contract {
     }
 }
 
+/// Refuse `bytes` past [`harvest_common::store::MAX_STORE_BYTES`] on its
+/// length, before anything is read.
+fn within_bound(bytes: &[u8], what: &str) -> Result<(), ContractError> {
+    if bytes.len() > harvest_common::store::MAX_STORE_BYTES {
+        return Err(ContractError::InvalidUpdateWithInfo {
+            reason: format!(
+                "{what} of {} bytes is past the most a store takes, {}",
+                bytes.len(),
+                harvest_common::store::MAX_STORE_BYTES
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +266,118 @@ mod tests {
         AuthorizedOrder, Order, OrderId, OrderPaymentProof, OrderStatus,
     };
     use harvest_common::store::OrdersV1;
+
+    /// Step 2 (the overseer's hostile-delta check): a delta, an incoming
+    /// state, or a state to validate past `MAX_STORE_BYTES` is refused on its
+    /// length before any of it is read (these are bytes nothing decodes).
+    /// Red with the bound dropped (the bytes then fail to decode instead).
+    #[test]
+    fn an_update_past_the_store_bound_is_refused_on_its_length() {
+        let params = Parameters::from(
+            harvest_common::to_cbor(&StoreParameters::new(seller_key().verifying_key())).unwrap(),
+        );
+        let mut oversized = vec![0xa1u8];
+        oversized.resize(harvest_common::store::MAX_STORE_BYTES + 1, 0xff);
+        for update in [
+            UpdateData::Delta(StateDelta::from(oversized.clone())),
+            UpdateData::State(State::from(oversized.clone())),
+        ] {
+            let why = <Contract as ContractInterface>::update_state(
+                params.clone(),
+                State::from(vec![]),
+                vec![update],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(why.contains("past the most a store takes"), "{why}");
+        }
+        let why = <Contract as ContractInterface>::validate_state(
+            params.clone(),
+            State::from(oversized),
+            RelatedContracts::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("past the most a store takes"), "{why}");
+        // Each under the bound, together past it.
+        let mut half = vec![0xa1u8];
+        half.resize(harvest_common::store::MAX_STORE_BYTES / 2 + 1, 0xff);
+        let why = <Contract as ContractInterface>::update_state(
+            params,
+            State::from(vec![]),
+            vec![
+                UpdateData::Delta(StateDelta::from(half.clone())),
+                UpdateData::Delta(StateDelta::from(half)),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(why.contains("together"), "{why}");
+    }
+
+    /// Step 2: `update_state` merges without verifying, verifies what the
+    /// result does not hold, and leaves the rest to `validate_state`. A
+    /// forged status an EARLIER update of the same call put in, and a later
+    /// one's newer statuses cut, is in no result, and is refused. Red with
+    /// the check run per update instead of against the final state, and
+    /// with it skipped.
+    #[test]
+    fn a_forged_record_a_later_update_cuts_is_refused() {
+        use harvest_common::backing::sign_with_store_key;
+        use harvest_common::listing::{
+            AuthorizedListingStatus, ListingAvailability, ListingId, ListingStatus,
+        };
+        use harvest_common::store::MAX_LISTING_STATUSES;
+        let seller = seller_key();
+        let status = |n: u16, revision: u64, forged: bool| {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            let status = ListingStatus {
+                listing: ListingId(id),
+                revision,
+                availability: ListingAvailability::SoldOut,
+            };
+            let (scoped_payload, mut signature) =
+                sign_with_store_key(&seller, harvest_common::to_cbor(&status).unwrap()).unwrap();
+            if forged {
+                signature[0] ^= 1;
+            }
+            AuthorizedListingStatus {
+                status,
+                scoped_payload,
+                signature,
+            }
+        };
+        let delta = |statuses: Vec<AuthorizedListingStatus>| {
+            UpdateData::Delta(StateDelta::from(
+                harvest_common::to_cbor(&StoreStateV1Delta {
+                    owner: Some(seller.verifying_key()),
+                    listing_statuses: Some(statuses),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+        };
+        let params = Parameters::from(params_bytes(&seller));
+        let newer: Vec<_> = (0..MAX_LISTING_STATUSES as u16)
+            .map(|n| status(n, 2_000_000 + u64::from(n), false))
+            .collect();
+        let update = |forged: bool| {
+            <Contract as ContractInterface>::update_state(
+                params.clone(),
+                State::from(vec![]),
+                vec![
+                    delta(vec![status(9_000, 1_000_000, forged)]),
+                    delta(newer.clone()),
+                ],
+            )
+        };
+        let kept = update(false).expect("genuine statuses apply");
+        let kept: StoreStateV1 = from_reader(kept.new_state.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(kept.listing_statuses.records.len(), MAX_LISTING_STATUSES);
+        let why = update(true).unwrap_err().to_string();
+        assert!(why.contains("listing status"), "{why}");
+    }
 
     fn seller_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])

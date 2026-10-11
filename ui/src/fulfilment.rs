@@ -32,14 +32,14 @@ use harvest_common::payment::{AuthorizedOrder, OrderPaymentProof, OrderStatus};
 /// Decided in the harvest#53 design (section 7, decision 4) as a starting
 /// point to revisit with real seller data. Reader-side, so changing it moves
 /// no contract.
-pub const DESPATCH_WINDOW_BLOCKS: u32 = 1008;
+pub use harvest_common::fulfilment::DESPATCH_WINDOW_BLOCKS;
 
 /// How long after the despatch deadline the buyer may still complain: about
 /// two further weeks of blocks. Past it, the order counts as finished.
 ///
 /// Same provenance and the same freedom to change as
 /// [`DESPATCH_WINDOW_BLOCKS`].
-pub const COMPLAINT_WINDOW_BLOCKS: u32 = 2016;
+pub use harvest_common::fulfilment::COMPLAINT_WINDOW_BLOCKS;
 
 /// Whether a payment could still settle an order in this status: unpaid, or
 /// CANCELLED.

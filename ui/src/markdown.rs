@@ -61,7 +61,7 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// The longest description this renders. Past it the text is cut, with a
 /// marker, rather than silently shortened.
-pub const MAX_SOURCE_BYTES: usize = 16 * 1024;
+pub const MAX_SOURCE_BYTES: usize = harvest_common::store::MAX_DESCRIPTION_BYTES;
 
 /// How deeply containers may nest before the rest is flattened into the
 /// container that holds them. Bounds recursion in the renderer AND in the

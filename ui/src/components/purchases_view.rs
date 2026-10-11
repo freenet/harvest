@@ -60,6 +60,39 @@ pub(crate) fn purchase_rows(state: &AppState) -> Vec<PurchaseRow> {
     rows
 }
 
+/// A string as a JavaScript literal, for the few lines `eval` runs.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn js_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Offer `text` as a file named `name`.
+#[cfg(target_arch = "wasm32")]
+fn download(name: &str, text: &str) {
+    let _ = document::eval(&format!(
+        "const a = document.createElement('a');\
+         a.href = URL.createObjectURL(new Blob([{}], {{ type: 'text/plain' }}));\
+         a.download = {};\
+         document.body.appendChild(a); a.click(); a.remove();",
+        js_string(text),
+        js_string(name)
+    ));
+}
+
 /// The tabs on Purchases.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PurchasesTab {
@@ -227,14 +260,11 @@ fn use_purchases_loading() -> (bool, usize) {
     (loading, failed)
 }
 
-/// Whether any conversation this device keeps has no backup anywhere else:
-/// the banner that sends the buyer to Backup until there is one.
+/// Whether any purchase or conversation this device keeps is in no backup
+/// the buyer saved: the banner that sends the buyer to Backup until there
+/// is one.
 pub(crate) fn backup_due(state: &AppState) -> bool {
-    state
-        .browsing_stores
-        .iter()
-        .filter(|(id, _)| state.store_owner_fingerprint(id).is_none())
-        .any(|(_, store)| store.conversations.iter().any(|c| !c.backed_up))
+    state.not_backed_up() != (0, 0)
 }
 
 /// P6: every order this device has placed, newest first, with what needs
@@ -489,101 +519,255 @@ pub fn PurchaseMessagesPage() -> Element {
     }
 }
 
-/// One conversation this device keeps, as Backup lists it: its store, the
-/// store's name, its tag, when it started and whether it is backed up.
-type KeptConversation = (Vec<u8>, String, [u8; 32], i64, bool);
+/// The id of the hidden file input "Restore from a file" opens.
+const RESTORE_INPUT: &str = "purchases-backup-file";
 
-/// P9: keep a copy of the purchases and messages this device holds, and
-/// bring one back on another device.
+/// P9: one file with every purchase and conversation this device keeps,
+/// and bringing one back on another device (step 2; `crate::backup_flow`).
 ///
-/// One backup for everything needs the approved delegate change (one backup
-/// for all purchases); until it lands, each conversation, which holds that
-/// store's orders and messages, is saved on its own, and this page lists
-/// them.
+/// The file is made as the page opens, so saving it is one click; the
+/// click is what marks what it holds as backed up, so a file never saved
+/// marks nothing.
 #[component]
 pub fn BackupPage() -> Element {
-    let kept: Vec<KeptConversation> = {
-        let state = APP_STATE.read();
-        let mut kept = Vec::new();
-        for (id, store) in state.browsing_stores.iter() {
-            if state.store_owner_fingerprint(id).is_some() {
-                continue;
-            }
-            for c in store.conversations.iter() {
-                kept.push((
-                    id.clone(),
-                    state.store_name_of(id).label(),
-                    c.buyer_public_key,
-                    c.created_at,
-                    c.backed_up,
-                ));
-            }
+    let mut pasting = use_signal(|| false);
+    let mut paste = use_signal(String::new);
+    // Made once, as the page opens.
+    use_hook(|| {
+        let out = APP_STATE.write().start_backup_export();
+        crate::backup_flow::send_all(out);
+    });
+    // "Preparing" is judged against the clock: a request whose answer never
+    // came stops holding the buttons once its wait is over.
+    #[allow(unused_mut)]
+    let mut clock = use_signal(|| 0u32);
+    #[cfg(target_arch = "wasm32")]
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            clock += 1;
         }
-        kept.sort_by(|a, b| {
-            a.1.to_lowercase()
-                .cmp(&b.1.to_lowercase())
-                .then(a.3.cmp(&b.3))
-        });
-        kept
+    });
+    let _ = clock();
+    let (purchases, conversations, message, busy, restoring, ready, addresses, books_unread) = {
+        let state = APP_STATE.read();
+        let (purchases, conversations) = state.not_backed_up();
+        (
+            purchases,
+            conversations,
+            state.backup_message.clone(),
+            state.backup_busy_at(crate::state::now_ms()),
+            state.backup_restore.is_some(),
+            state.backup_file_ready.clone(),
+            state.unsent_addresses_in_backup(),
+            state.seller_books_unread(),
+        )
     };
-    let unsaved = kept.iter().filter(|k| !k.4).count();
+    let restore = |text: String| {
+        let out = APP_STATE.write().start_restore(&text);
+        crate::backup_flow::send_all(out);
+    };
+    let save = move |copy: bool| {
+        let Some((name, text)) = APP_STATE.read().ready_backup_file() else {
+            return;
+        };
+        let made = APP_STATE
+            .read()
+            .backup_file_ready
+            .as_ref()
+            .map_or(0, |r| r.bundle.made_at_ms);
+        let saved = move || {
+            let out = APP_STATE.write().backup_saved_of(made);
+            crate::backup_flow::send_all(out);
+        };
+        // Marked only once the text is on the clipboard: a copy the browser
+        // refused saved nothing. A download cannot be followed that far; the
+        // click that asked for it is the buyer's say-so.
+        #[cfg(target_arch = "wasm32")]
+        if copy {
+            spawn(async move {
+                let mut copied = document::eval(&format!(
+                    "navigator.clipboard.writeText({}).then(\
+                     () => dioxus.send(true), () => dioxus.send(false));",
+                    js_string(&text)
+                ));
+                if copied.recv::<bool>().await.unwrap_or(false) {
+                    saved();
+                } else {
+                    APP_STATE.write().backup_message = Some(COPY_REFUSED.to_string());
+                }
+            });
+        } else {
+            download(&name, &text);
+            saved();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (copy, &name, &text);
+            saved();
+        }
+    };
     rsx! {
         super::seller_pages::BackTo { label: "Purchases".to_string(), page: Page::Purchases }
-        h2 { class: "page-h", "Backup" }
+        div { class: "page-head",
+            h2 { class: "page-h", "Backup" }
+            if purchases + conversations > 0 {
+                span { class: "pill", "Not backed up" }
+            }
+        }
         p { class: "lede",
-            "Your purchases and messages are saved on this device only. A backup lets you see them, \
-             and report a problem, on another device."
+            "Your purchases and messages are saved on this device only. A backup lets you see \
+             them, and report a problem, on another device."
         }
         section { class: "panel",
-            p { class: "text-muted small",
-                "Each store you have bought from or written to has its own backup, which holds your \
-                 orders and messages with it. Keep it private, like a password: anyone who has it \
-                 can read your messages and report problems as you."
+            h3 { class: "panel-h", "Save a backup" }
+            match unsaved_line(purchases, conversations) {
+                Some(line) => rsx! { p { class: "text-warning", "{line}" } },
+                None => rsx! {
+                    p { class: "text-muted small", "Every purchase and conversation on this device is in a backup you saved." }
+                },
             }
-            if kept.is_empty() {
-                p { class: "text-muted",
-                    "Nothing to back up yet: you haven\u{2019}t bought from or written to a store on this device."
-                }
-            } else if unsaved == 0 {
-                p { class: "text-muted small", "You have saved a backup of each of them." }
-            } else if unsaved == 1 {
-                p { class: "text-warning", "1 of them exists on this device and nowhere else." }
-            } else {
-                p { class: "text-warning", "{unsaved} of them exist on this device and nowhere else." }
+            p { class: "text-muted small", "{crate::backup_flow::KEEP_IT_PRIVATE}" }
+            if let Some(line) = crate::backup_flow::addresses_line(addresses) {
+                p { class: "text-warning", "{line}" }
             }
-            for (store , name , tag , created , backed_up) in kept.iter() {
-                div { key: "{bs58::encode(tag).into_string()}", class: "backup-row",
-                    div { class: "row-between",
-                        span {
-                            strong { "{name}" }
-                            span { class: "text-muted small", " \u{00b7} started {started_on(*created)}" }
-                        }
-                        if *backed_up {
-                            span { class: "pill pill-open", "Saved" }
-                        } else {
-                            span { class: "pill", "Not saved" }
-                        }
+            if books_unread > 0 {
+                p { class: "text-muted small", "{BOOKS_UNREAD}" }
+            }
+            div { class: "row",
+                button {
+                    class: "btn btn-primary",
+                    disabled: ready.is_none(),
+                    onclick: move |_| save(false),
+                    if ready.is_some() {
+                        "Save a backup file"
+                    } else if busy && !restoring {
+                        "Preparing your backup\u{2026}"
+                    } else {
+                        "Save a backup file"
                     }
-                    super::message_view::ConversationBackupControl {
-                        store_contract_id: store.clone(),
-                        tag: *tag,
-                        primary: !*backed_up,
+                }
+                if ready.is_some() {
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| save(true),
+                        "Copy it as text instead"
+                    }
+                }
+                if ready.is_none() && !busy {
+                    button {
+                        class: "link-btn",
+                        onclick: move |_| {
+                            let out = APP_STATE.write().start_backup_export();
+                            crate::backup_flow::send_all(out);
+                        },
+                        "Try again"
                     }
                 }
             }
         }
         section { class: "panel",
             h3 { class: "panel-h", "Restore from a backup" }
-            super::message_view::Restore {}
+            p { class: "text-muted small",
+                "Choose a backup file you saved. What this device already holds stays as it is."
+            }
+            div { class: "row",
+                button {
+                    class: "btn btn-outline",
+                    disabled: restoring && busy,
+                    onclick: move |_| {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let _ = document::eval(&format!(
+                                "document.getElementById({}).click();",
+                                js_string(RESTORE_INPUT)
+                            ));
+                        }
+                    },
+                    "Restore from a file"
+                }
+                button {
+                    class: "link-btn",
+                    onclick: move |_| pasting.toggle(),
+                    "Paste one instead"
+                }
+            }
+            input {
+                id: RESTORE_INPUT,
+                r#type: "file",
+                accept: ".txt,text/plain",
+                style: "display: none;",
+                onchange: move |_| {
+                    #[cfg(target_arch = "wasm32")]
+                    spawn(async move {
+                        let mut read = document::eval(&format!(
+                            "const input = document.getElementById({});\
+                             const file = input.files && input.files[0];\
+                             if (file) {{ file.text().then(t => {{ input.value = ''; dioxus.send(t); }}); }}",
+                            js_string(RESTORE_INPUT)
+                        ));
+                        if let Ok(text) = read.recv::<String>().await {
+                            restore(text);
+                        }
+                    });
+                },
+            }
+            if pasting() {
+                div { class: "form-group",
+                    textarea {
+                        class: "form-textarea",
+                        rows: "4",
+                        placeholder: "Paste a whole backup file, or an older one-conversation backup.",
+                        value: "{paste}",
+                        oninput: move |e| paste.set(e.value()),
+                    }
+                    button {
+                        class: "btn btn-outline",
+                        disabled: (restoring && busy) || paste().trim().is_empty(),
+                        onclick: move |_| {
+                            restore(paste());
+                            paste.set(String::new());
+                        },
+                        "Restore"
+                    }
+                }
+            }
+        }
+        if let Some(message) = message {
+            p { class: "small", role: "status", "{message}" }
         }
     }
 }
 
-/// "27 Sep", for when a conversation was started (seconds since 1970).
-fn started_on(created_at: i64) -> String {
-    chrono::DateTime::from_timestamp(created_at, 0)
-        .map(super::order_status::short_date)
-        .unwrap_or_else(|| "at an unknown time".to_string())
+/// Said while a store's own orders have not been read yet.
+const BOOKS_UNREAD: &str = "Your store\u{2019}s orders on this device are still loading, \
+     so a backup saved now leaves them out. Open your store, then come back.";
+
+/// Said when the browser would not put the backup on the clipboard.
+const COPY_REFUSED: &str =
+    "The browser did not copy the backup, so nothing is marked as saved. Use Save instead.";
+
+/// What Backup says is not in a backup yet, or `None` when everything is.
+pub(crate) fn unsaved_line(purchases: usize, conversations: usize) -> Option<String> {
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    match (purchases, conversations) {
+        (0, 0) => None,
+        (1, 0) => Some("1 purchase isn\u{2019}t in a backup yet.".to_string()),
+        (p, 0) => Some(format!("{p} purchases aren\u{2019}t in a backup yet.")),
+        (0, 1) => Some("1 conversation isn\u{2019}t in a backup yet.".to_string()),
+        (0, c) => Some(format!("{c} conversations aren\u{2019}t in a backup yet.")),
+        (p, c) => Some(format!(
+            "{} and {} aren\u{2019}t in a backup yet.",
+            plural(p, "purchase", "purchases"),
+            plural(c, "conversation", "conversations")
+        )),
+    }
 }
 
 /// The kept purchases the loaded stores' purchases already show, judged

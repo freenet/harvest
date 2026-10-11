@@ -403,6 +403,7 @@ fn FindStore() -> Element {
 fn visited_row_lines(row: &StoreListRow, collides: bool) -> (String, Option<String>) {
     let closed = match (row.closed, row.closed_for_now) {
         (false, _) => None,
+        (true, _) if row.paused => Some("Closed for now"),
         (true, true) => Some("Closed right now"),
         (true, false) => Some("Closed"),
     };
@@ -623,7 +624,14 @@ fn LoadedStore(
     // Open only where a buyer can buy: the one answer the visited rows and
     // the seller's own cards give too (`AppState::buyer_open`).
     let buyer_open = APP_STATE.read().buyer_open(&contract_id, now);
-    let pill = buyer_open.pill();
+    // Closed by the seller's own pause reads "Closed for now", beside the
+    // buyer line saying the same (step 2).
+    let closed_label = closed_pill(presence);
+    let pill = if buyer_open == BuyerOpen::Closed {
+        closed_label
+    } else {
+        buyer_open.pill()
+    };
     let pill_open = buyer_open == BuyerOpen::Open;
     let is_closed = buyer_open == BuyerOpen::Closed;
     let cannot_take = !store.closed && presence.is_open() && !store.takes_orders();
@@ -1008,7 +1016,7 @@ pub fn ItemPage(store: Vec<u8>, listing: harvest_common::listing::ListingId) -> 
     let why_not = if offer.is_some() || own_preview {
         None
     } else if browsing.closed || closed {
-        Some("This store is closed right now, so this can\u{2019}t be bought.".to_string())
+        Some(closed_item_line(APP_STATE.read().store_presence(&store, now)).to_string())
     } else if !availability.is_buyable() {
         Some("None are left.".to_string())
     } else if !l.offers_instant_checkout() {
@@ -1350,6 +1358,26 @@ fn buyable(
         seller_encryption_key: store.info.as_ref()?.encryption_public_key?,
         seller_verifying_key: store.seller_verifying_key?,
     })
+}
+
+/// The pill a closed store shows: "Closed for now" when its seller paused it
+/// (step 2), "Closed" for every other reason.
+fn closed_pill(presence: crate::presence_flow::StorePresence) -> &'static str {
+    if presence.is_paused() {
+        "Closed for now"
+    } else {
+        "Closed"
+    }
+}
+
+/// Why an item of a closed store can't be bought, in place of its form: its
+/// seller's pause says "for now" (step 2), as the store's pill does.
+fn closed_item_line(presence: crate::presence_flow::StorePresence) -> &'static str {
+    if presence.is_paused() {
+        "This store is closed for now, so this can\u{2019}t be bought."
+    } else {
+        "This store is closed right now, so this can\u{2019}t be bought."
+    }
 }
 
 /// What a listing's top corner says (after the mockup): "Closed" while the
@@ -1851,7 +1879,44 @@ mod stores_page_tests {
             archived: false,
             closed: false,
             closed_for_now: false,
+            paused: false,
         }
+    }
+
+    /// Step 2: a store its seller paused reads "Closed for now", on its own
+    /// page's pill, on its item pages and on its row in Stores; any other
+    /// closed store reads as before. Mutated red by labelling every closed
+    /// store "Closed for now", and by dropping the row's case.
+    #[test]
+    fn a_paused_store_reads_closed_for_now() {
+        use crate::presence_flow::StorePresence;
+        let paused = {
+            let mut state = crate::state::AppState::default();
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+            let store = state.browsing_stores.entry(vec![1; 32]).or_default();
+            store.pause = Some(harvest_common::store_pause::StorePause::new(owner, 1, true));
+            state.store_presence(&[1; 32], 0)
+        };
+        assert!(paused.is_paused());
+        assert_eq!(closed_pill(paused), "Closed for now");
+        assert_eq!(closed_pill(StorePresence::Checking), "Closed");
+        assert_eq!(closed_pill(StorePresence::Open), "Closed");
+        assert_eq!(
+            closed_item_line(paused),
+            "This store is closed for now, so this can\u{2019}t be bought."
+        );
+        assert_eq!(
+            closed_item_line(StorePresence::Checking),
+            "This store is closed right now, so this can\u{2019}t be bought."
+        );
+        let mut r = row(StoreName::Named("Tea".to_string()), Some("Loose tea"));
+        r.closed = true;
+        r.closed_for_now = true;
+        r.paused = true;
+        assert_eq!(
+            visited_row_lines(&r, false).1.as_deref(),
+            Some("Closed for now")
+        );
     }
 
     /// A visited store's row: its name, then its tagline. Its code is the

@@ -2410,6 +2410,27 @@ mod tests {
         assert_eq!(held.canary_next, C + 1, "a canary is used once");
     }
 
+    /// Step 2: pausing a store keeps its watches. With the store read as
+    /// paused, the wake-up still finds the pool low and sends the delegated
+    /// Watch, and the arm is still held, so a payment for an invoice issued
+    /// before the pause is still seen and resuming needs nothing re-armed.
+    /// Mutated red by skipping the refill for a paused store.
+    #[test]
+    fn a_paused_store_keeps_its_watches() {
+        let mut secrets = delegated();
+        let arm = arm_record(&secrets).arm;
+        crate::auto_invoice::note_store_read(
+            &mut secrets,
+            &arm.store_contract_id,
+            Some(&crate::auto_invoice::Refusal::StorePaused),
+        );
+        let inbox = open_inbox();
+        let out = wake_and_read(&mut secrets, &inbox, NOW);
+        let (_, entry) = submitted(&out);
+        assert_eq!(opened(&entry).action, Action::Watch);
+        assert_eq!(arm_record(&secrets).arm, arm, "still armed");
+    }
+
     /// Review round 2 of #179, P1: a request the bridge IGNORED credits
     /// nothing, although the tab has every one of its pool addresses watched
     /// (so their watermarks advance). The tab's watch named no height, so the

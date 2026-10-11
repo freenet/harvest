@@ -5,6 +5,7 @@
 mod address_reread;
 mod auto_invoice_flow;
 mod backing_flow;
+mod backup_flow;
 mod bitcoin_generation;
 mod bitcoin_inbox;
 mod closure_flow;
@@ -21,7 +22,9 @@ mod markdown;
 mod messaging;
 mod migrate;
 mod order_threads;
+mod pause_flow;
 mod presence_flow;
+mod seller_book;
 mod state;
 mod store_link;
 mod voucher_flow;

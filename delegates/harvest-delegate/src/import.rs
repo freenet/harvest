@@ -270,6 +270,10 @@ pub(crate) enum Family {
     /// into its own slot, never as the active key, and only where this
     /// delegate holds none (an emptied slot counts as none).
     PendingPaymentXpub,
+    /// A seller's order book for one store (step 2,
+    /// `seller_orders`): merged record by record, each re-checked, under the
+    /// book's caps; nothing held is lost.
+    SellerOrders,
     /// Everything else: written only if absent.
     Standalone,
 }
@@ -321,6 +325,11 @@ pub(crate) fn family(key: &[u8]) -> Family {
         Family::KnownStore
     } else if key.starts_with(crate::kept_purchases::KEPT_PURCHASE_PREFIX.as_bytes()) {
         Family::KeptPurchase
+    } else if key == crate::seller_orders::SWEEP_CURSOR_KEY {
+        // This node's own place in its sweep: rebuilt here.
+        Family::Refused
+    } else if key.starts_with(crate::seller_orders::SELLER_ORDERS_PREFIX.as_bytes()) {
+        Family::SellerOrders
     } else if key.starts_with(b"harvest:folded:") {
         Family::Folded
     } else {
@@ -454,6 +463,7 @@ pub(crate) fn import_secret<S: SecretStore>(
         Family::SellerSent => import_seller_sent(store, key, value),
         Family::KnownStore => crate::known_stores::import(store, key, value),
         Family::KeptPurchase => crate::kept_purchases::import(store, key, value),
+        Family::SellerOrders => crate::seller_orders::import(store, key, value),
         // Only reached if a caller bypasses `import`; staging needs the
         // predecessor, so a direct copy is the one wrong answer.
         Family::Folded => SecretImport::Permanent("a travelling record needs its carrier".into()),
@@ -1231,9 +1241,13 @@ mod tests {
             Family::Refused,    // instant-checkout store read (closed, not ours)
             Family::SellerSent, // a seller's sent digests for one store
             Family::PublishedScripts,
-            Family::Refused, // published scripts' count
-            Family::Refused, // the active key's scan cursor
-            Family::Refused, // the pending key's scan cursor
+            Family::Refused,      // published scripts' count
+            Family::Refused,      // the active key's scan cursor
+            Family::Refused,      // the pending key's scan cursor
+            Family::SellerOrders, // a seller's open orders for one store
+            Family::SellerOrders, // a seller's sent orders for one store
+            Family::SellerOrders, // a seller's unpaid orders for one store
+            Family::Refused,      // the order-book sweep's place
         ];
         let shapes = crate::handlers::all_secret_key_shapes("fp1");
         assert_eq!(

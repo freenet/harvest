@@ -57,7 +57,6 @@ use ed25519_dalek::VerifyingKey;
 use freenet_bitcoin_common::{BitcoinNetwork, BlockAnchor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::listing::verify_scoped_signature;
 use crate::store::{Bytes32, StoreParameters, StoreStateV1};
 
 /// How many backings one store holds.
@@ -161,12 +160,16 @@ pub struct AuthorizedBacking {
     pub statement: BackingStatement,
     /// `ScopedPayload` from the Ghost Key vault, wrapping the CBOR of
     /// `statement`.
+    #[serde(with = "serde_bytes")]
     pub backer_scoped_payload: Vec<u8>,
     /// The Ghost Key's Ed25519 signature over `backer_scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub backer_signature: Vec<u8>,
     /// `ScopedPayload` wrapping the CBOR of [`BackingAcceptance`].
+    #[serde(with = "serde_bytes")]
     pub acceptance_scoped_payload: Vec<u8>,
     /// The store key's Ed25519 signature over `acceptance_scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub acceptance_signature: Vec<u8>,
 }
 
@@ -184,14 +187,14 @@ impl AuthorizedBacking {
                 self.statement.certificate_pem.len()
             ));
         }
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.backer_scoped_payload,
             &self.backer_signature,
             &self.statement.backer,
             &self.statement,
         )
         .map_err(|e| format!("backing is not signed by the Ghost Key it names: {e}"))?;
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.acceptance_scoped_payload,
             &self.acceptance_signature,
             owner,
@@ -223,13 +226,15 @@ pub struct Retirement {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedRetirement {
     pub retirement: Retirement,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
 impl AuthorizedRetirement {
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(
+        verify_exact_scoped_signature(
             &self.scoped_payload,
             &self.signature,
             owner,
@@ -256,7 +261,9 @@ pub struct StoreClosure {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedClosure {
     pub closure: StoreClosure,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -265,7 +272,7 @@ impl AuthorizedClosure {
         if self.closure.store != *owner {
             return Err("closure names a different store key than this store's owner".into());
         }
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.closure)
+        verify_exact_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.closure)
             .map_err(|e| format!("closure is not signed by the store key: {e}"))
     }
 }
@@ -277,6 +284,11 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     fn slot(&self) -> Bytes32;
     /// Whether the store owned by `owner` may hold this record.
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String>;
+    /// Whether each signed envelope the record carries is exactly the
+    /// Harvest envelope of what it signs ([`verify_exact_scoped_signature`]),
+    /// without checking any signature: a migration fold drops a record an
+    /// earlier generation kept that is not (`SignedSetV1::drop_inexact`).
+    fn exact(&self) -> bool;
     /// Which of two records for one slot is kept: the higher rank, and on
     /// equal ranks the smaller encoding. Zero for every record whose slot
     /// holds one statement for good (a backing, a retirement, a closure, a
@@ -288,6 +300,16 @@ pub trait SignedRecord: Serialize + DeserializeOwned + Clone + PartialEq + std::
     }
     /// What a verify error calls this kind of record.
     const WHAT: &'static str;
+    /// The most records of this kind a store holds, and so the most one
+    /// delta may carry (step 2): a longer delta is copies or records the
+    /// store would cut, and is refused before any of it is checked.
+    const MAX_RECORDS: usize;
+    /// Whether the set itself keeps only its [`Self::MAX_RECORDS`] newest
+    /// slots (the listing statuses), rather than a rule over the whole store
+    /// (the backings, `StoreStateV1::normalize_backings`) or `verify` (one
+    /// closure, one pause) holding it to the bound. See
+    /// `SignedSetV1::cut_to_newest`.
+    const CUT_TO_NEWEST: bool = false;
 }
 
 impl SignedRecord for AuthorizedBacking {
@@ -297,7 +319,17 @@ impl SignedRecord for AuthorizedBacking {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.backer_scoped_payload, &self.statement)
+            && exact_envelope(
+                &self.acceptance_scoped_payload,
+                &BackingAcceptance {
+                    backing: self.statement.clone(),
+                },
+            )
+    }
     const WHAT: &'static str = "backing";
+    const MAX_RECORDS: usize = MAX_BACKINGS;
 }
 
 impl SignedRecord for AuthorizedRetirement {
@@ -307,7 +339,11 @@ impl SignedRecord for AuthorizedRetirement {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.scoped_payload, &self.retirement)
+    }
     const WHAT: &'static str = "retirement";
+    const MAX_RECORDS: usize = MAX_BACKINGS;
 }
 
 impl SignedRecord for AuthorizedClosure {
@@ -317,9 +353,13 @@ impl SignedRecord for AuthorizedClosure {
     fn verify_for(&self, owner: &VerifyingKey) -> Result<(), String> {
         self.verify(owner)
     }
+    fn exact(&self) -> bool {
+        exact_envelope(&self.scoped_payload, &self.closure)
+    }
     // `verify` requires the closure to name the owner and to sit in its own
-    // slot, so a store holds at most one: there is no bound to exceed.
+    // slot, so a store holds at most one.
     const WHAT: &'static str = "closure";
+    const MAX_RECORDS: usize = 1;
 }
 
 /// The CBOR bytes of a record, which is what two records for one slot are
@@ -383,8 +423,8 @@ impl<T: SignedRecord> SignedSetV1<T> {
         self.records.is_empty()
     }
 
-    /// Fold one already-verified record in, keeping the higher rank and, on
-    /// equal ranks, the smaller encoding. See the type's docs.
+    /// Fold one record in, keeping the higher rank and, on equal ranks, the
+    /// smaller encoding. See the type's docs.
     fn merge_record(&mut self, incoming: T) {
         let slot = incoming.slot();
         match self.records.get(&slot) {
@@ -392,6 +432,96 @@ impl<T: SignedRecord> SignedSetV1<T> {
             _ => {
                 self.records.insert(slot, incoming);
             }
+        }
+    }
+
+    /// The records of `incoming` a merge has to look at: not one held here
+    /// as it is, nor one the delta already carried. Those change nothing,
+    /// so are not verified again: replayed copies of a genuine record cost
+    /// no signature checks (review round 4 of step 2: 4,000 copies of one
+    /// listing status cost five calls' budget). A delta carrying more than
+    /// [`SignedRecord::MAX_RECORDS`] is refused whole.
+    pub(crate) fn admit<'a>(&self, incoming: &'a [T]) -> Result<Vec<&'a T>, String> {
+        if incoming.len() > T::MAX_RECORDS {
+            return Err(format!(
+                "a delta of {} {} records is more than a store holds ({})",
+                incoming.len(),
+                T::WHAT,
+                T::MAX_RECORDS
+            ));
+        }
+        let mut fresh: Vec<&T> = Vec::with_capacity(incoming.len());
+        for record in incoming {
+            if self.records.get(&record.slot()) != Some(record) && !fresh.contains(&record) {
+                fresh.push(record);
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Merge records in WITHOUT verifying them: for a caller that has, or
+    /// that checks what the merge kept and what it did not
+    /// (`StoreStateV1::apply_update`).
+    pub(crate) fn merge_unchecked<'a>(&mut self, records: impl IntoIterator<Item = &'a T>)
+    where
+        T: 'a,
+    {
+        for record in records {
+            self.merge_record(record.clone());
+        }
+        if T::CUT_TO_NEWEST {
+            self.cut_to_newest();
+        }
+    }
+
+    /// Keep the [`SignedRecord::MAX_RECORDS`] slots whose records rank
+    /// highest, the smaller slot first between two at one rank (step 2, for
+    /// the listing statuses).
+    ///
+    /// # Why it obeys the merge laws, though a merge can raise a slot's rank
+    ///
+    /// A slot ranks by the record it holds, and a later record for it ranks
+    /// higher, so unlike the order cap's ranking (`store::enforce_order_cap`)
+    /// a merge can move a slot up. The kept set is still a function of the
+    /// union: the top slots by their best record in it. Take a slot cut from
+    /// one side: N slots rank above its best record there, and they rank at
+    /// least as high in any union containing that side. If the union brings
+    /// the slot a better record, the slot is judged on that one, wherever it
+    /// came from; if not, its best record is one that was cut, and it is cut
+    /// again. Either way cutting it early changed nothing, so the cut is
+    /// idempotent, commutative and associative. The seeded laws in
+    /// `store::status_tests` check it on bytes.
+    pub(crate) fn cut_to_newest(&mut self) {
+        if self.records.len() <= T::MAX_RECORDS {
+            return;
+        }
+        let mut ranked: Vec<(u64, Bytes32)> = self
+            .records
+            .iter()
+            .map(|(slot, record)| (record.rank(), *slot))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, slot) in ranked.into_iter().skip(T::MAX_RECORDS) {
+            self.records.remove(&slot);
+        }
+    }
+
+    /// Drop every record whose envelopes are not exact
+    /// ([`SignedRecord::exact`]): for a state an earlier generation wrote,
+    /// which kept them, that a migration fold carries forward (step 2). The
+    /// record is dropped, not the state: refusing the state would discard
+    /// everything else an earlier generation held beside it. Every producer
+    /// builds the exact envelope, so no honest record is one.
+    pub fn drop_inexact(&mut self) {
+        self.records.retain(|_, record| record.exact());
+    }
+
+    /// The set as this generation keeps it, for a state an earlier one wrote
+    /// that a migration fold carries forward (see
+    /// `StoreStateV1::normalize_carried`).
+    pub fn normalize(&mut self) {
+        if T::CUT_TO_NEWEST {
+            self.cut_to_newest();
         }
     }
 }
@@ -412,6 +542,16 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
     ) -> Result<(), String> {
         if self.records.is_empty() {
             return Ok(());
+        }
+        // The bound first: it is cheap, and a state past it is refused before
+        // a single signature is checked.
+        if self.records.len() > T::MAX_RECORDS {
+            return Err(format!(
+                "store holds {} {} records, the most it keeps is {}",
+                self.records.len(),
+                T::WHAT,
+                T::MAX_RECORDS
+            ));
         }
         let owner = crate::store::owner_key(parent_state)?;
         for (slot, record) in &self.records {
@@ -478,21 +618,21 @@ impl<T: SignedRecord> freenet_scaffold::ComposableState for SignedSetV1<T> {
         if incoming.is_empty() {
             return Ok(());
         }
-        // Verify the whole delta before merging any of it, and merge into a
-        // copy, so a refused delta leaves `self` exactly as it was -- the
-        // discipline `OrdersV1::apply_delta` states.
-        let owner = crate::store::owner_key(parent_state)?;
-        for record in incoming {
-            record.verify_for(owner)?;
+        let fresh = self.admit(incoming)?;
+        // Verify the whole delta before merging any of it, so a refused
+        // delta leaves `self` exactly as it was -- the discipline
+        // `OrdersV1::apply_delta` states.
+        if !fresh.is_empty() {
+            let owner = crate::store::owner_key(parent_state)?;
+            for record in &fresh {
+                record.verify_for(owner)?;
+            }
         }
-        let mut next = self.clone();
-        for record in incoming {
-            next.merge_record(record.clone());
-        }
-        // No bound is applied here. The bound on backings and retirements
-        // is about the store as a whole, so `StoreStateV1::normalize_backings`
-        // applies it after every part has been merged; see [`MAX_BACKINGS`].
-        *self = next;
+        // No store-wide bound is applied here. The bound on backings and
+        // retirements is about the store as a whole, so
+        // `StoreStateV1::normalize_backings` applies it after every part has
+        // been merged; see [`MAX_BACKINGS`].
+        self.merge_unchecked(fresh);
         Ok(())
     }
 }
@@ -632,6 +772,8 @@ pub enum StoreKeyMessage {
     Despatch,
     /// The seller is online (`crate::presence`).
     Heartbeat,
+    /// The seller paused or resumed the store (`crate::store_pause`).
+    Pause,
 }
 
 /// Which kind of store-key message `payload` is, or `None` if it is none of
@@ -671,6 +813,10 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
     // anything above from decoding as it.
     } else if is::<crate::presence::Heartbeat>(payload) {
         Some(StoreKeyMessage::Heartbeat)
+    // After the heartbeat, for the same reason; its own one-variant `kind`
+    // tag keeps it apart from everything above.
+    } else if is::<crate::store_pause::StorePause>(payload) {
+        Some(StoreKeyMessage::Pause)
     } else {
         None
     }
@@ -678,7 +824,7 @@ pub fn classify_store_key_message(payload: &[u8]) -> Option<StoreKeyMessage> {
 
 /// The `ScopedPayload` envelope around `payload`, with the Harvest webapp as
 /// requestor: the same shape the Ghost Key vault signs, so
-/// [`verify_scoped_signature`] verifies a store-key signature exactly as it
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature) verifies a store-key signature exactly as it
 /// verifies a Ghost Key's.
 ///
 /// Built with `ghostkey-common`'s own type when that feature is on, which is
@@ -698,11 +844,50 @@ pub fn store_key_envelope(payload: Vec<u8>) -> Result<Vec<u8>, String> {
     }
 }
 
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature), for a record a store holds whose content has
+/// a fixed shape (step 2): `scoped` must also be EXACTLY the Harvest envelope
+/// of `data` ([`is_exact_harvest_envelope`]).
+///
+/// The store's state has a byte bound (`store::MAX_STORE_BYTES`), and every
+/// state its caps allow must fit under it, or two valid states could merge
+/// into one the contract refuses. A record's size is then a function of its
+/// content only if its envelope is: without this a signer (the store key, a
+/// Ghost Key backing it) could pad the envelope with bytes after the CBOR item
+/// or map keys the decoder skips, and the record would still verify. Every
+/// producer builds the exact envelope: [`store_key_envelope`], and the Ghost
+/// Key vault, which encodes the same `ScopedPayload` the same way.
+pub fn verify_exact_scoped_signature<T: Serialize>(
+    scoped: &[u8],
+    signature: &[u8],
+    key: &VerifyingKey,
+    data: &T,
+) -> Result<(), String> {
+    if !exact_envelope(scoped, data) {
+        return Err("its signed payload is not exactly the Harvest envelope of the record".into());
+    }
+    // `scoped` is now byte for byte the envelope of `data` with a Harvest
+    // webapp as requestor, which is everything `verify_scoped_signature`
+    // decodes the envelope to compare: only the signature is left, and
+    // decoding and encoding again would only add cost.
+    use ed25519_dalek::Verifier;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| format!("signature must be 64 bytes, got {}", signature.len()))?;
+    key.verify(scoped, &ed25519_dalek::Signature::from_bytes(&signature))
+        .map_err(|e| format!("signature verification failed: {e}"))
+}
+
+/// Whether `scoped` is exactly the Harvest envelope of `data`'s encoding
+/// ([`is_exact_harvest_envelope`]).
+pub fn exact_envelope<T: Serialize>(scoped: &[u8], data: &T) -> bool {
+    crate::to_cbor(data).is_ok_and(|payload| is_exact_harvest_envelope(scoped, &payload))
+}
+
 /// Whether `scoped` is EXACTLY the envelope [`store_key_envelope`] builds
 /// around `payload`, for the canonical Harvest webapp id or a legacy one
 /// (`LEGACY_HARVEST_WEBAPP_CONTRACT_IDS`).
 ///
-/// [`verify_scoped_signature`] decodes the envelope and compares the inner
+/// [`verify_scoped_signature`](crate::listing::verify_scoped_signature) decodes the envelope and compares the inner
 /// payload, which is the right check for a record whose envelope nobody
 /// keeps; it lets a signer append bytes after the CBOR item, or add a map
 /// key the decoder skips, and still verify. A record that is stored forever
@@ -717,7 +902,7 @@ pub fn is_exact_harvest_envelope(scoped: &[u8], payload: &[u8]) -> bool {
 
 /// The envelope around `payload` with the webapp contract `id` (base58) as
 /// requestor. [`store_key_envelope`] is this with the canonical id.
-fn envelope_with_requestor(id: &str, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+pub(crate) fn envelope_with_requestor(id: &str, payload: Vec<u8>) -> Result<Vec<u8>, String> {
     #[cfg(feature = "ghostkey")]
     {
         use freenet_stdlib::prelude::ContractInstanceId;
@@ -1121,12 +1306,21 @@ mod tests {
     #[test]
     fn a_union_past_the_bound_keeps_the_smallest_keys_and_everything_else() {
         let many = many_backings(MAX_BACKINGS + 3);
+        // Two updates, each within what a delta may carry, whose union is
+        // past the bound; the closure comes with the second.
+        let (first, second) = many.split_at(MAX_BACKINGS - 4);
         let mut next = StoreStateV1::default();
         next.apply_delta(
             &StoreStateV1::default(),
             &params(),
+            &Some(delta_with(first.to_vec(), vec![], vec![])),
+        )
+        .expect("within the bound");
+        next.apply_delta(
+            &StoreStateV1::default(),
+            &params(),
             &Some(delta_with(
-                many.clone(),
+                second.to_vec(),
                 vec![],
                 vec![closure_by(&store_key(), &store_key())],
             )),
@@ -2201,8 +2395,13 @@ mod tests {
         };
         let (scoped, sig) =
             sign_with_store_key(&store_key(), crate::to_cbor(&retirement).unwrap()).unwrap();
-        verify_scoped_signature(&scoped, &sig, &store_key().verifying_key(), &retirement)
-            .expect("the same verifier as every other record");
+        crate::listing::verify_scoped_signature(
+            &scoped,
+            &sig,
+            &store_key().verifying_key(),
+            &retirement,
+        )
+        .expect("the same verifier as every other record");
         // And the envelope is ghostkey-common's own type, requestor included.
         #[cfg(feature = "ghostkey")]
         {

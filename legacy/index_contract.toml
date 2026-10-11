@@ -58,3 +58,9 @@ version = "V7"
 description = "Superseded by listing photos (harvest images PR 2), which changed `harvest-common`: `Listing` gained `images` (a list of `ListingImage` references, each naming an image contract by the BLAKE3 hash of its bytes, harvest#212), `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]` so every earlier listing encodes, and so is identified and signed, exactly as before (pinned by `a_listing_without_photos_encodes_and_is_identified_as_before`); a new `listing_image` module holds the types and the store's bounds on them. `harvest-common` is compiled into every artifact, so its changes move these bytes whether or not this artifact's own behaviour changed. This one's merge, validation and state encoding are unchanged, and the parameters are unchanged. The generation the delegated watch key shipped (harvest#179)."
 date = "2026-10-01"
 code_hash = "56b3c70f4155823a4c22f08ba29769880735c6cd2a231349ace7617ba6a61c2a"
+
+[[entry]]
+version = "V8"
+description = "Superseded by step 2, which changed `harvest-common` (the store pause, the listing and order caps, the minimal proof on `Paid`, the store's signed records as byte strings). `harvest-common` is compiled into every artifact, so its changes move these bytes; this contract's behaviour did not change, and its state, parameters and wire format are V8's. The generation harvest#215 shipped (`57979f8`), unchanged through #221 and #229."
+date = "2026-10-04"
+code_hash = "44bcc983a6e6c21896f3cd72aa086ec8832cffcd2085a6ce28630250d4fe8abc"

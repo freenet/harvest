@@ -894,14 +894,22 @@ impl AppState {
         let address_code_hash = self.bitcoin.address_generation.0.clone().ok()?;
         // Only what the bridge has READ a request for, and the watch is
         // counted from the earliest of those requests. A renewal not yet read
-        // does not end the watch the last read request started.
-        let inbox = self.bitcoin.inbox.as_ref()?;
+        // does not end the watch the last read request started. Not needed
+        // for an arm naming nothing (after a newly paid address), which must
+        // go out even before the inbox is known (step 2, money lens).
+        let inbox = if upcoming.is_empty() {
+            None
+        } else {
+            Some(self.bitcoin.inbox.as_ref()?)
+        };
         let mut watched_scripts = Vec::new();
         let mut earliest: Option<u64> = None;
         // The nearest horizon among them, or `None` once any lacks one.
         let mut horizon: Option<Option<u32>> = None;
         for address in upcoming {
-            let Some(sent) = inbox.sent.get(&(network, address.script_pubkey.clone())) else {
+            let Some(sent) =
+                inbox.and_then(|inbox| inbox.sent.get(&(network, address.script_pubkey.clone())))
+            else {
                 break;
             };
             let Some(read_at) = (if sent.read {
@@ -972,7 +980,29 @@ impl AppState {
     /// ask without taking the state for writing.
     pub(crate) fn plan_auto_invoice(&self, now_ms: u64) -> AutoInvoiceWork {
         let mut work = AutoInvoiceWork::default();
-        let stores = self.instant_checkout_stores();
+        let mut stores = self.instant_checkout_stores();
+        // After a newly paid address, every store this session armed gets the
+        // empty arm, including one that has since stopped selling by Buy now
+        // and so dropped out of the list (step 2, money lens): its delegate
+        // still holds the old window.
+        if self.auto_invoice.paid_since_read {
+            let mut fingerprints: Vec<&String> = self.my_stores.keys().collect();
+            fingerprints.sort();
+            for fingerprint in fingerprints {
+                for registration in &self.my_stores[fingerprint] {
+                    if self
+                        .auto_invoice
+                        .sent
+                        .contains_key(&registration.store_contract_id)
+                        && !stores
+                            .iter()
+                            .any(|(_, r)| r.store_contract_id == registration.store_contract_id)
+                    {
+                        stores.push((fingerprint.clone(), registration.clone()));
+                    }
+                }
+            }
+        }
         if stores.is_empty() {
             return work;
         }

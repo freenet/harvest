@@ -109,6 +109,16 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo check --locked --manifest-path tests/rehearsal/Cargo.toml
 
+      # The merge-law corpus generator is its own workspace too (so it can
+      # never move a dependency version the contracts compile against), and
+      # `fdev verify-merge` runs outside CI: without this, a change to the
+      # store's types breaks it silently until the next sweep (step 2's
+      # review round 4).
+      - name: check the merge-law corpus generator compiles
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --locked --manifest-path tests/merge-laws/gen/Cargo.toml
+
   wasm:
     name: contracts, delegate and UI build to wasm
     runs-on: ubuntu-latest

@@ -427,7 +427,7 @@ fn apply_published_floor(
 /// How many indices one call's scan may derive (#206). Each is a public-key
 /// derivation, about 3.2 million units of the node's fuel, so this is about a
 /// third of a call. A device whose counter is far behind its published orders
-/// (a new device for a busy key; a store holds up to 4,096 orders) catches up
+/// (a new device for a busy key; a store holds up to 256 orders) catches up
 /// over several calls, the cursor saved after each, rather than in one call
 /// the node would stop.
 pub(crate) const FLOOR_SCAN_BUDGET: u32 = 384;
@@ -1991,6 +1991,36 @@ mod origin_gating_tests {
             other => panic!("expected OrderAddress, got {other:?}"),
         }
         assert_eq!(load_payment_xpub(&store).map(|s| s.next_index), Some(4));
+    }
+
+    /// Step 2: a manual invoice still goes out while the store is paused.
+    /// `DeriveOrderAddress` reads no store's pause; a paused seller answering
+    /// a request by hand is acting on purpose. Mutated red by refusing it
+    /// while any store reads as paused.
+    #[test]
+    fn a_manual_invoice_still_goes_out_while_paused() {
+        let mut store = MemSecrets::default();
+        seller_sets(&mut store, SELLERS_KEY);
+        crate::auto_invoice::note_store_read(
+            &mut store,
+            &[1; 32],
+            Some(&crate::auto_invoice::Refusal::StorePaused),
+        );
+        match handle(
+            &mut store,
+            Some(&harvest()),
+            BitcoinDelegateRequest::DeriveOrderAddress {
+                request_id: 2,
+                published_scripts: Vec::new(),
+            },
+        )
+        .expect("authorized")
+        {
+            BitcoinDelegateResponse::OrderAddress { result, .. } => {
+                result.expect("derived while paused");
+            }
+            other => panic!("expected OrderAddress, got {other:?}"),
+        }
     }
 
     /// **PR #83 review, Should Fix 8.** A stale device, not a fresh one: it

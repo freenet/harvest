@@ -1514,6 +1514,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation,
                 order: paid,
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeptPurchases",
@@ -1528,6 +1529,8 @@ fn scenario(r: &mut Runner) -> Result<()> {
             receipt_seed,
             order: orders.paid(orders.order(n, receipt_key)),
             complaint: None,
+            backed_up: false,
+            despatch: None,
         };
         let id: String = record
             .order
@@ -1572,6 +1575,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation: last_conversation,
                 order: orders.paid(orders.order(KEPT_PURCHASES as u32, last_receipt)),
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeptPurchases",
@@ -1588,6 +1592,7 @@ fn scenario(r: &mut Runner) -> Result<()> {
                 conversation: stranger,
                 order: orders.paid(orders.order(KEPT_PURCHASES as u32 + 1, last_receipt)),
                 complaint: None,
+                despatch: None,
             }),
         }),
         "KeepPurchaseRefused",
@@ -1619,6 +1624,92 @@ fn scenario(r: &mut Runner) -> Result<()> {
         ),
     }
 
+    // --- one backup of everything (step 2) -----------------------------------
+    // Every page of the export, with every conversation and purchase at its
+    // cap: each page is one call, measured under one name (the most
+    // expensive is reported). Then one import chunk of
+    // `BACKUP_IMPORT_ITEMS` paid purchases this node does not hold, each
+    // checked as a fresh keep is (the costly case), with the state put
+    // back after.
+    let mut after: Option<String> = None;
+    let (mut exported_conversations, mut exported_purchases, mut pages) = (0usize, 0usize, 0usize);
+    let mut first_purchases: Vec<KeptPurchase> = Vec::new();
+    loop {
+        let answer = r.app(
+            "ExportPurchasesBackup (a page, everything at its caps)",
+            cbor(&HarvestDelegateRequest::ExportPurchasesBackup {
+                request_id: 950,
+                after: after.clone(),
+            }),
+            "PurchasesBackup",
+        )?;
+        pages += 1;
+        let page = field(&answer, &["PurchasesBackup", "result", "Ok"])?;
+        if let Value::Array(c) = field(page, &["conversations"])? {
+            exported_conversations += c.len();
+        }
+        if let Value::Array(p) = field(page, &["purchases"])? {
+            exported_purchases += p.len();
+            for item in p {
+                if first_purchases.len() < harvest_common::delegate::BACKUP_IMPORT_ITEMS {
+                    first_purchases.push(item.deserialized()?);
+                }
+            }
+        }
+        match field(page, &["next"])? {
+            Value::Text(next) => after = Some(next.clone()),
+            _ => break,
+        }
+        if pages > 10_000 {
+            bail!("the backup export never ends");
+        }
+    }
+    if exported_conversations != buyer_conversations || exported_purchases != KEPT_PURCHASES {
+        bail!(
+            "the backup exported {exported_conversations} conversations and \
+             {exported_purchases} purchases, expected {buyer_conversations} and {KEPT_PURCHASES}"
+        );
+    }
+    println!("  (backup: {pages} pages)");
+    let snapshot = r.host.state.secrets.clone();
+    for purchase in &first_purchases {
+        let id: String = purchase
+            .order
+            .order
+            .id
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        r.host
+            .state
+            .secrets
+            .remove(format!("harvest:kept_purchase:{id}").as_bytes());
+    }
+    let imported = r.app(
+        &format!(
+            "ImportPurchasesBackup ({} paid purchases not held)",
+            first_purchases.len()
+        ),
+        cbor(&HarvestDelegateRequest::ImportPurchasesBackup {
+            request_id: 951,
+            conversations: Vec::new(),
+            purchases: first_purchases.clone(),
+        }),
+        "PurchasesBackupImported",
+    )?;
+    match field(&imported, &["PurchasesBackupImported", "result", "Ok"])? {
+        Value::Array(o)
+            if o.len() == first_purchases.len()
+                && o.iter()
+                    .all(|v| matches!(v, Value::Text(t) if t == "Imported")) => {}
+        other => bail!(
+            "the backup import did not restore every purchase: {}",
+            brief(other)
+        ),
+    }
+    r.host.state.secrets = snapshot;
+
     // --- the buyer's remembered stores, to the cap --------------------------
     for i in 0..caps.known_stores {
         let mut seed = [0x33u8; 32];
@@ -1649,16 +1740,57 @@ fn scenario(r: &mut Runner) -> Result<()> {
         );
     }
 
+    let at = InstantStore {
+        contract: store_contract,
+        verifying_key: store,
+        mailbox: mailbox_contract,
+        inbox,
+        fingerprint: &fingerprint,
+        tip_contract,
+        trusted: &trusted,
+    };
     instant_decide(
         r,
-        &InstantStore {
-            contract: store_contract,
-            verifying_key: store,
-            mailbox: mailbox_contract,
-            inbox,
-            fingerprint: &fingerprint,
-            tip_contract,
-            trusted: &trusted,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: 0,
+            full_mailbox: true,
+            full_book: false,
+        },
+    )?;
+    // Step 2: the seller's own book at every cap; decide writes the order it
+    // signs into it.
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: 0,
+            full_mailbox: false,
+            full_book: true,
+        },
+    )?;
+    // Step 2: the same store at both listing caps, the worst case the caps
+    // allow; and with a long status history, which nothing caps.
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: true,
+            statuses: 0,
+            full_mailbox: false,
+            full_book: false,
+        },
+    )?;
+    instant_decide(
+        r,
+        &at,
+        &DecideShape {
+            listings_at_cap: false,
+            statuses: DECIDE_STATUSES,
+            full_mailbox: false,
+            full_book: false,
         },
     )?;
 
@@ -1765,6 +1897,110 @@ fn scenario(r: &mut Runner) -> Result<()> {
     Ok(())
 }
 
+/// A listing as large as a store keeps ([`harvest_common::store::MAX_LISTING_BYTES`]),
+/// signed for real so its signed payload is its real size: every field the
+/// listing form offers at its maximum (8 photos with full alt text, 4
+/// choice groups of 12 options, 12 delivery regions, every name at its
+/// longest, a certificate at the backing bound), then the description
+/// padded until one more character would not fit. A store at its listing
+/// cap holds `MAX_LISTINGS` (128) of these.
+fn listing_at_cap(
+    base: &harvest_common::listing::Listing,
+    i: usize,
+    signer: &SigningKey,
+) -> Result<harvest_common::listing::AuthorizedListing> {
+    use harvest_common::listing_image::{ImageBlob, ListingImage, MAX_ALT_CHARS, MAX_IMAGES_HARD};
+    let build = |desc: usize| -> Result<harvest_common::listing::AuthorizedListing> {
+        use harvest_common::listing::{
+            ChoiceGroup, DeliveryPrice, FixedCheckout, RegionPrice, MAX_CHOICE_GROUPS,
+            MAX_CHOICE_OPTIONS, MAX_DELIVERY_REGIONS, MAX_TERM_NAME_CHARS,
+        };
+        let name = |what: &str, k: usize| {
+            let mut n = format!("{what} {k} ");
+            n.extend(std::iter::repeat_n(
+                'n',
+                MAX_TERM_NAME_CHARS.saturating_sub(n.len()),
+            ));
+            n
+        };
+        let mut l = base.clone();
+        l.title = format!("Listing {i}: a jar of plum jam from the orchard");
+        l.description = "d".repeat(desc);
+        l.choices = (0..MAX_CHOICE_GROUPS)
+            .map(|g| ChoiceGroup {
+                name: name("Choice", g),
+                options: (0..MAX_CHOICE_OPTIONS)
+                    .map(|o| name("Option", g * 100 + o))
+                    .collect(),
+            })
+            .collect();
+        l.checkout = Some(FixedCheckout {
+            unit_sats: 10_000,
+            delivery: DeliveryPrice::ByRegion(
+                (0..MAX_DELIVERY_REGIONS)
+                    .map(|r| RegionPrice {
+                        region: name("Region", r),
+                        sats: 2_000 + r as u64,
+                    })
+                    .collect(),
+            ),
+        });
+        l.images = (0..MAX_IMAGES_HARD as u8)
+            .map(|p| ListingImage {
+                full: ImageBlob {
+                    hash: harvest_common::store::Bytes32([p + 30; 32]),
+                    len: 200_000,
+                    width: 1600,
+                    height: 1200,
+                },
+                thumb: (p == 0).then_some(ImageBlob {
+                    hash: harvest_common::store::Bytes32([99; 32]),
+                    len: 20_000,
+                    width: 400,
+                    height: 300,
+                }),
+                colour: [10, 200, 30],
+                alt: "a".repeat(MAX_ALT_CHARS),
+            })
+            .collect();
+        l.created_at = fixtures::ts(1_600_000_000 + i as i64);
+        let l = l.with_derived_id();
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(signer, cbor(&l))
+                .map_err(|e| anyhow!("{e}"))?;
+        Ok(harvest_common::listing::AuthorizedListing {
+            listing: l,
+            scoped_payload,
+            signature,
+            certificate_pem: "c".repeat(harvest_common::backing::MAX_CERTIFICATE_PEM_BYTES),
+        })
+    };
+    let fits = |a: &harvest_common::listing::AuthorizedListing| {
+        cbor(a).len() <= harvest_common::store::MAX_LISTING_BYTES
+    };
+    let (mut lo, mut hi) = (0usize, harvest_common::store::MAX_LISTING_BYTES);
+    if !fits(&build(0)?) {
+        bail!("a listing with every photo and full alt text does not fit the listing bound");
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&build(mid)?) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if i == 0 {
+        println!(
+            "  (a listing at every field maximum is {} bytes with no description; the {}-byte \
+             bound leaves it {lo} characters of description)",
+            cbor(&build(0)?).len(),
+            harvest_common::store::MAX_LISTING_BYTES
+        );
+    }
+    build(lo)
+}
+
 /// The first store's instant-checkout arm, as [`instant_decide`] needs it.
 struct InstantStore<'a> {
     contract: [u8; 32],
@@ -1817,7 +2053,408 @@ impl InstantStore<'_> {
 /// counter has caught up. `decide` does not check an order's signature, so
 /// each is signed by a fixture key at its real size, with a genuine SPV
 /// payment proof.
-fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
+/// How many listing statuses the long-history decide carries: about one per
+/// listing version ever published (an edit publishes a new version).
+const DECIDE_STATUSES: usize = 10_000;
+
+/// What else the store holds beside its `MAX_ORDERS` paid orders (step 2).
+struct DecideShape {
+    /// `MAX_LISTINGS` listings at `MAX_LISTING_BYTES` each: both caps.
+    listings_at_cap: bool,
+    /// Listing statuses, which are not capped: one per listing version ever
+    /// published.
+    statuses: usize,
+    /// Also measure a full mailbox of instant requests (once is enough).
+    full_mailbox: bool,
+    /// The seller's own order book at every cap (step 2), each request's
+    /// texts at their bound: decide writes the order it signs into it, and
+    /// the book's own calls are measured against it.
+    full_book: bool,
+}
+
+/// 32 bytes for the `n`th fixture of a kind.
+fn book_bytes(kind: &[u8], n: u64) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(kind);
+    h.update(&n.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// The delegate's open half of a seller's book, as `seller_orders` stores
+/// it.
+#[derive(serde::Serialize)]
+struct OpenBook {
+    orders: Vec<harvest_common::delegate::SellerKeptOrder>,
+}
+
+/// The store key the delegate holds for `at` (`CreateStoreKey` made it).
+fn store_signer(r: &Runner, at: &InstantStore) -> Result<SigningKey> {
+    let seed = r
+        .host
+        .state
+        .secrets
+        .get(
+            format!(
+                "harvest:store_sk:{}",
+                bs58::encode(at.verifying_key).into_string()
+            )
+            .as_bytes(),
+        )
+        .ok_or_else(|| anyhow!("the delegate holds no key for the instant store"))?;
+    let seed: [u8; 32] = seed.as_slice().try_into()?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// The seller's book for `at`, filled to every cap: the paid orders of
+/// `paid` not yet sent (up to `MAX_SELLER_UNSENT_KEPT`), as many unpaid
+/// ones as it keeps, and as many sent ones, every request's texts at their
+/// bound. Answers the paid-unsent records, for the calls measured on it.
+fn fill_book(
+    r: &mut Runner,
+    at: &InstantStore,
+    fx: &fixtures::OrderFx,
+    paid: &[harvest_common::payment::AuthorizedOrder],
+) -> Result<Vec<harvest_common::delegate::SellerKeptOrder>> {
+    use harvest_common::delegate::{
+        KeptRequest, SellerKeptOrder, MAX_KEPT_REQUEST_TEXT, MAX_SELLER_SENT_KEPT,
+        MAX_SELLER_UNPAID_KEPT, MAX_SELLER_UNSENT_KEPT,
+    };
+    let request = |n: u64| KeptRequest {
+        listing_id: harvest_common::listing::ListingId(book_bytes(b"listing", n)),
+        quantity: 1,
+        shipping: "s".repeat(MAX_KEPT_REQUEST_TEXT),
+        note: "n".repeat(MAX_KEPT_REQUEST_TEXT),
+        region: Some("r".repeat(40)),
+        choices: vec!["c".repeat(40); 4],
+        conversation: book_bytes(b"conversation", n),
+    };
+    // Signed as the store key signs an order, so the delegate's checks of
+    // a record the tab sends pass.
+    let signer = store_signer(r, at)?;
+    let resign = |mut order: harvest_common::payment::AuthorizedOrder| -> Result<_> {
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(&signer, cbor(&order.order))
+                .map_err(|e| anyhow!("{e}"))?;
+        order.scoped_payload = scoped_payload;
+        order.signature = signature;
+        Ok(order)
+    };
+    let record = |order, n| SellerKeptOrder {
+        order,
+        request: Some(request(n)),
+        despatch: None,
+        paid_height: Some(100),
+        sent_off_store: false,
+        seal: None,
+    };
+    let mut paid_unsent: Vec<SellerKeptOrder> = Vec::new();
+    let mut extra = 0u32;
+    while paid_unsent.len() < MAX_SELLER_UNSENT_KEPT {
+        let order = match paid.get(paid_unsent.len()) {
+            Some(o) => o.clone(),
+            None => {
+                extra += 1;
+                fx.paid(fx.order(200_000 + extra, [0x5B; 32]))
+            }
+        };
+        let n = paid_unsent.len() as u64;
+        paid_unsent.push(record(resign(order)?, n));
+    }
+    let open = paid_unsent.clone();
+    let mut unpaid_stage = Vec::new();
+    let unpaid = |k: u32| -> Result<harvest_common::payment::AuthorizedOrder> {
+        let mut order = fx.paid(fx.order(k, [0x5B; 32]));
+        order.status = harvest_common::payment::OrderStatus::AwaitingPayment;
+        order.payment_proof = None;
+        resign(order)
+    };
+    // The unpaid stage full: what decide and a store notification read and
+    // write. Its unpaid orders, and as many paid ones waiting for room in a
+    // full paid stage (kept without their proof, with their paid height).
+    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
+        unpaid_stage.push(record(unpaid(100_000 + k)?, 10_000 + u64::from(k)));
+    }
+    for k in 0..MAX_SELLER_UNPAID_KEPT as u32 {
+        let mut order = resign(fx.paid(fx.order(400_000 + k, [0x5B; 32])))?;
+        order.payment_proof = None;
+        unpaid_stage.push(record(order, 30_000 + u64::from(k)));
+    }
+    let mut done = Vec::new();
+    for k in 0..MAX_SELLER_SENT_KEPT as u32 {
+        // A sent order is kept without its proof (`seller_orders::file`).
+        let mut order = resign(fx.paid(fx.order(300_000 + k, [0x5B; 32])))?;
+        order.payment_proof = None;
+        let despatch = harvest_common::fulfilment::Despatch {
+            order_id: order.order.id.clone(),
+            anchor: freenet_bitcoin_common::BlockAnchor {
+                height: 120,
+                hash: freenet_bitcoin_common::BlockHash([7u8; 32]),
+            },
+        };
+        let (scoped_payload, signature) =
+            harvest_common::backing::sign_with_store_key(&signer, cbor(&despatch))
+                .map_err(|e| anyhow!("{e}"))?;
+        let mut r = record(order, 20_000 + u64::from(k));
+        r.despatch = Some(harvest_common::fulfilment::AuthorizedDespatch {
+            despatch,
+            scoped_payload,
+            signature,
+        });
+        done.push(r);
+    }
+    let key = bs58::encode(at.verifying_key).into_string();
+    let open_bytes = cbor(&OpenBook { orders: open });
+    let done_bytes = cbor(&done);
+    println!(
+        "  (seller's book: {} open records, {} KiB; {} sent, {} KiB)",
+        MAX_SELLER_UNSENT_KEPT,
+        open_bytes.len() / 1024,
+        done.len(),
+        done_bytes.len() / 1024
+    );
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:open:{key}").into_bytes(),
+        open_bytes,
+    );
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:done:{key}").into_bytes(),
+        done_bytes,
+    );
+    r.host.state.secrets.insert(
+        format!("harvest:seller_orders:unpaid:{key}").into_bytes(),
+        cbor(&unpaid_stage),
+    );
+    Ok(paid_unsent)
+}
+
+/// The seller's book's own calls, on the full book [`fill_book`] made.
+fn book_calls(
+    r: &mut Runner,
+    at: &InstantStore,
+    paid_unsent: &[harvest_common::delegate::SellerKeptOrder],
+) -> Result<()> {
+    let inbox = r
+        .host
+        .state
+        .secrets
+        .get(
+            format!(
+                "harvest:seller_orders:unpaid:{}",
+                bs58::encode(at.verifying_key).into_string()
+            )
+            .as_bytes(),
+        )
+        .cloned()
+        .ok_or_else(|| anyhow!("no inbox seeded"))?;
+    use harvest_common::delegate::SELLER_ORDERS_PER_CALL;
+    let signer = store_signer(r, at)?;
+    // A tab marking orders sent: each moves from the open half to the sent
+    // half, both rewritten, the oldest sent ones cut.
+    let sent: Vec<_> = paid_unsent
+        .iter()
+        .take(SELLER_ORDERS_PER_CALL)
+        .map(|record| {
+            let despatch = harvest_common::fulfilment::Despatch {
+                order_id: record.order.order.id.clone(),
+                anchor: freenet_bitcoin_common::BlockAnchor {
+                    height: 130,
+                    hash: freenet_bitcoin_common::BlockHash([7u8; 32]),
+                },
+            };
+            let (scoped_payload, signature) =
+                harvest_common::backing::sign_with_store_key(&signer, cbor(&despatch))
+                    .map_err(|e| anyhow!("{e}"))?;
+            let mut r = record.clone();
+            r.despatch = Some(harvest_common::fulfilment::AuthorizedDespatch {
+                despatch,
+                scoped_payload,
+                signature,
+            });
+            Ok(r)
+        })
+        .collect::<Result<_>>()?;
+    let kept = r.app(
+        &format!("KeepSellerOrders ({SELLER_ORDERS_PER_CALL} sent, a full book)"),
+        cbor(&HarvestDelegateRequest::KeepSellerOrders {
+            request_id: 960,
+            store_key: at.verifying_key,
+            orders: sent,
+        }),
+        "SellerOrdersKept",
+    )?;
+    match field(&kept, &["SellerOrdersKept", "result", "Ok"])? {
+        Value::Integer(n) if i128::from(*n) == SELLER_ORDERS_PER_CALL as i128 => {}
+        other => bail!("the full book kept {} of the sent orders", brief(other)),
+    }
+    let mut after: Option<harvest_common::payment::OrderId> = None;
+    let mut pages = 0;
+    loop {
+        let answer = r.app(
+            "ListSellerOrders (a page, a full book)",
+            cbor(&HarvestDelegateRequest::ListSellerOrders {
+                request_id: 961,
+                store_key: at.verifying_key,
+                after: after.clone(),
+            }),
+            "SellerOrders",
+        )?;
+        pages += 1;
+        match field(&answer, &["SellerOrders", "result", "Ok", "next"])? {
+            Value::Bytes(_) | Value::Array(_) => {
+                let page: harvest_common::delegate::SellerOrdersPage =
+                    field(&answer, &["SellerOrders", "result", "Ok"])?.deserialized()?;
+                after = page.next;
+            }
+            _ => break,
+        }
+        if pages > 10_000 {
+            bail!("the book's pages never end");
+        }
+    }
+    println!("  (seller's book: {pages} pages)");
+    // A wake-up's sweep of the full book at its most: every unpaid order
+    // marked paid by store notifications, beside the most paid orders that
+    // wait there for room (`MAX_SELLER_UNPAID_KEPT` of each, as `fill_book`
+    // made them), and room in the paid stage for all of them, so the
+    // wake-up moves them all on.
+    use harvest_common::delegate::{MAX_SELLER_UNPAID_KEPT, MAX_SELLER_UNSENT_KEPT};
+    use harvest_common::payment::OrderStatus;
+    let key = bs58::encode(at.verifying_key).into_string();
+    let stage = |name: &str| format!("harvest:seller_orders:{name}:{key}").into_bytes();
+    let mut unpaid: Vec<harvest_common::delegate::SellerKeptOrder> =
+        ciborium::from_reader(inbox.as_slice()).context("the unpaid stage is not CBOR")?;
+    for record in unpaid.iter_mut() {
+        record.order.status = OrderStatus::Paid;
+    }
+    let moving = unpaid.len();
+    let room = MAX_SELLER_UNSENT_KEPT
+        .checked_sub(moving)
+        .ok_or_else(|| anyhow!("more paid orders waiting than the paid stage holds"))?;
+    let open: Vec<_> = paid_unsent
+        .iter()
+        .skip(SELLER_ORDERS_PER_CALL)
+        .take(room)
+        .cloned()
+        .collect();
+    if open.len() != room || moving != 2 * MAX_SELLER_UNPAID_KEPT {
+        bail!(
+            "the book holds {} paid unsent orders and {moving} waiting, not {room} and {}",
+            open.len(),
+            2 * MAX_SELLER_UNPAID_KEPT
+        );
+    }
+    r.host.state.secrets.insert(stage("unpaid"), cbor(&unpaid));
+    r.host
+        .state
+        .secrets
+        .insert(stage("open"), cbor(&OpenBook { orders: open }));
+    let mut wakeup = vec![0x09, 0, 0, 0];
+    wakeup.extend_from_slice(&9u64.to_le_bytes());
+    wakeup.extend_from_slice(b"heartbeat");
+    r.host.state.now += chrono::Duration::minutes(5);
+    r.background(
+        &format!(
+            "Background: heartbeat wake-up (a full seller's book swept, {moving} paid moved on)"
+        ),
+        &wakeup,
+    )?;
+    let read_stage = |r: &Runner, name: &str| -> Result<Value> {
+        let bytes = r
+            .host
+            .state
+            .secrets
+            .get(&stage(name))
+            .ok_or_else(|| anyhow!("no {name} stage"))?;
+        ciborium::from_reader(bytes.as_slice()).with_context(|| format!("the {name} stage"))
+    };
+    let held_paid = |v: &Value| -> Result<usize> {
+        let Value::Array(records) = v else {
+            bail!("a stage is not a list");
+        };
+        Ok(records
+            .iter()
+            .filter(|r| {
+                field(r, &["order", "status"])
+                    .is_ok_and(|s| *s != Value::Text("AwaitingPayment".into()))
+            })
+            .count())
+    };
+    let opened = read_stage(r, "open")?;
+    let (open_len, refused_len) = (
+        list_len(&opened, &["orders"])?,
+        list_len(&opened, &["paid_refused"]).unwrap_or(0),
+    );
+    if held_paid(&read_stage(r, "unpaid")?)? != 0
+        || open_len != MAX_SELLER_UNSENT_KEPT
+        || refused_len != 0
+    {
+        bail!(
+            "the wake-up did not move every paid order on: {open_len} in the paid stage, \
+             {refused_len} named as refused"
+        );
+    }
+
+    // The same with the paid stage full: nothing moves, the most that may
+    // wait stay, and every one is named.
+    let fresh: Vec<_> = unpaid
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            record.order.order.id.0[31] ^= 0xA5;
+            record
+        })
+        .collect();
+    r.host.state.secrets.insert(stage("unpaid"), cbor(&fresh));
+    r.host.state.now += chrono::Duration::minutes(5);
+    r.background(
+        &format!("Background: heartbeat wake-up ({moving} paid orders, the paid stage full)"),
+        &wakeup,
+    )?;
+    let opened = read_stage(r, "open")?;
+    if held_paid(&read_stage(r, "unpaid")?)? != MAX_SELLER_UNPAID_KEPT
+        || list_len(&opened, &["paid_refused"])? != moving
+    {
+        bail!("a full paid stage did not keep the most that may wait, every one named");
+    }
+
+    // A re-key: a predecessor's full book imported into a successor that
+    // holds none, its sent stage then its paid one (each one call).
+    let snapshot = r.host.state.secrets.clone();
+    let exported: Vec<(&str, Vec<u8>)> = ["done", "open"]
+        .into_iter()
+        .map(|name| {
+            r.host
+                .state
+                .secrets
+                .remove(&stage(name))
+                .map(|v| (name, v))
+                .ok_or_else(|| anyhow!("no {name} stage to export"))
+        })
+        .collect::<Result<_>>()?;
+    r.host.state.secrets.remove(&stage("unpaid"));
+    for (name, value) in exported {
+        let answer = r.app(
+            &format!("ImportMigratedSecret (a predecessor's full {name} stage of a seller's book)"),
+            cbor(&HarvestDelegateRequest::ImportMigratedSecret {
+                predecessor: [0x29; 32],
+                key: stage(name),
+                value: harvest_common::delegate::MigratedSecretValue(value),
+            }),
+            "MigratedSecretImported",
+        )?;
+        let outcome = field(&answer, &["MigratedSecretImported", "outcome"])?;
+        if *outcome != Value::Text("Written".into()) {
+            bail!(
+                "the {name} stage's import answered {}, not Written",
+                brief(outcome)
+            );
+        }
+    }
+    r.host.state.secrets = snapshot;
+    Ok(())
+}
+
+fn instant_decide(r: &mut Runner, at: &InstantStore, shape: &DecideShape) -> Result<()> {
     use harvest_common::listing::{
         AuthorizedListing, ChoiceGroup, DeliveryPrice, FixedCheckout, Listing, ListingId,
         ListingKind, RegionPrice,
@@ -1874,6 +2511,21 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         },
         ..Default::default()
     };
+    if shape.listings_at_cap {
+        let signer = SigningKey::from_bytes(&[12u8; 32]);
+        // One fewer than the cap, all older than the listing the request
+        // names, so the cut keeps that one (the newest are kept).
+        for i in 0..harvest_common::store::MAX_LISTINGS - 1 {
+            store
+                .listings
+                .listings
+                .push(listing_at_cap(&listing, i, &signer)?);
+        }
+        store.listings.normalize();
+        if store.listings.listings.len() != harvest_common::store::MAX_LISTINGS {
+            bail!("the listings at the cap did not all fit");
+        }
+    }
     for (k, script) in scripts_at(&chain, start..next)?.into_iter().enumerate() {
         let order = fx.paid(fx.order_on(k as u32, script));
         store.orders.orders.insert(order.order.id.clone(), order);
@@ -1884,12 +2536,6 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             store.orders.orders.len()
         );
     }
-    let store_bytes = cbor(&store);
-    println!(
-        "  (full store: {} paid orders, {} KiB)",
-        store.orders.orders.len(),
-        store_bytes.len() / 1024
-    );
 
     // The buyer's instant request, sealed to the store's inbox.
     let buyer = StaticSecret::from([0xD0u8; 32]);
@@ -1924,12 +2570,52 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
         now - chrono::Duration::seconds(5),
         40_000,
     );
+    if shape.statuses > 0 {
+        use harvest_common::listing::{
+            AuthorizedListingStatus, ListingAvailability, ListingId, ListingStatus,
+        };
+        let signer = SigningKey::from_bytes(&[12u8; 32]);
+        for i in 0..shape.statuses {
+            let mut id = [0x77u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let status = ListingStatus {
+                listing: ListingId(id),
+                revision: 1_700_000_000_000 + i as u64,
+                availability: ListingAvailability::Withdrawn,
+            };
+            let (scoped_payload, signature) =
+                harvest_common::backing::sign_with_store_key(&signer, cbor(&status))
+                    .map_err(|e| anyhow!("{e}"))?;
+            store.listing_statuses.records.insert(
+                harvest_common::store::Bytes32(id),
+                AuthorizedListingStatus {
+                    status,
+                    scoped_payload,
+                    signature,
+                },
+            );
+        }
+    }
+    let book = if shape.full_book {
+        let paid: Vec<_> = store.orders.orders.values().cloned().collect();
+        Some(fill_book(r, at, &fx, &paid)?)
+    } else {
+        None
+    };
+    let store_bytes = cbor(&store);
+    println!(
+        "  (full store: {} paid orders, {} listings, {} statuses, {} KiB)",
+        store.orders.orders.len(),
+        store.listings.listings.len(),
+        store.listing_statuses.records.len(),
+        store_bytes.len() / 1024
+    );
     // A mailbox full of valid instant requests, each from its own buyer:
     // every one opens and pays the subgroup check on its tag
     // (`messaging::is_canonical_tag`, in `open_instant`), on top of the
     // agreement and the decryption `OPEN_FIXED_COST` stands for. One run
     // (the most one run opens); the delegate's state is put back after.
-    {
+    if shape.full_mailbox {
         let before = r.host.state.secrets.clone();
         let requests: Vec<_> = (0..harvest_common::mailbox::MAX_MESSAGES as u64)
             .map(|i| {
@@ -2003,7 +2689,21 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
             anyhow!("the instant request asked nothing of the store: it was not batched")
         })?;
 
-    let name = format!("GetContractResponse: store, {n} paid orders (instant decide)");
+    let mut extra = String::new();
+    if shape.listings_at_cap {
+        extra += &format!(
+            ", {} listings of {} KiB",
+            harvest_common::store::MAX_LISTINGS,
+            harvest_common::store::MAX_LISTING_BYTES / 1024
+        );
+    }
+    if shape.statuses > 0 {
+        extra += &format!(", {} listing statuses", shape.statuses);
+    }
+    if shape.full_book {
+        extra += ", the seller's book full";
+    }
+    let name = format!("GetContractResponse: store, {n} paid orders{extra} (instant decide)");
     let counter = |r: &Runner| -> Result<u64> {
         let v = secret_value(r, XPUB_KEY)?;
         match field(&v, &["next_index"])? {
@@ -2076,6 +2776,9 @@ fn instant_decide(r: &mut Runner, at: &InstantStore) -> Result<()> {
                  (one past the store's last)",
                 scripts.len()
             );
+        }
+        if let Some(book) = &book {
+            book_calls(r, at, book)?;
         }
         // Back as it was for the rest of the scenario.
         r.host.state.secrets = snapshot;
@@ -2520,7 +3223,7 @@ fn held_key(r: &Runner, key: &[u8]) -> Result<Option<String>> {
     }
 }
 
-/// A new device: a key that is not the active one, entered with a store's
+/// A new device: a key that is not the active one, entered with its stores'
 /// published scripts held. Its scan runs in the pending slot, the active
 /// key going on handing out addresses meanwhile, and only once complete is
 /// it made active (#216). Then the stale case: a tab resuming a key's
@@ -2543,9 +3246,17 @@ fn pending_key(r: &mut Runner) -> Result<()> {
     let chain = bip32::AccountXpub::parse(&new)
         .and_then(|a| a.external_chain())
         .map_err(|e| anyhow!("derive the new key's chain: {e}"))?;
+    // More scripts than one call scans, in whole stores: since step 2 one
+    // store's `MAX_ORDERS` fits in a single call's `FLOOR_SCAN_BUDGET`, so
+    // the new device that takes more than one call is a key with several.
     let per_store = harvest_common::store::MAX_ORDERS;
-    let label = format!("{per_store} published scripts, a new key");
-    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, true)?;
+    let budget = delegate_u32("bitcoin.rs", "FLOOR_SCAN_BUDGET")? as usize;
+    let scripts = per_store * (budget / per_store + 1);
+    let label = format!(
+        "{scripts} published scripts, a new key ({} full stores)",
+        scripts / per_store
+    );
+    feed(r, &label, &scripts_at(&chain, 0..scripts as u32)?, true)?;
     let set = |xpub: &str, resume: bool| {
         cbor(&BitcoinDelegateRequest::SetPaymentXpub {
             request_id: 415,
@@ -2566,7 +3277,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         &set(&new, false),
         &set(&new, true),
         "PaymentXpubSet",
-        per_store,
+        scripts,
         Some(1),
         &mut stood,
     )?
@@ -2586,13 +3297,13 @@ fn pending_key(r: &mut Runner) -> Result<()> {
         &set(&new, true),
         &set(&new, true),
         "PaymentXpubSet",
-        per_store,
+        scripts,
         None,
         &mut stood,
     )?
     .ok_or_else(|| anyhow!("{name}: never finished"))?;
     let count = field(&done, &["PaymentXpubSet", "result", "Ok", "next_index"])?;
-    if *count != Value::Integer((per_store as u64).into())
+    if *count != Value::Integer((scripts as u64).into())
         || held_key(r, XPUB_KEY)?.as_deref() != Some(new.as_str())
         || held_key(r, XPUB_PENDING_KEY)?.is_some()
     {
@@ -2607,7 +3318,7 @@ fn pending_key(r: &mut Runner) -> Result<()> {
     // has no published scripts, so it is made active at once), then tab A
     // asks again.
     r.host.state.secrets = snapshot.clone();
-    feed(r, &label, &scripts_at(&chain, 0..per_store as u32)?, false)?;
+    feed(r, &label, &scripts_at(&chain, 0..scripts as u32)?, false)?;
     r.quiet_send(&set(&new, false))?;
     r.app(
         "SetPaymentXpub (another new key, entered in another tab)",

@@ -192,6 +192,8 @@ pub fn BuyForm(
                 textarea {
                     id: "buy-ship-to",
                     class: "form-textarea",
+                    // What the seller's book keeps of it (step 2).
+                    maxlength: harvest_common::delegate::MAX_KEPT_REQUEST_TEXT as i64,
                     value: "{shipping}",
                     placeholder: "Name and postal address, or whatever this seller needs.",
                     oninput: move |event| shipping.set(event.value()),
@@ -208,6 +210,7 @@ pub fn BuyForm(
                     id: "buy-note",
                     class: "form-textarea grow-textarea",
                     rows: 1,
+                    maxlength: harvest_common::delegate::MAX_KEPT_REQUEST_TEXT as i64,
                     value: "{note}",
                     placeholder: "Delivery date, gift message\u{2026}",
                     oninput: move |event| {
@@ -256,6 +259,13 @@ pub fn BuyForm(
                         }
                         if shipping().trim().is_empty() {
                             problem.set(Some("Add where to send it.".to_string()));
+                            return;
+                        }
+                        // The seller's book keeps each at most this many
+                        // bytes; `maxlength` counts characters, which run
+                        // to more bytes outside plain ASCII.
+                        if too_long_to_keep(&shipping(), &note()) {
+                            problem.set(Some(TOO_LONG.to_string()));
                             return;
                         }
                         let (Some(quantity_wanted), Some(total)) = (parsed_quantity, total) else {
@@ -1345,6 +1355,8 @@ pub fn AcceptRequest(
     let confirmations_read = super::invoice_form::parse_required_confirmations(&confirmations());
     let parsed_confirmations = confirmations_read.as_ref().ok().copied();
     let ready = parsed_amount.is_some() && parsed_confirmations.is_some();
+    // Paused (step 2): Buy now is stopped, an answer by hand is not.
+    let paused = APP_STATE.read().store_paused(&store_contract_id);
 
     if accepted() {
         return rsx! {
@@ -1371,6 +1383,9 @@ pub fn AcceptRequest(
     rsx! {
         div { style: "margin-top: 0.75rem;",
             h5 { style: "margin-bottom: 0.25rem;", "{quantity} x {listing_title}" }
+            if paused {
+                p { class: "text-muted small", "{crate::pause_flow::PAUSED_INVOICE_NOTE}" }
+            }
             p { class: "text-muted", style: "font-size: 0.85rem;",
                 "Accepting publishes this order on your store, where anyone can see it. It "
                 "carries the amount, the payment address, a recent block, the confirmations you "
@@ -1649,8 +1664,37 @@ pub fn remedy(blocker: &PaymentBlocker) -> Remedy {
     }
 }
 
+/// Said when the address or the note is longer than the seller's own copy
+/// of the order keeps.
+const TOO_LONG: &str = "That is too long for the seller to keep. Shorten the address or the note.";
+
+/// Whether the address or the note is longer than the seller's own copy of
+/// the order keeps: [`harvest_common::delegate::MAX_KEPT_REQUEST_TEXT`]
+/// bytes, which `maxlength` (counting characters) does not hold to.
+fn too_long_to_keep(shipping: &str, note: &str) -> bool {
+    let max = harvest_common::delegate::MAX_KEPT_REQUEST_TEXT;
+    shipping.len() > max || note.len() > max
+}
+
 #[cfg(test)]
 mod tests {
+    /// Review round 2 of step 2: the form holds the address and the note to
+    /// the bytes the seller's book keeps, not the characters `maxlength`
+    /// counts. Red with a character count.
+    #[test]
+    fn text_past_the_books_byte_bound_is_too_long() {
+        let max = harvest_common::delegate::MAX_KEPT_REQUEST_TEXT;
+        assert!(!super::too_long_to_keep(&"a".repeat(max), &"n".repeat(max)));
+        assert!(super::too_long_to_keep(&"a".repeat(max + 1), ""));
+        assert!(super::too_long_to_keep("", &"n".repeat(max + 1)));
+        let chars = "\u{e9}".repeat(max / 2 + 1);
+        assert!(chars.chars().count() <= max);
+        assert!(
+            super::too_long_to_keep(&chars, ""),
+            "fewer characters, more bytes"
+        );
+    }
+
     use super::*;
 
     /// **The complaint step's "Message the seller" goes to the purchase's
@@ -1740,6 +1784,8 @@ mod tests {
                 receipt_seed: [0; 32],
                 order: kept_order,
                 complaint: None,
+                despatch: None,
+                backed_up: false,
             });
         let kept = ComplaintTarget::Kept {
             store_key: key,

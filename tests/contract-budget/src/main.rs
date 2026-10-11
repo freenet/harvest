@@ -22,6 +22,7 @@
 mod cases;
 mod host;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -490,19 +491,21 @@ fn run() -> Result<bool> {
     let mut calibrate_reps = 0usize;
     let mut only: Option<String> = None;
     let mut case_filter: Option<String> = None;
+    let mut write_ratchet = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--only" => only = Some(args.next().ok_or_else(|| anyhow!("--only CONTRACT"))?),
             "--case" => case_filter = Some(args.next().ok_or_else(|| anyhow!("--case SUBSTRING"))?),
             "--wasm-dir" => wasm_dir = args.next().ok_or_else(|| anyhow!("--wasm-dir DIR"))?.into(),
             "--calibrate" => calibrate_reps = 3,
+            "--write-ratchet" => write_ratchet = true,
             n if calibrate_reps > 0 && n.parse::<usize>().is_ok() => {
                 calibrate_reps = n.parse().unwrap()
             }
             other => {
                 bail!(
                     "unknown argument {other}; usage: [--wasm-dir DIR] [--calibrate [REPS]] \
-                     [--only CONTRACT] [--case SUBSTRING]"
+                     [--only CONTRACT] [--case SUBSTRING] [--write-ratchet]"
                 )
             }
         }
@@ -530,6 +533,10 @@ fn run() -> Result<bool> {
     );
     println!();
 
+    if write_ratchet && (only.is_some() || case_filter.is_some()) {
+        bail!("--write-ratchet records every report-only call, so it runs unfiltered");
+    }
+
     let mut runner = Runner {
         contracts,
         calibrate_reps,
@@ -541,10 +548,16 @@ fn run() -> Result<bool> {
             bail!("--only {only}: no such contract");
         }
     }
-    let selected = cases::all()?.into_iter().filter(|c| {
-        only.as_deref().is_none_or(|o| c.kind.name() == o)
-            && case_filter.as_deref().is_none_or(|f| c.name.contains(f))
-    });
+    let selected: Vec<_> = cases::all()?
+        .into_iter()
+        .filter(|c| {
+            only.as_deref().is_none_or(|o| c.kind.name() == o)
+                && case_filter.as_deref().is_none_or(|f| c.name.contains(f))
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!("no case matches the filter");
+    }
     for case in selected {
         if let Err(e) = runner.run_case(&case) {
             failure = Some(e);
@@ -553,6 +566,28 @@ fn run() -> Result<bool> {
     }
 
     let ok = report(&runner.measured, &hashes, failure.as_ref())?;
+    let ratchet_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(RATCHET_FILE);
+    let ratchet_ok = if write_ratchet {
+        std::fs::write(&ratchet_path, write_ratchet_file(&runner.measured))
+            .with_context(|| format!("write {}", ratchet_path.display()))?;
+        println!("wrote {}", ratchet_path.display());
+        true
+    } else {
+        let recorded = std::fs::read_to_string(&ratchet_path)
+            .with_context(|| format!("read {}", ratchet_path.display()))?;
+        let recorded = parse_ratchet(&recorded)?;
+        let mut broken = ratchet_failures(&runner.measured, &recorded);
+        // Unfiltered, every recorded call must have been measured: one that
+        // no longer runs (a fixture refused, a case gone) is not held.
+        if only.is_none() && case_filter.is_none() {
+            broken.extend(ratchet_unmeasured(&runner.measured, &recorded));
+        }
+        for why in &broken {
+            eprintln!("::error::ratchet: {why}");
+        }
+        broken.is_empty()
+    };
+    let ok = ok && ratchet_ok;
     match failure {
         // A call past the fuel ceiling is already an over-budget result;
         // anything else that stopped the run is a harness failure.
@@ -731,6 +766,103 @@ fn report(
     Ok(over.is_empty())
 }
 
+/// The figures the report-only calls are held to (`--write-ratchet` writes
+/// them), next to this crate's manifest.
+const RATCHET_FILE: &str = "ratchet.tsv";
+
+/// How far above its recorded figure a report-only call may go before the
+/// run fails: report-only means over the budget is a warning, not that
+/// growing is free (the overseer, step 2: the store's calls stay over the
+/// budget until harvest#230, and must not silently get worse meanwhile).
+const RATCHET_PERCENT: u64 = 110;
+
+/// One line per report-only call measured: contract, case, call, fuel.
+fn write_ratchet_file(measured: &[Measured]) -> String {
+    let mut out = String::from(
+        "# Fuel per report-only call, the most a run may reach being this times 1.10.\n\
+         # Written by `cargo run --release -- --write-ratchet`; see README.md.\n",
+    );
+    for m in measured.iter().filter(|m| !m.gating) {
+        if let Some(fuel) = m.fuel {
+            out.push_str(&format!("{}\t{}\t{}\t{fuel}\n", m.contract, m.case, m.call));
+        }
+    }
+    out
+}
+
+/// The recorded figures, by (contract, case, call).
+fn parse_ratchet(text: &str) -> Result<BTreeMap<(String, String, String), u64>> {
+    let mut out = BTreeMap::new();
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        let parts: Vec<&str> = line.split('\t').collect();
+        let [contract, case, call, fuel] = parts[..] else {
+            bail!("ratchet line not contract, case, call, fuel: {line}");
+        };
+        out.insert(
+            (contract.into(), case.into(), call.into()),
+            fuel.parse()
+                .with_context(|| format!("ratchet fuel: {line}"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Each report-only call over its recorded figure by more than
+/// [`RATCHET_PERCENT`], past the ceiling where it had a figure, or measured
+/// with none recorded (a new call must be recorded to be held).
+fn ratchet_failures(
+    measured: &[Measured],
+    recorded: &BTreeMap<(String, String, String), u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in measured.iter().filter(|m| !m.gating) {
+        let key = (m.contract.to_string(), m.case.clone(), m.call.to_string());
+        let name = format!("{} / {} / {}", m.contract, m.case, m.call);
+        match (recorded.get(&key), m.fuel) {
+            (None, _) => out.push(format!(
+                "{name}: no recorded figure; run with --write-ratchet and commit {RATCHET_FILE}"
+            )),
+            (Some(was), None) => out.push(format!(
+                "{name}: past the ceiling, where {} was recorded",
+                group(*was)
+            )),
+            (Some(was), Some(now))
+                if now as u128 * 100 > *was as u128 * RATCHET_PERCENT as u128 =>
+            {
+                out.push(format!(
+                    "{name}: {} fuel, more than {}% of the {} recorded",
+                    group(now),
+                    RATCHET_PERCENT,
+                    group(*was)
+                ))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Each recorded call this run did not measure.
+fn ratchet_unmeasured(
+    measured: &[Measured],
+    recorded: &BTreeMap<(String, String, String), u64>,
+) -> Vec<String> {
+    recorded
+        .keys()
+        .filter(|(contract, case, call)| {
+            !measured
+                .iter()
+                .any(|m| m.contract == contract && m.case == *case && m.call == call)
+        })
+        .map(|(contract, case, call)| {
+            format!("{contract} / {case} / {call}: recorded, but not measured this run")
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     let outcome = run();
     if let Err(e) = &outcome {
@@ -742,6 +874,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ratchet holds each report-only call to 110% of its recorded
+    /// figure, fails one with no figure or past the ceiling, and ignores
+    /// gating calls (the budget holds those). Red with any of the three
+    /// dropped. Also seen failing on the real run (README).
+    #[test]
+    fn the_ratchet_holds_report_only_calls_to_their_figures() {
+        let recorded = parse_ratchet("# c\nstore\tcase\tcall\t1000\n").unwrap();
+        let at = |fuel: Option<u64>, gating: bool| {
+            let mut m = measured(gating, fuel, None);
+            m.contract = "store";
+            m.case = "case".into();
+            m.call = "call";
+            m
+        };
+        assert!(ratchet_failures(&[at(Some(1100), false)], &recorded).is_empty());
+        assert_eq!(
+            ratchet_failures(&[at(Some(1101), false)], &recorded).len(),
+            1
+        );
+        assert_eq!(ratchet_failures(&[at(None, false)], &recorded).len(), 1);
+        assert!(ratchet_failures(&[at(Some(5000), true)], &recorded).is_empty());
+        let mut new = at(Some(1), false);
+        new.case = "another".into();
+        assert_eq!(ratchet_failures(&[new], &recorded).len(), 1);
+        let written = write_ratchet_file(&[at(Some(7), false), at(Some(9), true)]);
+        assert_eq!(parse_ratchet(&written).unwrap().len(), 1);
+        // A recorded call not measured is named.
+        assert_eq!(ratchet_unmeasured(&[], &recorded).len(), 1);
+        assert!(ratchet_unmeasured(&[at(Some(1), false)], &recorded).is_empty());
+    }
 
     fn measured(gating: bool, fuel: Option<u64>, trap: Option<&str>) -> Measured {
         Measured {

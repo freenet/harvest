@@ -380,8 +380,10 @@ impl Listing {
 pub struct AuthorizedListing {
     pub listing: Listing,
     /// CBOR-serialized ScopedPayload from the ghostkey delegate's SignResult.
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
     /// Ed25519 signature over the scoped_payload bytes.
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     /// The seller's ghostkey certificate PEM, so any verifier can check the trust chain.
     pub certificate_pem: String,
@@ -489,14 +491,21 @@ pub struct ListingStatus {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedListingStatus {
     pub status: ListingStatus,
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
 impl AuthorizedListingStatus {
     pub fn verify(&self, owner: &VerifyingKey) -> Result<(), String> {
-        verify_scoped_signature(&self.scoped_payload, &self.signature, owner, &self.status)
-            .map_err(|e| format!("listing status is not signed by the store key: {e}"))
+        crate::backing::verify_exact_scoped_signature(
+            &self.scoped_payload,
+            &self.signature,
+            owner,
+            &self.status,
+        )
+        .map_err(|e| format!("listing status is not signed by the store key: {e}"))
     }
 }
 

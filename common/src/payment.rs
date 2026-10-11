@@ -1248,6 +1248,64 @@ fn distinct_claims(claims: &[SignedClaim]) -> Vec<&SignedClaim> {
         .collect::<Vec<_>>()
 }
 
+/// How many verified tips [`verify_tip_once`] remembers before starting
+/// again: more than a store's orders can name, so one validation of a full
+/// store verifies each distinct tip once.
+const VERIFIED_TIPS_HELD: usize = 4096;
+
+std::thread_local! {
+    /// Tips already verified, by the digest of the signed tip and the
+    /// parameters it was verified under (step 2).
+    static VERIFIED_TIPS: std::cell::RefCell<
+        std::collections::HashMap<[u8; 32], freenet_bitcoin_common::TipEntryBody>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many tips this thread has verified rather than recalled.
+    static TIP_VERIFICATIONS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// `tip.verify(params)`, done once per distinct signed tip and parameters
+/// (step 2). Verifying a tip is a pure function of those bytes (the bridge's
+/// signature over the entry, against the bridges the order trusts), and the
+/// orders paid in one block carry the same signed tip, so a store's
+/// validation re-checked one signature per paid order that it had already
+/// checked. Only an accepted tip is remembered: a refused one is verified
+/// again, and refused again, every time.
+fn verify_tip_once(
+    tip: &freenet_bitcoin_common::SignedTipEntry,
+    params: &freenet_bitcoin_common::BitcoinTipParameters,
+) -> Result<freenet_bitcoin_common::TipEntryBody, ProofError> {
+    let (Ok(tip_bytes), Ok(param_bytes)) = (crate::to_cbor(tip), crate::to_cbor(params)) else {
+        // Not remembered, but never refused for it.
+        return tip.verify(params).map_err(ProofError::BadTip);
+    };
+    let key = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"harvest/verified-tip/v1");
+        hasher.update(&(tip_bytes.len() as u64).to_le_bytes());
+        hasher.update(&tip_bytes);
+        hasher.update(&param_bytes);
+        *hasher.finalize().as_bytes()
+    };
+    if let Some(body) = VERIFIED_TIPS.with(|held| held.borrow().get(&key).cloned()) {
+        return Ok(body);
+    }
+    #[cfg(test)]
+    TIP_VERIFICATIONS.with(|n| n.set(n.get() + 1));
+    let body = tip.verify(params).map_err(ProofError::BadTip)?;
+    VERIFIED_TIPS.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.len() >= VERIFIED_TIPS_HELD {
+            held.clear();
+        }
+        held.insert(key, body.clone());
+    });
+    Ok(body)
+}
+
 fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u64, ProofError> {
     if order.payment_script_pubkey.is_empty() {
         return Err(ProofError::WrongRail);
@@ -1290,7 +1348,7 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
         network: order.network,
         trusted_bridges: order.trusted_bridges.clone(),
     };
-    let tip = proof.tip.verify(&tip_params).map_err(ProofError::BadTip)?;
+    let tip = verify_tip_once(&proof.tip, &tip_params)?;
     if tip.network != order.network {
         return Err(ProofError::NetworkMismatch);
     }
@@ -1566,8 +1624,10 @@ fn verify_on_chain_proof(order: &Order, proof: &OnChainPaymentProof) -> Result<u
 pub struct AuthorizedOrder {
     pub order: Order,
     /// CBOR `ScopedPayload` from the ghostkey delegate, over `order`.
+    #[serde(with = "serde_bytes")]
     pub scoped_payload: Vec<u8>,
     /// Seller's Ed25519 signature over `scoped_payload`.
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     pub status: OrderStatus,
     /// Evidence for `Paid` / `PaymentReversed`. Absent while awaiting payment.
@@ -1575,7 +1635,9 @@ pub struct AuthorizedOrder {
     /// A party's signature over `(order.id, status)` for the transitions a
     /// party asserts -- today just `Cancelled`, signed by the seller's store
     /// key or by the order's `buyer_receipt_key`.
+    #[serde(with = "serde_bytes")]
     pub status_scoped_payload: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
     pub status_signature: Option<Vec<u8>>,
 }
 
@@ -3367,5 +3429,59 @@ mod proof_assembly_tests {
         let proof = OrderPaymentProof::on_chain(vec![paid, retracted], tip);
         let err = verify_minimal_proof(&order, &proof).expect_err("not minimal");
         assert!(err.contains("does not confirm"), "{err}");
+    }
+}
+
+/// Step 2: a signed tip is verified once per distinct tip and bridge set
+/// (`verify_tip_once`), and what it remembers never changes an answer.
+#[cfg(test)]
+mod verified_tip_tests {
+    use super::*;
+    use crate::test_orders::{order, proof};
+
+    /// A tip accepted once is recalled, not verified again; one accepted
+    /// for an order that trusts its bridge is not accepted for one that
+    /// trusts another bridge (the bridges are part of what is remembered),
+    /// and a tip refused once is refused again. Mutated red by keying the
+    /// memory on the tip alone, by remembering a refusal as an acceptance,
+    /// and by never recalling (round 1 of step 2's review: without the
+    /// count this passed with no memory at all).
+    #[test]
+    fn a_remembered_tip_never_changes_an_answer() {
+        let verifications = || super::TIP_VERIFICATIONS.with(|n| n.get());
+        let trusted = order(1);
+        let paid = proof(&trusted, 1);
+        let before = verifications();
+        assert!(verify_payment_proof(&trusted, &paid).is_ok());
+        assert!(verify_payment_proof(&trusted, &paid).is_ok(), "remembered");
+        assert_eq!(verifications() - before, 1, "verified once, then recalled");
+
+        // The same proof, for an order whose bridge did not sign it.
+        let mut elsewhere = trusted.clone();
+        elsewhere.trusted_bridges = vec![freenet_bitcoin_common::BridgeId([0x99; 32])];
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    verify_payment_proof(&elsewhere, &paid),
+                    Err(ProofError::BadTip(_))
+                ),
+                "another bridge set is checked afresh"
+            );
+        }
+
+        // A tip whose body was altered after signing.
+        let OrderPaymentProof::OnChain(mut forged) = paid.clone() else {
+            panic!("an on-chain proof");
+        };
+        let last = forged.tip.body_cbor.len() - 1;
+        forged.tip.body_cbor[last] ^= 1;
+        let forged = OrderPaymentProof::OnChain(forged);
+        for _ in 0..2 {
+            assert!(matches!(
+                verify_payment_proof(&trusted, &forged),
+                Err(ProofError::BadTip(_))
+            ));
+        }
+        assert!(verify_payment_proof(&trusted, &paid).is_ok());
     }
 }

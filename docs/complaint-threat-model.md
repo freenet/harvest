@@ -734,6 +734,16 @@ same renewal, through the last block a complaint could count at. The seller's UI
   A frozen-bytes complaint fixture (`tests/fixtures/reputation-state-complaint-v1.cbor`),
   decoded, re-encoded and verified by `Complaint::verify` in every build, pins it
   (`a_complaint_from_the_first_build_still_verifies`).
+- **The encoding may change only where the old one still decodes, and never inside what is
+  signed.** Step 2 (harvest#230) writes every signed record's outer signed payload and
+  signature (the order's among them) as CBOR byte strings rather than integer arrays. The bytes
+  signed are unchanged, and the earlier form still decodes (`serde_bytes` reads both). The
+  frozen fixture now pins exactly that: it decodes and verifies, and it equals today's encoding
+  with those fields as integer arrays and nothing else changed. Since a contract accepts only
+  its own canonical encoding, the migration fold forwards a predecessor's record re-encoded
+  (`a_complaint_made_before_step_2_is_carried_across`). `Complaint::digest` hashes the encoded
+  complaint, so every digest changes with it; a digest is only ever compared within one
+  generation's summaries and deltas, and nothing signs one.
 
 ## 8a. Review round 5's three P1s: resolved in revision 5
 
