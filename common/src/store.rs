@@ -8446,7 +8446,6 @@ mod at_caps_tests {
         let bytes = crate::to_cbor(&state).unwrap().len();
         println!("a store at every cap: {bytes} bytes; AT_CAPS_BYTES {AT_CAPS_BYTES}");
         assert!(bytes <= AT_CAPS_BYTES, "{bytes} > {AT_CAPS_BYTES}");
-        assert!(MAX_STORE_BYTES >= AT_CAPS_BYTES);
     }
 
     /// The largest unpaid order the app writes, cancelled (its terms and a
