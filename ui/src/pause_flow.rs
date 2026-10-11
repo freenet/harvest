@@ -266,6 +266,36 @@ mod tests {
         assert_eq!(queued(&state)[0].revision, 52);
     }
 
+    /// A pause or resume the delegate never answers is withdrawn after
+    /// `STORE_KEY_SIGNATURE_TIMEOUT_MS`: the switch is offered again and the
+    /// seller is told it was not saved (step 2's screenshots: a Resume held
+    /// at "Saving" while the delegate's queue was full). One answered in time
+    /// is untouched. Red with the deadline doing nothing.
+    #[test]
+    fn a_pause_the_delegate_never_answers_is_withdrawn() {
+        let mut state = seller_state();
+        held(&mut state, 50, true);
+        state
+            .queue_store_pause_at(STORE.to_vec(), false, 10)
+            .unwrap();
+        let request_id = *state.pending_store_key_requests.keys().next().unwrap();
+        assert!(state.store_pause_pending_at(STORE, 0));
+        state.store_key_signature_timed_out(request_id);
+        assert!(!state.store_pause_pending_at(STORE, 0), "offered again");
+        assert!(state.pending_signatures.is_empty());
+        assert!(
+            state
+                .notifications
+                .iter()
+                .any(|n| n.starts_with(PAUSE_NOT_SAVED) && n.contains("did not answer")),
+            "{:?}",
+            state.notifications
+        );
+        let told = state.notifications.len();
+        state.store_key_signature_timed_out(request_id);
+        assert_eq!(state.notifications.len(), told, "once only");
+    }
+
     /// A closed store is closed, not paused, whatever its pause says.
     #[test]
     fn a_closed_store_is_not_paused() {

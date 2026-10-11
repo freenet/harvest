@@ -1218,9 +1218,19 @@ fn spawn_store_key_signature(request_id: u64, store_verifying_key: [u8; 32], pay
         };
         if let Err(e) = crate::gateway::send_delegate_message(&delegate_key, payload).await {
             fail(format!("send for signing: {e}"));
+            return;
         }
+        gloo_timers::future::TimeoutFuture::new(STORE_KEY_SIGNATURE_TIMEOUT_MS).await;
+        crate::gateway::APP_STATE
+            .write()
+            .store_key_signature_timed_out(request_id);
     });
 }
+
+/// How long a store-key signature may go unanswered before it is withdrawn
+/// ([`AppState::store_key_signature_timed_out`]). The delegate signs in
+/// well under a second; a minute is long past any honest wait.
+pub(crate) const STORE_KEY_SIGNATURE_TIMEOUT_MS: u32 = 60_000;
 
 /// The store key test fixtures register their stores under: a store this
 /// device can sign for (harvest#93). A test about a store made before
@@ -12022,6 +12032,23 @@ impl AppState {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = (store_verifying_key, bytes);
         Ok(())
+    }
+
+    /// The Harvest delegate has not answered `request_id` within
+    /// [`STORE_KEY_SIGNATURE_TIMEOUT_MS`]: withdraw it as refused, so the
+    /// control that asked is offered again and the seller is told it was not
+    /// saved. Step 2's screenshots found a Resume held at "Saving" for minutes:
+    /// the delegate's queue was full, and the node's answer was an error that
+    /// carries no request id, so nothing ever withdrew the request. Answered
+    /// already, it is a no-op; a signature arriving after it is matched to
+    /// nothing and dropped.
+    pub(crate) fn store_key_signature_timed_out(&mut self, request_id: u64) {
+        if self.pending_store_key_requests.contains_key(&request_id) {
+            self.store_key_signature_failed(
+                request_id,
+                "your Harvest delegate did not answer in time",
+            );
+        }
     }
 
     /// The Harvest delegate did not sign what `request_id` asked for, or the
