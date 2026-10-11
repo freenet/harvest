@@ -1,43 +1,44 @@
 # Fuel per report-only call, the most a run may reach being this times 1.10.
 # Written by `cargo run --release -- --write-ratchet`; see README.md.
-store	256 orders at caps + one-listing delta	update_state	809136079
-store	256 orders at caps + one-listing delta	validate_state (merged state)	7083048935
-store	256 orders at caps + one-listing delta	summarize_state (merged state)	864231366
-store	256 orders at caps + one-listing delta	get_state_delta (to a co-host holding the old state)	871355157
-store	256 orders at caps + one-listing delta	get_state_delta (to a new subscriber, empty summary)	733500409
-store	256 orders at caps + another at-caps state	validate_state (incoming state)	7083988611
-store	256 orders at caps + another at-caps state	update_state	6321830327
-store	256 orders at caps + another at-caps state	validate_state (merged state)	7166476704
-store	256 orders at caps + another at-caps state	summarize_state (merged state)	874712508
-store	256 orders at caps + another at-caps state	get_state_delta (to a co-host holding the old state)	800273766
-store	256 orders at caps + another at-caps state	get_state_delta (to a new subscriber, empty summary)	742887536
-store	256 orders at caps + another at-caps state	update_state (idempotency probe, 1 in 32)	3861036514
-store	256 Paid orders of 8 KiB + one-listing delta	update_state	934346347
-store	256 Paid orders of 8 KiB + one-listing delta	validate_state (merged state)	7437643820
-store	256 Paid orders of 8 KiB + one-listing delta	summarize_state (merged state)	1003062541
-store	256 Paid orders of 8 KiB + one-listing delta	get_state_delta (to a co-host holding the old state)	1009840894
-store	256 Paid orders of 8 KiB + one-listing delta	get_state_delta (to a new subscriber, empty summary)	858701832
-store	256 orders at caps + 43 padded Paid, the most under the store's byte bound	update_state	5256524231
-store	256 orders at caps + 43 padded Paid, the most under the store's byte bound	validate_state (merged state)	6656689298
-store	256 orders at caps + 43 padded Paid, the most under the store's byte bound	summarize_state (merged state)	785530092
-store	256 orders at caps + 43 padded Paid, the most under the store's byte bound	get_state_delta (to a co-host holding the old state)	786952205
-store	256 orders at caps + 43 padded Paid, the most under the store's byte bound	get_state_delta (to a new subscriber, empty summary)	663535307
-store	256 orders at caps + 44 padded Paid, past the store's byte bound (refused)	update_state (must refuse)	53432719
-store	256 orders at caps + one-listing delta + 256 copies of a held paid order	update_state	1421777901
-store	256 orders at caps + one-listing delta + 256 copies of a held paid order	validate_state (merged state)	7083048935
-store	256 orders at caps + one-listing delta + 256 copies of a held paid order	summarize_state (merged state)	864231366
-store	256 orders at caps + one-listing delta + 256 copies of a held paid order	get_state_delta (to a co-host holding the old state)	871355157
-store	256 orders at caps + one-listing delta + 256 copies of a held paid order	get_state_delta (to a new subscriber, empty summary)	733500409
-store	256 orders at caps + one-listing delta + 4000 copies of a held listing status	update_state	1021358742
-store	256 orders at caps + one-listing delta + 4000 copies of a held listing status	validate_state (merged state)	7083048935
-store	256 orders at caps + one-listing delta + 4000 copies of a held listing status	summarize_state (merged state)	864231366
-store	256 orders at caps + one-listing delta + 4000 copies of a held listing status	get_state_delta (to a co-host holding the old state)	871355157
-store	256 orders at caps + one-listing delta + 4000 copies of a held listing status	get_state_delta (to a new subscriber, empty summary)	733500409
-store	a new subscriber's whole store (paid orders at their byte bound) as one delta	update_state	7148406511
-store	a new subscriber's whole store (paid orders at their byte bound) as one delta	validate_state (merged state)	7437624808
-store	a new subscriber's whole store (paid orders at their byte bound) as one delta	summarize_state (merged state)	1003062409
-store	a new subscriber's whole store (paid orders at their byte bound) as one delta	get_state_delta (to a co-host holding the old state)	858701668
-store	a new subscriber's whole store (paid orders at their byte bound) as one delta	get_state_delta (to a new subscriber, empty summary)	858701668
+store	256 orders at caps + one-listing delta	update_state	856743122
+store	256 orders at caps + one-listing delta	validate_state (merged state)	8167636317
+store	256 orders at caps + one-listing delta	summarize_state (merged state)	952309022
+store	256 orders at caps + one-listing delta	get_state_delta (to a co-host holding the old state)	961992902
+store	256 orders at caps + one-listing delta	get_state_delta (to a new subscriber, empty summary)	804452330
+store	256 orders at caps + another at-caps state	validate_state (incoming state)	8168372360
+store	256 orders at caps + another at-caps state	update_state	4263390343
+store	256 orders at caps + another at-caps state	validate_state (merged state)	8168762081
+store	256 orders at caps + another at-caps state	summarize_state (merged state)	952304379
+store	256 orders at caps + another at-caps state	get_state_delta (to a co-host holding the old state)	884505952
+store	256 orders at caps + another at-caps state	get_state_delta (to a new subscriber, empty summary)	804461360
+store	256 orders at caps + another at-caps state	update_state (idempotency probe, 1 in 32)	4110127664
+store	256 Paid orders of 8 KiB + one-listing delta	update_state	980854265
+store	256 Paid orders of 8 KiB + one-listing delta	validate_state (merged state)	8522752160
+store	256 Paid orders of 8 KiB + one-listing delta	summarize_state (merged state)	1091134322
+store	256 Paid orders of 8 KiB + one-listing delta	get_state_delta (to a co-host holding the old state)	1100556590
+store	256 Paid orders of 8 KiB + one-listing delta	get_state_delta (to a new subscriber, empty summary)	929634658
+store	256 orders at caps + 29 padded Paid, the most under the store's byte bound	update_state	3749042622
+store	256 orders at caps + 29 padded Paid, the most under the store's byte bound	validate_state (merged state)	7884649473
+store	256 orders at caps + 29 padded Paid, the most under the store's byte bound	summarize_state (merged state)	899296953
+store	256 orders at caps + 29 padded Paid, the most under the store's byte bound	get_state_delta (to a co-host holding the old state)	905843642
+store	256 orders at caps + 29 padded Paid, the most under the store's byte bound	get_state_delta (to a new subscriber, empty summary)	757204338
+store	256 orders at caps + 30 padded Paid, past the store's byte bound (refused)	update_state (must refuse)	41951812
+store	256 orders at caps + one-listing delta + 256 copies of a held paid order	update_state	1601782664
+store	256 orders at caps + one-listing delta + 256 copies of a held paid order	validate_state (merged state)	8167636317
+store	256 orders at caps + one-listing delta + 256 copies of a held paid order	summarize_state (merged state)	952309022
+store	256 orders at caps + one-listing delta + 256 copies of a held paid order	get_state_delta (to a co-host holding the old state)	961992902
+store	256 orders at caps + one-listing delta + 256 copies of a held paid order	get_state_delta (to a new subscriber, empty summary)	804452330
+store	256 orders at caps + one-listing delta + 512 copies of a held listing status	update_state	883234200
+store	256 orders at caps + one-listing delta + 512 copies of a held listing status	validate_state (merged state)	8167636317
+store	256 orders at caps + one-listing delta + 512 copies of a held listing status	summarize_state (merged state)	952309022
+store	256 orders at caps + one-listing delta + 512 copies of a held listing status	get_state_delta (to a co-host holding the old state)	961992902
+store	256 orders at caps + one-listing delta + 512 copies of a held listing status	get_state_delta (to a new subscriber, empty summary)	804452330
+store	256 orders at caps + one-listing delta + 513 copies of a held listing status (refused)	update_state (must refuse)	661979965
+store	a new subscriber's whole store (paid orders at their byte bound) as one delta	update_state	1698321440
+store	a new subscriber's whole store (paid orders at their byte bound) as one delta	validate_state (merged state)	8522737825
+store	a new subscriber's whole store (paid orders at their byte bound) as one delta	summarize_state (merged state)	1091138601
+store	a new subscriber's whole store (paid orders at their byte bound) as one delta	get_state_delta (to a co-host holding the old state)	929634494
+store	a new subscriber's whole store (paid orders at their byte bound) as one delta	get_state_delta (to a new subscriber, empty summary)	929634494
 reputation	146 at caps + one-complaint delta	update_state	27067392525
 reputation	146 at caps + one-complaint delta	validate_state (merged state)	69260939768
 reputation	146 at caps + one-complaint delta	summarize_state (merged state)	21211789500
